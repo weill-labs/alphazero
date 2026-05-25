@@ -12,6 +12,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+modal = [
+    "modal>=0.64",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
