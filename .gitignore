@@ -37,3 +37,6 @@ gemini.mcp.json
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# orchestrator scratch (self-play verification)
+.verify_selfplay.py
