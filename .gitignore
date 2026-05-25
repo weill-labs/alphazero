@@ -31,3 +31,19 @@ venv/
 
 # Local AI agent settings
 .claude/settings.local.json
+.ntm/
+cursor.mcp.json
+gemini.mcp.json
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# orchestrator scratch (self-play verification/tuning)
+.verify_selfplay.py
+.tune_selfplay.py
+
+# trained model checkpoints (generated artifact)
+checkpoints/
+
+# wandb local run data (generated)
+wandb/

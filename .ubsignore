@@ -18,6 +18,10 @@ out/
 target/
 *.egg-info/
 
+# Test source (pytest uses bare `assert` idiomatically; the scanner targets
+# production source, not test code — tests are validated by pytest itself).
+tests/
+
 # Test artifacts
 coverage/
 .coverage
