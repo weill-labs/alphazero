@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+
 from alphazero.arena import (
     MCTSPlayer,
     PerfectPlayer,
@@ -69,3 +71,67 @@ def test_short_self_play_training_beats_random_and_reduces_loss(tmp_path) -> Non
     assert wins + draws + losses == 12
     assert wins >= 8
     assert wins > losses
+
+
+def test_wandb_disabled_by_default_does_not_import_wandb(monkeypatch, tmp_path) -> None:
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "wandb" or name.startswith("wandb."):
+            raise AssertionError("wandb should not be imported unless enabled")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    game = TicTacToe()
+
+    net, metrics = train_tictactoe_agent(
+        iterations=1,
+        self_play_games_per_iteration=1,
+        self_play_mcts_cfg={
+            "num_simulations": 8,
+            "dirichlet_eps": 0.25,
+            "seed": 1,
+        },
+        batch_size=8,
+        epochs=1,
+        checkpoint_path=tmp_path / "tictactoe.pt",
+        seed=1,
+    )
+    wins, draws, losses = play_match(
+        MCTSPlayer(net, num_simulations=8, seed=1),
+        RandomPlayer(seed=2),
+        game,
+        n_games=2,
+    )
+
+    assert metrics["self_play_examples"] > 0
+    assert wins + draws + losses == 2
+
+
+def test_wandb_import_failure_is_nonfatal(monkeypatch, tmp_path, capsys) -> None:
+    real_import = builtins.__import__
+
+    def failing_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "wandb" or name.startswith("wandb."):
+            raise RuntimeError("wandb unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+
+    _, metrics = train_tictactoe_agent(
+        iterations=1,
+        self_play_games_per_iteration=1,
+        self_play_mcts_cfg={
+            "num_simulations": 4,
+            "dirichlet_eps": 0.25,
+            "seed": 2,
+        },
+        batch_size=8,
+        epochs=1,
+        checkpoint_path=tmp_path / "tictactoe.pt",
+        seed=2,
+        wandb_enabled=True,
+    )
+
+    assert metrics["self_play_examples"] > 0
+    assert "Warning: wandb disabled" in capsys.readouterr().err

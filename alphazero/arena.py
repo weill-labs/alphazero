@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 import numpy as np
 import torch
@@ -22,6 +23,14 @@ from alphazero.train import (
     save_checkpoint,
     train_iteration,
 )
+
+WANDB_PROJECT = "alphazero-tictactoe"
+
+
+class WandbRun(Protocol):
+    def log(self, data: Mapping[str, int | float], step: int | None = None) -> None: ...
+
+    def finish(self) -> None: ...
 
 
 class Player(Protocol):
@@ -187,6 +196,89 @@ def _self_play_cfg(
     return merged
 
 
+def _training_run_config(
+    *,
+    iterations: int,
+    self_play_games_per_iteration: int,
+    self_play_mcts_cfg: Mapping[str, object] | None,
+    replay_capacity: int,
+    batch_size: int,
+    epochs: int,
+    lr: float,
+    l2_reg: float,
+    checkpoint_path: str | Path | None,
+    seed: int,
+) -> dict[str, object]:
+    mcts_cfg = _self_play_cfg(self_play_mcts_cfg, seed)
+    return {
+        "iterations": iterations,
+        "self_play_games": self_play_games_per_iteration,
+        "self_play_sims": mcts_cfg["num_simulations"],
+        "c_puct": mcts_cfg["c_puct"],
+        "dirichlet_alpha": mcts_cfg["dirichlet_alpha"],
+        "dirichlet_eps": mcts_cfg["dirichlet_eps"],
+        "replay_capacity": replay_capacity,
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "lr": lr,
+        "l2_reg": l2_reg,
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else "",
+        "seed": seed,
+    }
+
+
+def _init_wandb(
+    enabled: bool,
+    *,
+    project: str,
+    run_name: str | None,
+    config: Mapping[str, object],
+) -> WandbRun | None:
+    if not enabled:
+        return None
+
+    try:
+        wandb_module = __import__("wandb")
+        init = getattr(wandb_module, "init")
+        return cast(WandbRun, init(project=project, name=run_name, config=dict(config)))
+    except Exception as exc:
+        print(f"Warning: wandb disabled: {exc}", file=sys.stderr)
+        return None
+
+
+def _wandb_log(
+    run: WandbRun | None,
+    metrics: Mapping[str, float | int | str],
+    *,
+    step: int,
+) -> None:
+    if run is None:
+        return
+
+    numeric_metrics = {
+        key: value
+        for key, value in metrics.items()
+        if isinstance(value, int | float) and not isinstance(value, bool)
+    }
+    if not numeric_metrics:
+        return
+
+    try:
+        run.log(numeric_metrics, step=step)
+    except Exception as exc:
+        print(f"Warning: wandb log skipped: {exc}", file=sys.stderr)
+
+
+def _wandb_finish(run: WandbRun | None) -> None:
+    if run is None:
+        return
+
+    try:
+        run.finish()
+    except Exception as exc:
+        print(f"Warning: wandb finish skipped: {exc}", file=sys.stderr)
+
+
 def train_tictactoe_agent(
     *,
     iterations: int = 25,
@@ -199,6 +291,11 @@ def train_tictactoe_agent(
     l2_reg: float = 1e-5,
     checkpoint_path: str | Path | None = None,
     seed: int = 0,
+    wandb_enabled: bool = False,
+    wandb_project: str = WANDB_PROJECT,
+    wandb_run_name: str | None = None,
+    wandb_run: WandbRun | None = None,
+    wandb_config: Mapping[str, object] | None = None,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
     """Train a compact tic-tac-toe agent from tabula-rasa self-play only."""
 
@@ -213,40 +310,70 @@ def train_tictactoe_agent(
     net = AlphaZeroNet(game.num_planes, game.board_shape, game.action_size)
     optimizer = make_optimizer(net, optimizer_name="adam", lr=lr)
     replay_buffer = ReplayBuffer(replay_capacity)
+    run_config = _training_run_config(
+        iterations=iterations,
+        self_play_games_per_iteration=self_play_games_per_iteration,
+        self_play_mcts_cfg=self_play_mcts_cfg,
+        replay_capacity=replay_capacity,
+        batch_size=batch_size,
+        epochs=epochs,
+        lr=lr,
+        l2_reg=l2_reg,
+        checkpoint_path=checkpoint_path,
+        seed=seed,
+    )
+    if wandb_config is not None:
+        run_config.update(wandb_config)
+
+    active_wandb_run = wandb_run
+    owns_wandb_run = False
+    if active_wandb_run is None:
+        active_wandb_run = _init_wandb(
+            wandb_enabled,
+            project=wandb_project,
+            run_name=wandb_run_name,
+            config=run_config,
+        )
+        owns_wandb_run = active_wandb_run is not None
 
     metrics: dict[str, float | int | str] = {}
-    for iteration in range(iterations):
-        examples: list[SelfPlayExample] = []
-        for _ in range(self_play_games_per_iteration):
-            game_seed = int(rng.integers(0, np.iinfo(np.int32).max))
-            examples.extend(
-                play_game(
-                    net,
-                    game,
-                    _self_play_cfg(self_play_mcts_cfg, game_seed),
-                    temperature_schedule=opening_temperature_schedule,
+    try:
+        for iteration in range(iterations):
+            examples: list[SelfPlayExample] = []
+            for _ in range(self_play_games_per_iteration):
+                game_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+                examples.extend(
+                    play_game(
+                        net,
+                        game,
+                        _self_play_cfg(self_play_mcts_cfg, game_seed),
+                        temperature_schedule=opening_temperature_schedule,
+                    )
                 )
+            loss_before, _ = compute_loss(net, examples, l2_reg=l2_reg)
+            metrics = train_iteration(
+                net,
+                examples,
+                optimizer=optimizer,
+                replay_buffer=replay_buffer,
+                batch_size=batch_size,
+                epochs=epochs,
+                l2_reg=l2_reg,
+                shuffle=True,
+                rng=rng,
             )
-        loss_before, _ = compute_loss(net, examples, l2_reg=l2_reg)
-        metrics = train_iteration(
-            net,
-            examples,
-            optimizer=optimizer,
-            replay_buffer=replay_buffer,
-            batch_size=batch_size,
-            epochs=epochs,
-            l2_reg=l2_reg,
-            shuffle=True,
-            rng=rng,
-        )
-        loss_after, _ = compute_loss(net, examples, l2_reg=l2_reg)
-        metrics["iteration"] = iteration + 1
-        metrics["self_play_examples"] = len(examples)
-        metrics["loss_before"] = float(loss_before.detach().cpu().item())
-        metrics["loss_after"] = float(loss_after.detach().cpu().item())
-        metrics["loss_delta"] = float(metrics["loss_before"]) - float(
-            metrics["loss_after"]
-        )
+            loss_after, _ = compute_loss(net, examples, l2_reg=l2_reg)
+            metrics["iteration"] = iteration + 1
+            metrics["self_play_examples"] = len(examples)
+            metrics["loss_before"] = float(loss_before.detach().cpu().item())
+            metrics["loss_after"] = float(loss_after.detach().cpu().item())
+            metrics["loss_delta"] = float(metrics["loss_before"]) - float(
+                metrics["loss_after"]
+            )
+            _wandb_log(active_wandb_run, metrics, step=iteration + 1)
+    finally:
+        if owns_wandb_run:
+            _wandb_finish(active_wandb_run)
 
     if checkpoint_path is not None:
         save_checkpoint(net, checkpoint_path, optimizer=optimizer, metrics=metrics)
@@ -264,39 +391,102 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--self-play-games", type=int, default=8)
     parser.add_argument("--self-play-sims", type=int, default=96)
     parser.add_argument("--dirichlet-eps", type=float, default=0.25)
+    parser.add_argument("--replay-capacity", type=int, default=8192)
+    parser.add_argument("--lr", type=float, default=5e-3)
+    parser.add_argument("--l2-reg", type=float, default=1e-5)
     parser.add_argument("--eval-games", type=int, default=40)
     parser.add_argument("--eval-sims", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--checkpoint", type=Path, default=Path("checkpoints/tictactoe.pt")
     )
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default=WANDB_PROJECT)
+    parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args(argv)
 
-    net, metrics = train_tictactoe_agent(
+    self_play_mcts_cfg = {
+        "num_simulations": args.self_play_sims,
+        "dirichlet_eps": args.dirichlet_eps,
+    }
+    run_config = _training_run_config(
         iterations=args.iterations,
         self_play_games_per_iteration=args.self_play_games,
-        self_play_mcts_cfg={
-            "num_simulations": args.self_play_sims,
-            "dirichlet_eps": args.dirichlet_eps,
-        },
+        self_play_mcts_cfg=self_play_mcts_cfg,
+        replay_capacity=args.replay_capacity,
         batch_size=args.batch_size,
         epochs=args.epochs,
+        lr=args.lr,
+        l2_reg=args.l2_reg,
         checkpoint_path=args.checkpoint,
         seed=args.seed,
     )
-    wins, draws, losses = play_match(
-        MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed),
-        PerfectPlayer(),
-        TicTacToe(),
-        args.eval_games,
-    )
-    print(
+    run_config.update(
         {
-            "metrics": metrics,
-            "vs_perfect": {"wins": wins, "draws": draws, "losses": losses},
+            "eval_games": args.eval_games,
+            "eval_sims": args.eval_sims,
         }
     )
-    return 0 if losses == 0 else 1
+    wandb_run = _init_wandb(
+        args.wandb,
+        project=args.wandb_project,
+        run_name=args.wandb_run_name,
+        config=run_config,
+    )
+    try:
+        net, metrics = train_tictactoe_agent(
+            iterations=args.iterations,
+            self_play_games_per_iteration=args.self_play_games,
+            self_play_mcts_cfg=self_play_mcts_cfg,
+            replay_capacity=args.replay_capacity,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            l2_reg=args.l2_reg,
+            checkpoint_path=args.checkpoint,
+            seed=args.seed,
+            wandb_run=wandb_run,
+            wandb_config=run_config,
+        )
+        game = TicTacToe()
+        perfect_wins, perfect_draws, perfect_losses = play_match(
+            MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed),
+            PerfectPlayer(),
+            game,
+            args.eval_games,
+        )
+        random_wins, random_draws, random_losses = play_match(
+            MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed + 1),
+            RandomPlayer(seed=args.seed),
+            game,
+            args.eval_games,
+        )
+        vs_perfect = {
+            "wins": perfect_wins,
+            "draws": perfect_draws,
+            "losses": perfect_losses,
+        }
+        vs_random = {
+            "wins": random_wins,
+            "draws": random_draws,
+            "losses": random_losses,
+        }
+        _wandb_log(
+            wandb_run,
+            {
+                "eval/perfect_wins": perfect_wins,
+                "eval/perfect_draws": perfect_draws,
+                "eval/perfect_losses": perfect_losses,
+                "eval/random_wins": random_wins,
+                "eval/random_draws": random_draws,
+                "eval/random_losses": random_losses,
+            },
+            step=args.iterations,
+        )
+        print({"metrics": metrics, "vs_perfect": vs_perfect, "vs_random": vs_random})
+    finally:
+        _wandb_finish(wandb_run)
+    return 0 if perfect_losses == 0 else 1
 
 
 if __name__ == "__main__":
