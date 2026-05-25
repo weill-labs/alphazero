@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from alphazero.arena import MCTSPlayer, PerfectPlayer, play_match, train_tictactoe_agent
+from alphazero.arena import (
+    MCTSPlayer,
+    PerfectPlayer,
+    RandomPlayer,
+    play_match,
+    train_tictactoe_agent,
+)
 from alphazero.game import Game, State
 from alphazero.games.tictactoe import TicTacToe
 
@@ -39,21 +45,27 @@ def test_play_match_tallies_wins_draws_and_losses() -> None:
     assert (wins_a, draws, wins_b) == (1, 0, 0)
 
 
-def test_short_training_run_never_loses_to_perfect_player(tmp_path) -> None:
+def test_short_self_play_training_beats_random_and_reduces_loss(tmp_path) -> None:
     game = TicTacToe()
     net, metrics = train_tictactoe_agent(
-        iterations=1,
-        self_play_games_per_iteration=0,
-        perfect_examples_limit=256,
-        batch_size=128,
-        epochs=4,
+        iterations=2,
+        self_play_games_per_iteration=4,
+        self_play_mcts_cfg={
+            "num_simulations": 24,
+            "dirichlet_eps": 0.25,
+            "seed": 0,
+        },
+        batch_size=32,
+        epochs=2,
         checkpoint_path=tmp_path / "tictactoe.pt",
         seed=0,
     )
-    trained = MCTSPlayer(net, num_simulations=64, seed=0)
+    trained = MCTSPlayer(net, num_simulations=48, seed=0)
 
-    wins, draws, losses = play_match(trained, PerfectPlayer(), game, n_games=2)
+    wins, draws, losses = play_match(trained, RandomPlayer(seed=1), game, n_games=12)
 
-    assert metrics["num_examples"] >= 256
-    assert wins + draws + losses == 2
-    assert losses == 0
+    assert metrics["self_play_examples"] > 0
+    assert metrics["loss_after"] < metrics["loss_before"]
+    assert wins + draws + losses == 12
+    assert wins >= 8
+    assert wins > losses

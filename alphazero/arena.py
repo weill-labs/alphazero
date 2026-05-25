@@ -17,6 +17,7 @@ from alphazero.network import AlphaZeroNet
 from alphazero.selfplay import SelfPlayExample, play_game
 from alphazero.train import (
     ReplayBuffer,
+    compute_loss,
     make_optimizer,
     save_checkpoint,
     train_iteration,
@@ -57,27 +58,6 @@ class PerfectPlayer:
         }
         best_score = max(scores.values())
         return min(action for action, score in scores.items() if score == best_score)
-
-    def policy_value(self, game: Game, state: State) -> tuple[np.ndarray, int]:
-        """Return a uniform optimal policy and minimax value for `state`."""
-
-        legal = game.legal_moves(state)
-        pi = np.zeros(game.action_size, dtype=np.float32)
-        value = self.value(game, state)
-        if not legal:
-            return pi, value
-
-        scores = {
-            action: -self.value(game, game.apply_move(state, action))
-            for action in legal
-        }
-        best_score = max(scores.values())
-        best_actions = [
-            action for action, score in scores.items() if score == best_score
-        ]
-        for action in best_actions:
-            pi[action] = 1.0 / len(best_actions)
-        return pi, value
 
     def value(self, game: Game, state: State) -> int:
         """Minimax value from the current player's perspective."""
@@ -181,49 +161,51 @@ def play_match(
     return wins_a, draws, wins_b
 
 
-def perfect_training_examples(game: Game) -> list[SelfPlayExample]:
-    """Enumerate reachable non-terminal states with minimax policy/value targets."""
+def opening_temperature_schedule(move_index: int) -> float:
+    """Explore early openings, then play greedily from MCTS visits."""
 
-    player = PerfectPlayer()
-    examples: list[SelfPlayExample] = []
-    visited: set[State] = set()
+    return 1.0 if move_index < 3 else 0.0
 
-    def visit(state: State) -> None:
-        if state in visited:
-            return
-        visited.add(state)
-        if game.is_terminal(state):
-            return
 
-        pi, value = player.policy_value(game, state)
-        examples.append((game.encode(state).copy(), pi, value))
-        for action in game.legal_moves(state):
-            visit(game.apply_move(state, action))
-
-    visit(game.initial_state())
-    return examples
+def _self_play_cfg(
+    cfg: Mapping[str, object] | None,
+    seed: int,
+) -> dict[str, object]:
+    merged: dict[str, object] = {
+        "num_simulations": 64,
+        "c_puct": 1.5,
+        "dirichlet_alpha": 0.3,
+        "dirichlet_eps": 0.25,
+    }
+    if cfg is not None:
+        merged.update(cfg)
+    if float(merged.get("dirichlet_eps", 0.0)) <= 0.0:
+        merged["dirichlet_eps"] = 0.25
+    if float(merged.get("dirichlet_alpha", 0.0)) <= 0.0:
+        merged["dirichlet_alpha"] = 0.3
+    merged["seed"] = seed
+    return merged
 
 
 def train_tictactoe_agent(
     *,
-    iterations: int = 2,
-    self_play_games_per_iteration: int = 0,
+    iterations: int = 25,
+    self_play_games_per_iteration: int = 8,
     self_play_mcts_cfg: Mapping[str, object] | None = None,
-    perfect_examples_limit: int | None = 256,
-    replay_capacity: int = 4096,
+    replay_capacity: int = 8192,
     batch_size: int = 64,
-    epochs: int = 3,
-    lr: float = 1e-2,
+    epochs: int = 2,
+    lr: float = 5e-3,
     l2_reg: float = 1e-5,
     checkpoint_path: str | Path | None = None,
     seed: int = 0,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
-    """Train a compact tic-tac-toe agent using minimax bootstrap plus optional self-play."""
+    """Train a compact tic-tac-toe agent from tabula-rasa self-play only."""
 
     if iterations <= 0:
         raise ValueError("iterations must be positive")
-    if perfect_examples_limit is not None and perfect_examples_limit <= 0:
-        raise ValueError("perfect_examples_limit must be positive when provided")
+    if self_play_games_per_iteration <= 0:
+        raise ValueError("self_play_games_per_iteration must be positive")
 
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -231,28 +213,21 @@ def train_tictactoe_agent(
     net = AlphaZeroNet(game.num_planes, game.board_shape, game.action_size)
     optimizer = make_optimizer(net, optimizer_name="adam", lr=lr)
     replay_buffer = ReplayBuffer(replay_capacity)
-    perfect_examples = perfect_training_examples(game)
-    if perfect_examples_limit is not None and perfect_examples_limit < len(
-        perfect_examples
-    ):
-        indices = rng.choice(
-            len(perfect_examples), size=perfect_examples_limit, replace=False
-        )
-        perfect_examples = [perfect_examples[int(i)] for i in indices]
 
     metrics: dict[str, float | int | str] = {}
     for iteration in range(iterations):
-        examples = list(perfect_examples)
+        examples: list[SelfPlayExample] = []
         for _ in range(self_play_games_per_iteration):
+            game_seed = int(rng.integers(0, np.iinfo(np.int32).max))
             examples.extend(
                 play_game(
                     net,
                     game,
-                    self_play_mcts_cfg
-                    or {"num_simulations": 16, "dirichlet_eps": 0.0, "seed": seed},
-                    temperature_schedule=0.0,
+                    _self_play_cfg(self_play_mcts_cfg, game_seed),
+                    temperature_schedule=opening_temperature_schedule,
                 )
             )
+        loss_before, _ = compute_loss(net, examples, l2_reg=l2_reg)
         metrics = train_iteration(
             net,
             examples,
@@ -264,7 +239,14 @@ def train_tictactoe_agent(
             shuffle=True,
             rng=rng,
         )
+        loss_after, _ = compute_loss(net, examples, l2_reg=l2_reg)
         metrics["iteration"] = iteration + 1
+        metrics["self_play_examples"] = len(examples)
+        metrics["loss_before"] = float(loss_before.detach().cpu().item())
+        metrics["loss_after"] = float(loss_after.detach().cpu().item())
+        metrics["loss_delta"] = float(metrics["loss_before"]) - float(
+            metrics["loss_after"]
+        )
 
     if checkpoint_path is not None:
         save_checkpoint(net, checkpoint_path, optimizer=optimizer, metrics=metrics)
@@ -276,14 +258,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Train and evaluate a tic-tac-toe AlphaZero agent."
     )
-    parser.add_argument("--iterations", type=int, default=5)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--self-play-games", type=int, default=0)
-    parser.add_argument("--self-play-sims", type=int, default=32)
-    parser.add_argument("--perfect-examples-limit", type=int, default=256)
-    parser.add_argument("--eval-games", type=int, default=10)
-    parser.add_argument("--eval-sims", type=int, default=100)
+    parser.add_argument("--iterations", type=int, default=35)
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--self-play-games", type=int, default=8)
+    parser.add_argument("--self-play-sims", type=int, default=96)
+    parser.add_argument("--dirichlet-eps", type=float, default=0.25)
+    parser.add_argument("--eval-games", type=int, default=40)
+    parser.add_argument("--eval-sims", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--checkpoint", type=Path, default=Path("checkpoints/tictactoe.pt")
@@ -295,10 +277,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         self_play_games_per_iteration=args.self_play_games,
         self_play_mcts_cfg={
             "num_simulations": args.self_play_sims,
-            "dirichlet_eps": 0.0,
-            "seed": args.seed,
+            "dirichlet_eps": args.dirichlet_eps,
         },
-        perfect_examples_limit=args.perfect_examples_limit,
         batch_size=args.batch_size,
         epochs=args.epochs,
         checkpoint_path=args.checkpoint,
