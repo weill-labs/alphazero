@@ -73,7 +73,9 @@ def test_short_self_play_training_beats_random_and_reduces_loss(tmp_path) -> Non
     assert wins > losses
 
 
-def test_wandb_disabled_by_default_does_not_import_wandb(monkeypatch, tmp_path) -> None:
+def test_train_wandb_disabled_by_default_does_not_import_wandb(
+    monkeypatch, tmp_path
+) -> None:
     real_import = builtins.__import__
 
     def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -105,6 +107,9 @@ def test_wandb_disabled_by_default_does_not_import_wandb(monkeypatch, tmp_path) 
     )
 
     assert metrics["self_play_examples"] > 0
+    assert metrics["iteration_seconds"] > 0
+    assert metrics["iters_per_sec"] > 0
+    assert metrics["self_play_games_per_sec"] > 0
     assert wins + draws + losses == 2
 
 

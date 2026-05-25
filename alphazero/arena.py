@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, cast
@@ -28,6 +29,8 @@ WANDB_PROJECT = "alphazero-tictactoe"
 
 
 class WandbRun(Protocol):
+    url: str | None
+
     def log(self, data: Mapping[str, int | float], step: int | None = None) -> None: ...
 
     def finish(self) -> None: ...
@@ -246,6 +249,14 @@ def _init_wandb(
         return None
 
 
+def _print_wandb_url(run: WandbRun | None) -> None:
+    if run is None:
+        return
+    url = getattr(run, "url", None)
+    if url:
+        print(f"wandb run: {url}")
+
+
 def _wandb_log(
     run: WandbRun | None,
     metrics: Mapping[str, float | int | str],
@@ -339,6 +350,7 @@ def train_tictactoe_agent(
     metrics: dict[str, float | int | str] = {}
     try:
         for iteration in range(iterations):
+            iteration_started = time.perf_counter()
             examples: list[SelfPlayExample] = []
             for _ in range(self_play_games_per_iteration):
                 game_seed = int(rng.integers(0, np.iinfo(np.int32).max))
@@ -370,6 +382,12 @@ def train_tictactoe_agent(
             metrics["loss_delta"] = float(metrics["loss_before"]) - float(
                 metrics["loss_after"]
             )
+            iteration_seconds = max(time.perf_counter() - iteration_started, 1e-12)
+            metrics["iteration_seconds"] = iteration_seconds
+            metrics["iters_per_sec"] = 1.0 / iteration_seconds
+            metrics["self_play_games_per_sec"] = (
+                self_play_games_per_iteration / iteration_seconds
+            )
             _wandb_log(active_wandb_run, metrics, step=iteration + 1)
     finally:
         if owns_wandb_run:
@@ -385,11 +403,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Train and evaluate a tic-tac-toe AlphaZero agent."
     )
-    parser.add_argument("--iterations", type=int, default=35)
+    parser.add_argument("--iterations", type=int, default=60)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--self-play-games", type=int, default=8)
-    parser.add_argument("--self-play-sims", type=int, default=96)
+    parser.add_argument("--self-play-games", type=int, default=24)
+    parser.add_argument("--self-play-sims", type=int, default=128)
     parser.add_argument("--dirichlet-eps", type=float, default=0.25)
     parser.add_argument("--replay-capacity", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=5e-3)
@@ -400,7 +418,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--checkpoint", type=Path, default=Path("checkpoints/tictactoe.pt")
     )
-    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--no-wandb", action="store_false", dest="wandb", default=True)
     parser.add_argument("--wandb-project", default=WANDB_PROJECT)
     parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args(argv)
@@ -433,6 +451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_name=args.wandb_run_name,
         config=run_config,
     )
+    _print_wandb_url(wandb_run)
     try:
         net, metrics = train_tictactoe_agent(
             iterations=args.iterations,

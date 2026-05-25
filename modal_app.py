@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from collections.abc import Mapping
 
 WANDB_PROJECT = "alphazero-tictactoe"
@@ -37,6 +38,14 @@ def _wandb_init(
     except Exception as exc:
         print(f"Warning: wandb disabled: {exc}", file=sys.stderr)
         return None
+
+
+def _print_wandb_url(run) -> None:
+    if run is None:
+        return
+    url = getattr(run, "url", None)
+    if url:
+        print(f"wandb run: {url}")
 
 
 def _wandb_log(run, metrics: Mapping[str, int | float], *, step: int) -> None:
@@ -81,9 +90,9 @@ else:
         secrets=[modal.Secret.from_name("wandb")],
     )
     def train_remote(
-        iterations: int = 35,
-        self_play_games: int = 8,
-        sims: int = 96,
+        iterations: int = 60,
+        self_play_games: int = 24,
+        sims: int = 128,
         seed: int = 0,
         gpu: str | None = None,
         eval_games: int = 40,
@@ -111,7 +120,9 @@ else:
             run_name=f"modal-tictactoe-seed-{seed}",
             config=run_config,
         )
+        _print_wandb_url(wandb_run)
         try:
+            training_started = time.perf_counter()
             net, metrics = train_tictactoe_agent(
                 iterations=iterations,
                 self_play_games_per_iteration=self_play_games,
@@ -123,6 +134,12 @@ else:
                 seed=seed,
                 wandb_run=wandb_run,
                 wandb_config=run_config,
+            )
+            training_seconds = max(time.perf_counter() - training_started, 1e-12)
+            metrics["modal_training_seconds"] = training_seconds
+            metrics["modal_iters_per_sec"] = iterations / training_seconds
+            metrics["modal_self_play_games_per_sec"] = (
+                iterations * self_play_games / training_seconds
             )
             game = TicTacToe()
             perfect_wins, perfect_draws, perfect_losses = play_match(
@@ -144,6 +161,11 @@ else:
                 "eval/random_wins": random_wins,
                 "eval/random_draws": random_draws,
                 "eval/random_losses": random_losses,
+                "modal_training_seconds": metrics["modal_training_seconds"],
+                "modal_iters_per_sec": metrics["modal_iters_per_sec"],
+                "modal_self_play_games_per_sec": metrics[
+                    "modal_self_play_games_per_sec"
+                ],
             }
             _wandb_log(wandb_run, eval_metrics, step=iterations)
             return {
@@ -165,9 +187,9 @@ else:
 
     @app.local_entrypoint()
     def main(
-        iterations: int = 35,
-        self_play_games: int = 8,
-        sims: int = 96,
+        iterations: int = 60,
+        self_play_games: int = 24,
+        sims: int = 128,
         seed: int = 0,
         gpu: str | None = None,
         eval_games: int = 40,

@@ -102,3 +102,4 @@ def test_modal_app_registers_remote_training_without_real_modal(monkeypatch) -> 
     assert module.app.functions[0].options["image"] is module.image
     assert module.app.functions[0].options["timeout"] == 6 * 60 * 60
     assert module.app.entrypoint is not None
+    assert module.app.entrypoint.__defaults__[:3] == (60, 24, 128)
