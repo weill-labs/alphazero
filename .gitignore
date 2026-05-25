@@ -31,6 +31,9 @@ venv/
 
 # Local AI agent settings
 .claude/settings.local.json
+.ntm/
+cursor.mcp.json
+gemini.mcp.json
 
 # bv (beads viewer) local config and caches
 .bv/
