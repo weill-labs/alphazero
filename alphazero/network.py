@@ -12,11 +12,36 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
+class _ResidualBlock(nn.Module):
+    """Two 3x3 convolutions with a skip connection (no normalization).
+
+    The skip path keeps gradients flowing through deep trunks. BatchNorm is
+    intentionally omitted so the block is safe for any batch size, including the
+    size-1 final batch the training loop can produce.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = F.relu(self.conv1(x))
+        out = self.conv2(out)
+        return F.relu(out + x)
+
+
 class AlphaZeroNet(nn.Module):
-    """Shared trunk with policy and value heads for AlphaZero-style search."""
+    """Residual trunk with policy and value heads for AlphaZero-style search."""
 
     def __init__(
-        self, num_planes: int, board_shape: tuple[int, int], action_size: int
+        self,
+        num_planes: int,
+        board_shape: tuple[int, int],
+        action_size: int,
+        *,
+        channels: int = 64,
+        num_res_blocks: int = 4,
     ) -> None:
         super().__init__()
         if num_planes <= 0:
@@ -28,17 +53,23 @@ class AlphaZeroNet(nn.Module):
             raise ValueError("board_shape dimensions must be positive")
         if action_size <= 0:
             raise ValueError("action_size must be positive")
+        if channels <= 0:
+            raise ValueError("channels must be positive")
+        if num_res_blocks < 0:
+            raise ValueError("num_res_blocks must be non-negative")
 
         self.num_planes = num_planes
         self.board_shape = (height, width)
         self.action_size = action_size
+        self.channels = channels
+        self.num_res_blocks = num_res_blocks
 
-        channels = 64
-        self.trunk = nn.Sequential(
+        self.stem = nn.Sequential(
             nn.Conv2d(num_planes, channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+        )
+        self.res_blocks = nn.ModuleList(
+            _ResidualBlock(channels) for _ in range(num_res_blocks)
         )
 
         flattened_policy = 2 * height * width
@@ -73,7 +104,9 @@ class AlphaZeroNet(nn.Module):
                 f"expected input shape (B, {expected_shape}), got {tuple(x.shape)}"
             )
 
-        features = self.trunk(x)
+        features = self.stem(x)
+        for block in self.res_blocks:
+            features = block(features)
         policy_logits = self.policy_head(features)
         value = self.value_head(features).squeeze(-1)
         return policy_logits, value
