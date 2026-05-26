@@ -25,6 +25,59 @@ def test_forward_returns_policy_logits_and_bounded_value() -> None:
     assert any(param.grad is not None for param in net.parameters())
 
 
+def test_residual_tower_is_configurable_and_trainable() -> None:
+    torch.manual_seed(0)
+    net = AlphaZeroNet(
+        num_planes=2,
+        board_shape=(3, 3),
+        action_size=9,
+        channels=16,
+        num_res_blocks=3,
+    )
+
+    assert net.channels == 16
+    assert net.num_res_blocks == 3
+    assert len(net.res_blocks) == 3
+
+    x = torch.randn(2, 2, 3, 3)
+    policy_logits, value = net(x)
+
+    assert policy_logits.shape == (2, 9)
+    assert value.shape == (2,)
+
+    (policy_logits.sum() + value.sum()).backward()
+    # The skip connection must carry gradient back to the first block's convs.
+    assert net.res_blocks[0].conv1.weight.grad is not None
+
+
+def test_zero_residual_blocks_is_a_valid_stem_only_network() -> None:
+    net = AlphaZeroNet(
+        num_planes=2,
+        board_shape=(3, 3),
+        action_size=9,
+        num_res_blocks=0,
+    )
+
+    assert len(net.res_blocks) == 0
+    policy_logits, value = net(torch.randn(2, 2, 3, 3))
+    assert policy_logits.shape == (2, 9)
+    assert value.shape == (2,)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"channels": 0}, "channels must be positive"),
+        ({"num_res_blocks": -1}, "num_res_blocks must be non-negative"),
+    ],
+)
+def test_network_rejects_invalid_trunk_config(
+    kwargs: dict[str, int], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        AlphaZeroNet(num_planes=2, board_shape=(3, 3), action_size=9, **kwargs)
+
+
 def test_predict_returns_softmax_distribution_for_single_state() -> None:
     torch.manual_seed(0)
     net = AlphaZeroNet(num_planes=2, board_shape=(3, 3), action_size=9)
