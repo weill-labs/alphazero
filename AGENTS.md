@@ -79,7 +79,7 @@ Example structure:
 alphago/
 ├── README.md
 ├── AGENTS.md
-├── .beads/                        # Issue tracking (br)
+├── .beads/                        # Issue tracking (bd)
 ├── .claude/                       # Claude Code settings
 │
 └── src/                           # Your source code
@@ -171,7 +171,6 @@ Common pitfalls:
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   br sync --flush-only
    git add .beads/
    git commit -m "Update beads"
    git push
@@ -189,79 +188,37 @@ Common pitfalls:
 
 ---
 
-<!-- br-agent-instructions-v1 -->
-## Issue Tracking with br (Beads)
+## Issue Tracking with bd (Beads)
 
-All issue tracking goes through **Beads**. No other TODO systems.
+All issue tracking goes through **Beads** — `bd` (github.com/gastownhall/beads, Dolt-backed, at `~/.local/bin/bd`). No other TODO systems. (`br`/`bv` are an older, unrelated tracker and are NOT used in this repo.)
 
 Key invariants:
 
-- `.beads/` is authoritative state and **must always be committed** with code changes.
-- Do not edit `.beads/*.jsonl` directly; only via `br`.
+- `.beads/issues.jsonl` is the git-tracked source of truth and **must be committed** with code changes.
+- Do not edit `.beads/*.jsonl` directly; only via `bd`.
+- The Dolt DB under `.beads/` is gitignored and lives in the main checkout, so run `bd` from the main repo (not a worktree).
 
 ### Basics
 
-Check ready work:
-
 ```bash
-br ready --json
+bd ready                                 # unblocked work
+bd create "Issue title" -t task -p 2     # types: bug|feature|task|epic|chore; priority 0-4 (0=highest)
+bd update <id> --status in_progress
+bd close <id> --reason "Completed"
+bd show <id>
+bd list --status open
 ```
-
-Create issues:
-
-```bash
-br create --title="Issue title" --type=bug --priority=1 --json
-br create --title="Issue title" --type=task --priority=1 --deps discovered-from:br-123 --json
-```
-
-Update:
-
-```bash
-br update br-42 --status in_progress --json
-br update br-42 --priority 1 --json
-```
-
-Complete:
-
-```bash
-br close br-42 --reason "Completed" --json
-```
-
-Types: `bug`, `feature`, `task`, `epic`, `chore`
-
-Priorities: `0` critical, `1` high, `2` medium (default), `3` low, `4` backlog
 
 Agent workflow:
 
-1. `br ready` to find unblocked work.
-2. Claim: `br update <id> --status in_progress`.
+1. `bd ready` to find unblocked work.
+2. Claim: `bd update <id> --status in_progress`.
 3. Implement + test.
-4. If you discover new work, create a new bead with `discovered-from:<parent-id>`.
-5. Close when done.
-6. Commit `.beads/` in the same commit as code changes.
+4. If you discover new work: `bd create "..." --deps discovered-from:<parent-id>`.
+5. `bd close <id>` when done.
+6. Commit `.beads/issues.jsonl` in the same commit as the code changes.
 
-Never:
-- Use markdown TODO lists.
-- Use other trackers.
-- Duplicate tracking.
-<!-- end-br-agent-instructions -->
-
----
-
-## Using bv as an AI sidecar
-
-bv is a graph-aware triage engine for Beads projects. Use robot flags for deterministic outputs.
-
-**⚠️ CRITICAL: Use ONLY `--robot-*` flags. Bare `bv` launches an interactive TUI that blocks your session.**
-
-```bash
-bv --robot-triage        # THE MEGA-COMMAND: start here
-bv --robot-next          # Just the single top pick + claim command
-bv --robot-plan          # Parallel execution tracks
-bv --robot-insights      # Full graph metrics
-```
-
-Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cycles, and parallel tracks deterministically.
+Never use markdown TODO lists, other trackers, or duplicate tracking.
 
 ---
 
