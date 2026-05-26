@@ -32,6 +32,9 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
+      - name: Modal entrypoint smoke (real modal, no cloud build)
+        run: uv run --extra modal pytest tests/test_modal_app.py -q
+
       - name: Run UBS if available
         shell: bash
         run: |
