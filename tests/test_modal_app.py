@@ -108,6 +108,7 @@ def test_modal_app_registers_remote_training_without_real_modal(monkeypatch) -> 
     assert module.image.modules == ("alphazero",)
     assert module.app.functions
     assert module.app.functions[0].options["image"] is module.image
+    assert module.app.functions[0].options["cpu"] == 8
     assert module.app.functions[0].options["timeout"] == 6 * 60 * 60
     assert module.app.entrypoint is not None
     assert module.app.entrypoint.__defaults__[:4] == ("tictactoe", None, None, None)
@@ -286,6 +287,7 @@ def test_modal_remote_threads_eval_args_to_training(monkeypatch) -> None:
         self_play_games=1,
         sims=1,
         mcts_batch_size=8,
+        self_play_workers=2,
         eval_games=1,
         eval_sims=1,
         gating_interval=2,
@@ -303,8 +305,10 @@ def test_modal_remote_threads_eval_args_to_training(monkeypatch) -> None:
     assert captured_kwargs["ladder_games"] == 5
     assert captured_kwargs["ladder_depths"] == (1, 4)
     assert captured_kwargs["self_play_mcts_cfg"]["batch_size"] == 8
+    assert captured_kwargs["n_selfplay_workers"] == 2
     assert result["config"]["ladder_depths"] == (1, 4)
     assert result["config"]["mcts_batch_size"] == 8
+    assert result["config"]["self_play_workers"] == 2
 
 
 def test_modal_remote_trains_go_generically(monkeypatch) -> None:
@@ -427,6 +431,7 @@ def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
         self_play_games=4,
         sims=5,
         mcts_batch_size=13,
+        self_play_workers=3,
         seed=6,
         gpu="A10G",
         eval_games=7,
@@ -454,6 +459,7 @@ def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
         "mcts_batch_size": 13,
         "seed": 6,
         "self_play_games": 4,
+        "self_play_workers": 3,
         "sims": 5,
     }
     assert (

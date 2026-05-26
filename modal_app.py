@@ -8,6 +8,8 @@ import time
 from collections.abc import Mapping, Sequence
 
 WANDB_PROJECT_PREFIX = "alphazero"
+_DEFAULT_MODAL_CPU = 8
+_DEFAULT_SELF_PLAY_WORKERS = 8
 _DEFAULT_GATING_INTERVAL = 5
 _DEFAULT_GATING_GAMES = 20
 _DEFAULT_GATING_THRESHOLD = 0.55
@@ -191,6 +193,7 @@ else:
 
     @app.function(
         image=image,
+        cpu=_DEFAULT_MODAL_CPU,
         timeout=6 * 60 * 60,
         secrets=[modal.Secret.from_name("wandb")],
     )
@@ -200,6 +203,7 @@ else:
         self_play_games: int | None = None,
         sims: int | None = None,
         mcts_batch_size: int = 16,
+        self_play_workers: int = _DEFAULT_SELF_PLAY_WORKERS,
         seed: int = 0,
         gpu: str | None = None,
         eval_games: int = 40,
@@ -250,6 +254,7 @@ else:
             "self_play_games": self_play_games,
             "self_play_sims": sims,
             "mcts_batch_size": mcts_batch_size,
+            "self_play_workers": self_play_workers,
             "seed": seed,
             "requested_gpu": gpu,
             "eval_games": eval_games,
@@ -272,6 +277,7 @@ else:
                     "dirichlet_eps": 0.25,
                     "batch_size": mcts_batch_size,
                 },
+                "n_selfplay_workers": self_play_workers,
                 "checkpoint_path": None,
                 "seed": seed,
                 "wandb_run": wandb_run,
@@ -418,6 +424,7 @@ else:
         self_play_games: int | None = None,
         sims: int | None = None,
         mcts_batch_size: int = 16,
+        self_play_workers: int = _DEFAULT_SELF_PLAY_WORKERS,
         seed: int = 0,
         gpu: str | None = None,
         eval_games: int = 40,
@@ -436,6 +443,7 @@ else:
             self_play_games=self_play_games,
             sims=sims,
             mcts_batch_size=mcts_batch_size,
+            self_play_workers=self_play_workers,
             seed=seed,
             gpu=gpu,
             eval_games=eval_games,
