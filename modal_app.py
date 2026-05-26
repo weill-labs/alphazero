@@ -13,17 +13,34 @@ _DEFAULT_GATING_GAMES = 20
 _DEFAULT_GATING_THRESHOLD = 0.55
 _DEFAULT_EVAL_INTERVAL = 5
 _DEFAULT_LADDER_GAMES = 20
-_DEFAULT_LADDER_DEPTHS = (1, 2, 4)
-_DEFAULT_LADDER_DEPTHS_CLI = ",".join(str(depth) for depth in _DEFAULT_LADDER_DEPTHS)
-_TICTACTOE_DEFAULTS = {
-    "iterations": 60,
-    "self_play_games": 24,
-    "sims": 128,
-}
-_CONNECTFOUR_DEFAULTS = {
-    "iterations": 120,
-    "self_play_games": 48,
-    "sims": 256,
+# Per-game training defaults; each value is overridable via a CLI flag. gomoku
+# and go use a shallow negamax ladder because deep negamax is intractable on
+# their larger boards.
+_GAME_DEFAULTS: dict[str, dict[str, object]] = {
+    "tictactoe": {
+        "iterations": 60,
+        "self_play_games": 24,
+        "sims": 128,
+        "ladder_depths": (1, 2, 4),
+    },
+    "connectfour": {
+        "iterations": 120,
+        "self_play_games": 48,
+        "sims": 256,
+        "ladder_depths": (1, 2, 4),
+    },
+    "gomoku": {
+        "iterations": 40,
+        "self_play_games": 16,
+        "sims": 96,
+        "ladder_depths": (1,),
+    },
+    "go": {
+        "iterations": 40,
+        "self_play_games": 16,
+        "sims": 96,
+        "ladder_depths": (1,),
+    },
 }
 
 try:
@@ -88,12 +105,13 @@ def _wandb_finish(run) -> None:
         print(f"Warning: wandb finish skipped: {exc}", file=sys.stderr)
 
 
-def _defaults_for_game(game: str) -> Mapping[str, int]:
-    if game == "tictactoe":
-        return _TICTACTOE_DEFAULTS
-    if game == "connectfour":
-        return _CONNECTFOUR_DEFAULTS
-    raise ValueError("game must be 'tictactoe' or 'connectfour'")
+def _defaults_for_game(game: str) -> Mapping[str, object]:
+    try:
+        return _GAME_DEFAULTS[game]
+    except KeyError:
+        raise ValueError(
+            f"unknown game {game!r}; choose from {tuple(_GAME_DEFAULTS)}"
+        ) from None
 
 
 def _resolve_training_args(
@@ -105,9 +123,11 @@ def _resolve_training_args(
 ) -> tuple[int, int, int]:
     defaults = _defaults_for_game(game)
     return (
-        defaults["iterations"] if iterations is None else iterations,
-        defaults["self_play_games"] if self_play_games is None else self_play_games,
-        defaults["sims"] if sims is None else sims,
+        int(defaults["iterations"]) if iterations is None else iterations,
+        int(defaults["self_play_games"])
+        if self_play_games is None
+        else self_play_games,
+        int(defaults["sims"]) if sims is None else sims,
     )
 
 
@@ -189,7 +209,7 @@ else:
         gating_threshold: float = _DEFAULT_GATING_THRESHOLD,
         eval_interval: int = _DEFAULT_EVAL_INTERVAL,
         ladder_games: int = _DEFAULT_LADDER_GAMES,
-        ladder_depths: str = _DEFAULT_LADDER_DEPTHS_CLI,
+        ladder_depths: str | None = None,
     ) -> dict[str, object]:
         from alphazero.arena import (
             DEFAULT_C4_SOLVER_POSITIONS,
@@ -202,8 +222,7 @@ else:
             train_agent,
             train_tictactoe_agent,
         )
-        from alphazero.games.connectfour import ConnectFour
-        from alphazero.games.tictactoe import TicTacToe
+        from alphazero.games import game_from_name
 
         iterations, self_play_games, sims = _resolve_training_args(
             game=game,
@@ -211,14 +230,19 @@ else:
             self_play_games=self_play_games,
             sims=sims,
         )
-        selected_game = ConnectFour() if game == "connectfour" else TicTacToe()
+        selected_game = game_from_name(game)
+        ladder_depths_value = (
+            ladder_depths
+            if ladder_depths is not None
+            else _GAME_DEFAULTS[game]["ladder_depths"]
+        )
         eval_args = _resolve_eval_args(
             gating_interval=gating_interval,
             gating_games=gating_games,
             gating_threshold=gating_threshold,
             eval_interval=eval_interval,
             ladder_games=ladder_games,
-            ladder_depths=ladder_depths,
+            ladder_depths=ladder_depths_value,
         )
         run_config = {
             "game": game,
@@ -311,25 +335,62 @@ else:
                     "config": run_config,
                 }
 
-            perfect_wins, perfect_draws, perfect_losses = play_match(
-                MCTSPlayer(net, num_simulations=eval_sims, seed=seed),
-                PerfectPlayer(),
-                selected_game,
-                eval_games,
-            )
+            if game == "tictactoe":
+                perfect_wins, perfect_draws, perfect_losses = play_match(
+                    MCTSPlayer(net, num_simulations=eval_sims, seed=seed),
+                    PerfectPlayer(),
+                    selected_game,
+                    eval_games,
+                )
+                random_wins, random_draws, random_losses = play_match(
+                    MCTSPlayer(net, num_simulations=eval_sims, seed=seed + 1),
+                    RandomPlayer(seed=seed),
+                    selected_game,
+                    eval_games,
+                )
+                eval_metrics = {
+                    "eval/perfect_wins": perfect_wins,
+                    "eval/perfect_draws": perfect_draws,
+                    "eval/perfect_losses": perfect_losses,
+                    "eval/random_wins": random_wins,
+                    "eval/random_draws": random_draws,
+                    "eval/random_losses": random_losses,
+                    "modal_training_seconds": metrics["modal_training_seconds"],
+                    "modal_iters_per_sec": metrics["modal_iters_per_sec"],
+                    "modal_self_play_games_per_sec": metrics[
+                        "modal_self_play_games_per_sec"
+                    ],
+                }
+                _wandb_log(wandb_run, eval_metrics, step=iterations)
+                return {
+                    "metrics": metrics,
+                    "vs_perfect": {
+                        "wins": perfect_wins,
+                        "draws": perfect_draws,
+                        "losses": perfect_losses,
+                    },
+                    "vs_random": {
+                        "wins": random_wins,
+                        "draws": random_draws,
+                        "losses": random_losses,
+                    },
+                    "config": run_config,
+                }
+
+            # Games without a tractable perfect player (gomoku, go, ...):
+            # benchmark against random play.
             random_wins, random_draws, random_losses = play_match(
-                MCTSPlayer(net, num_simulations=eval_sims, seed=seed + 1),
+                MCTSPlayer(net, num_simulations=eval_sims, seed=seed),
                 RandomPlayer(seed=seed),
                 selected_game,
                 eval_games,
             )
+            random_win_rate = random_wins / eval_games
             eval_metrics = {
-                "eval/perfect_wins": perfect_wins,
-                "eval/perfect_draws": perfect_draws,
-                "eval/perfect_losses": perfect_losses,
                 "eval/random_wins": random_wins,
                 "eval/random_draws": random_draws,
                 "eval/random_losses": random_losses,
+                "eval/random_win_rate": random_win_rate,
                 "modal_training_seconds": metrics["modal_training_seconds"],
                 "modal_iters_per_sec": metrics["modal_iters_per_sec"],
                 "modal_self_play_games_per_sec": metrics[
@@ -339,15 +400,11 @@ else:
             _wandb_log(wandb_run, eval_metrics, step=iterations)
             return {
                 "metrics": metrics,
-                "vs_perfect": {
-                    "wins": perfect_wins,
-                    "draws": perfect_draws,
-                    "losses": perfect_losses,
-                },
                 "vs_random": {
                     "wins": random_wins,
                     "draws": random_draws,
                     "losses": random_losses,
+                    "win_rate": random_win_rate,
                 },
                 "config": run_config,
             }
@@ -370,7 +427,7 @@ else:
         gating_threshold: float = _DEFAULT_GATING_THRESHOLD,
         eval_interval: int = _DEFAULT_EVAL_INTERVAL,
         ladder_games: int = _DEFAULT_LADDER_GAMES,
-        ladder_depths: str = _DEFAULT_LADDER_DEPTHS_CLI,
+        ladder_depths: str | None = None,
     ) -> None:
         remote_train = train_remote.with_options(gpu=gpu) if gpu else train_remote
         result = remote_train.remote(

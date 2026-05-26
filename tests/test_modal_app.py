@@ -154,12 +154,24 @@ def test_modal_app_game_defaults_are_game_specific(monkeypatch) -> None:
         sims=None,
     ) == (120, 48, 256)
     assert module._resolve_training_args(
+        game="gomoku",
+        iterations=None,
+        self_play_games=None,
+        sims=None,
+    ) == (40, 16, 96)
+    assert module._resolve_training_args(
+        game="go",
+        iterations=None,
+        self_play_games=None,
+        sims=None,
+    ) == (40, 16, 96)
+    assert module._resolve_training_args(
         game="connectfour",
         iterations=3,
         self_play_games=4,
         sims=5,
     ) == (3, 4, 5)
-    with pytest.raises(ValueError, match="game must be"):
+    with pytest.raises(ValueError, match="unknown game"):
         module._resolve_training_args(
             game="chess",
             iterations=None,
@@ -293,6 +305,65 @@ def test_modal_remote_threads_eval_args_to_training(monkeypatch) -> None:
     assert captured_kwargs["self_play_mcts_cfg"]["batch_size"] == 8
     assert result["config"]["ladder_depths"] == (1, 4)
     assert result["config"]["mcts_batch_size"] == 8
+
+
+def test_modal_remote_trains_go_generically(monkeypatch) -> None:
+    class FakeImage:
+        def pip_install(self, *packages: str, **kwargs):
+            return self
+
+        def add_local_python_source(self, *modules: str):
+            return self
+
+    class FakeImageFactory:
+        @staticmethod
+        def debian_slim(python_version: str | None = None) -> FakeImage:
+            return FakeImage()
+
+    class FakeApp:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def function(self, **options):
+            return lambda func: func
+
+        def local_entrypoint(self):
+            return lambda func: func
+
+    class FakeSecret:
+        @staticmethod
+        def from_name(name: str) -> SimpleNamespace:
+            return SimpleNamespace(name=name)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "modal",
+        SimpleNamespace(App=FakeApp, Image=FakeImageFactory, Secret=FakeSecret),
+    )
+    module = load_modal_app()
+
+    captured: dict[str, object] = {}
+
+    def fake_train_agent(game, **kwargs):
+        captured["game_type"] = type(game).__name__
+        captured["ladder_depths"] = kwargs["ladder_depths"]
+        return object(), {}
+
+    import alphazero.arena as arena
+
+    monkeypatch.setattr(module, "_wandb_init", lambda **kwargs: None)
+    monkeypatch.setattr(arena, "train_agent", fake_train_agent)
+    monkeypatch.setattr(arena, "play_match", lambda *a, **k: (1, 0, 0))
+
+    result = module.train_remote(
+        game="go", iterations=1, self_play_games=1, sims=1, eval_games=2
+    )
+
+    assert captured["game_type"] == "Go"
+    assert captured["ladder_depths"] == (1,)  # shallow ladder default for go
+    assert "vs_random" in result
+    assert "vs_perfect" not in result  # no tractable perfect player for go
+    assert result["vs_random"]["win_rate"] == 0.5
 
 
 def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
