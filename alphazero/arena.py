@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from alphazero.baselines import NegamaxPlayer
+from alphazero.c4_solver import NodeBudgetExceeded, solve as solve_connect_four
 from alphazero.game import Game, State
 from alphazero.games.connectfour import ConnectFour
 from alphazero.games.tictactoe import TicTacToe
@@ -31,6 +32,10 @@ WANDB_PROJECT = "alphazero-tictactoe"
 DEFAULT_LADDER_DEPTHS = [1, 2, 4, 6]
 DEFAULT_ELO = 0.0
 ELO_K = 32.0
+C4_BOARD_CELLS = 42
+DEFAULT_C4_SOLVER_POSITIONS = 8
+DEFAULT_C4_SOLVER_MAX_EMPTY_CELLS = 16
+DEFAULT_C4_SOLVER_MAX_NODES = 250_000
 
 
 class WandbRun(Protocol):
@@ -242,6 +247,134 @@ def evaluate_ladder(
         wins, _, _ = play_match(player, NegamaxPlayer(depth=depth), game, n_games)
         metrics[f"eval/ladder_negamax_d{depth}_winrate"] = wins / n_games
     return metrics
+
+
+def evaluate_connect_four_solver_anchor(
+    net,
+    game: ConnectFour,
+    *,
+    n_positions: int = DEFAULT_C4_SOLVER_POSITIONS,
+    max_empty_cells: int = DEFAULT_C4_SOLVER_MAX_EMPTY_CELLS,
+    solver_max_nodes: int = DEFAULT_C4_SOLVER_MAX_NODES,
+    seed: int = 0,
+    positions: Sequence[State] | None = None,
+    player: Player | None = None,
+) -> dict[str, float]:
+    """Compare a Connect Four agent against exact solver labels.
+
+    The value metric uses ``net.predict(game.encode(state))``. The move metric
+    uses ``player`` when provided; otherwise it uses the net policy argmax over
+    legal moves.
+    """
+
+    if not isinstance(game, ConnectFour):
+        raise TypeError("evaluate_connect_four_solver_anchor requires ConnectFour")
+    if n_positions <= 0:
+        raise ValueError("n_positions must be positive")
+    if not 1 <= max_empty_cells <= C4_BOARD_CELLS:
+        raise ValueError("max_empty_cells must be in [1, 42]")
+    if solver_max_nodes <= 0:
+        raise ValueError("solver_max_nodes must be positive")
+
+    eval_positions = (
+        list(positions)
+        if positions is not None
+        else _sample_connect_four_solver_positions(
+            game,
+            n_positions=n_positions,
+            max_empty_cells=max_empty_cells,
+            seed=seed,
+        )
+    )
+    value_errors: list[float] = []
+    policy_matches = 0
+    blunders = 0
+
+    for state in eval_positions:
+        if game.is_terminal(state):
+            continue
+        legal = game.legal_moves(state)
+        if not legal:
+            continue
+        try:
+            solver_value, optimal_moves = solve_connect_four(
+                state,
+                max_nodes=solver_max_nodes,
+            )
+        except NodeBudgetExceeded:
+            continue
+        if not optimal_moves:
+            continue
+
+        policy, net_value = net.predict(game.encode(state))
+        chosen_move = (
+            player.select_action(game, state)
+            if player is not None
+            else _policy_argmax_legal(policy, legal)
+        )
+        if chosen_move not in legal:
+            raise ValueError(f"agent selected illegal action {chosen_move}")
+
+        try:
+            child_value, _ = solve_connect_four(
+                game.apply_move(state, chosen_move),
+                max_nodes=solver_max_nodes,
+            )
+        except NodeBudgetExceeded:
+            continue
+
+        value_errors.append(abs(float(net_value) - float(solver_value)))
+        if chosen_move in optimal_moves:
+            policy_matches += 1
+        if -child_value < solver_value:
+            blunders += 1
+
+    count = len(value_errors)
+    if count == 0:
+        return {
+            "eval/c4_value_mae": 0.0,
+            "eval/c4_policy_match": 0.0,
+            "eval/c4_blunder_rate": 0.0,
+            "eval/c4_solver_positions": 0.0,
+        }
+    return {
+        "eval/c4_value_mae": float(np.mean(value_errors)),
+        "eval/c4_policy_match": policy_matches / count,
+        "eval/c4_blunder_rate": blunders / count,
+        "eval/c4_solver_positions": float(count),
+    }
+
+
+def _sample_connect_four_solver_positions(
+    game: ConnectFour,
+    *,
+    n_positions: int,
+    max_empty_cells: int,
+    seed: int,
+) -> list[State]:
+    rng = np.random.default_rng(seed)
+    target_moves = C4_BOARD_CELLS - max_empty_cells
+    positions: list[State] = []
+    max_attempts = max(n_positions * 50, 50)
+
+    for _ in range(max_attempts):
+        state = game.initial_state()
+        for _ in range(target_moves):
+            legal = game.legal_moves(state)
+            if not legal or game.is_terminal(state):
+                break
+            state = game.apply_move(state, int(rng.choice(legal)))
+        if not game.is_terminal(state) and game.legal_moves(state):
+            positions.append(state)
+            if len(positions) == n_positions:
+                break
+
+    return positions
+
+
+def _policy_argmax_legal(policy: np.ndarray, legal: Sequence[int]) -> int:
+    scores = np.asarray(policy, dtype=np.float64)
+    return max(legal, key=lambda action: (float(scores[action]), -action))
 
 
 def immediate_winning_moves(game: Game, state: State) -> list[int]:
@@ -689,6 +822,15 @@ def train_agent(
                         seed=ladder_seed + 1,
                     )
                 )
+                if isinstance(game, ConnectFour):
+                    metrics.update(
+                        evaluate_connect_four_solver_anchor(
+                            net,
+                            game,
+                            n_positions=DEFAULT_C4_SOLVER_POSITIONS,
+                            seed=ladder_seed + 2,
+                        )
+                    )
 
             _wandb_log(active_wandb_run, metrics, step=iteration + 1)
     finally:
@@ -873,6 +1015,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             tactical_metrics = evaluate_connect_four_tactics(
                 agent, cast(ConnectFour, game)
             )
+            solver_metrics = evaluate_connect_four_solver_anchor(
+                net,
+                cast(ConnectFour, game),
+                n_positions=max(1, min(args.eval_games, DEFAULT_C4_SOLVER_POSITIONS)),
+                seed=args.seed,
+            )
             random_wins, random_draws, random_losses = play_match(
                 agent,
                 RandomPlayer(seed=args.seed),
@@ -894,6 +1042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "eval/c4_random_wins": random_wins,
                     "eval/c4_random_draws": random_draws,
                     "eval/c4_random_losses": random_losses,
+                    **solver_metrics,
                 },
                 step=args.iterations,
             )
@@ -901,6 +1050,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "metrics": metrics,
                     "c4_tactics": tactical_metrics,
+                    "c4_solver": solver_metrics,
                     "vs_random": vs_random,
                 }
             )

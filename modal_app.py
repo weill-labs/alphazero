@@ -179,9 +179,11 @@ else:
         ladder_depths: str = _DEFAULT_LADDER_DEPTHS_CLI,
     ) -> dict[str, object]:
         from alphazero.arena import (
+            DEFAULT_C4_SOLVER_POSITIONS,
             MCTSPlayer,
             PerfectPlayer,
             RandomPlayer,
+            evaluate_connect_four_solver_anchor,
             evaluate_connect_four_tactics,
             play_match,
             train_agent,
@@ -250,6 +252,12 @@ else:
             if game == "connectfour":
                 agent = MCTSPlayer(net, num_simulations=eval_sims, seed=seed)
                 tactical_metrics = evaluate_connect_four_tactics(agent, selected_game)
+                solver_metrics = evaluate_connect_four_solver_anchor(
+                    net,
+                    selected_game,
+                    n_positions=max(1, min(eval_games, DEFAULT_C4_SOLVER_POSITIONS)),
+                    seed=seed,
+                )
                 random_wins, random_draws, random_losses = play_match(
                     agent,
                     RandomPlayer(seed=seed),
@@ -266,6 +274,7 @@ else:
                     "eval/c4_random_draws": random_draws,
                     "eval/c4_random_losses": random_losses,
                     "eval/c4_random_win_rate": random_win_rate,
+                    **solver_metrics,
                     "modal_training_seconds": metrics["modal_training_seconds"],
                     "modal_iters_per_sec": metrics["modal_iters_per_sec"],
                     "modal_self_play_games_per_sec": metrics[
@@ -276,6 +285,7 @@ else:
                 return {
                     "metrics": metrics,
                     "c4_tactics": tactical_metrics,
+                    "c4_solver": solver_metrics,
                     "vs_random": {
                         "wins": random_wins,
                         "draws": random_draws,
