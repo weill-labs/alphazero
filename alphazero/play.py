@@ -12,8 +12,7 @@ import torch
 
 from alphazero.arena import MCTSPlayer
 from alphazero.game import Game, State
-from alphazero.games.connectfour import ConnectFour
-from alphazero.games.tictactoe import TicTacToe
+from alphazero.games import GAME_CHOICES, game_from_name
 from alphazero.network import AlphaZeroNet
 
 
@@ -30,14 +29,6 @@ class PlayResult:
     winner: int
     human_player: int
     message: str
-
-
-def game_from_name(name: str) -> Game:
-    if name == "tictactoe":
-        return TicTacToe()
-    if name == "connectfour":
-        return ConnectFour()
-    raise ValueError("game must be 'tictactoe' or 'connectfour'")
 
 
 def parse_move(raw_move: str) -> int:
@@ -147,7 +138,7 @@ def main(
     parser = argparse.ArgumentParser(
         description="Play a human game against a trained AlphaZero checkpoint."
     )
-    parser.add_argument("--game", choices=("tictactoe", "connectfour"), required=True)
+    parser.add_argument("--game", choices=GAME_CHOICES, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--sims", type=int, default=200)
     parser.add_argument("--human-first", action="store_true")
