@@ -27,6 +27,7 @@ class BenchmarkConfig:
     game_name: str = "tictactoe"
     self_play_games: int = 2
     mcts_simulations: int = 32
+    mcts_batch_size: int = 16
     train_epochs: int = 4
     batch_size: int = 32
     seed: int = 0
@@ -68,9 +69,7 @@ class BenchmarkResult:
 
         return {
             "self-play MCTS overhead": self.breakdown.mcts_non_inference_seconds,
-            "sequential single-position MCTS network inference": (
-                self.breakdown.network_inference_seconds
-            ),
+            "MCTS network inference": self.breakdown.network_inference_seconds,
             "train step": self.breakdown.train_step_seconds,
         }
 
@@ -112,6 +111,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                     game,
                     {
                         "num_simulations": config.mcts_simulations,
+                        "batch_size": config.mcts_batch_size,
                         "dirichlet_eps": config.dirichlet_eps,
                         "seed": int(rng.integers(0, np.iinfo(np.int32).max)),
                     },
@@ -191,6 +191,7 @@ def format_report(result: BenchmarkResult) -> str:
                 "workload: "
                 f"self_play_games={result.config.self_play_games}, "
                 f"mcts_sims={result.config.mcts_simulations}, "
+                f"mcts_batch_size={result.config.mcts_batch_size}, "
                 f"train_epochs={result.config.train_epochs}, "
                 f"batch_size={result.config.batch_size}, "
                 f"seed={result.config.seed}"
@@ -236,6 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         game_name=args.game,
         self_play_games=args.self_play_games,
         mcts_simulations=args.mcts_sims,
+        mcts_batch_size=args.mcts_batch_size,
         train_epochs=args.train_epochs,
         batch_size=args.batch_size,
         seed=args.seed,
@@ -271,6 +273,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--self-play-games", type=int, default=2)
     parser.add_argument("--mcts-sims", type=int, default=32)
+    parser.add_argument("--mcts-batch-size", type=int, default=16)
     parser.add_argument("--train-epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
@@ -306,6 +309,8 @@ def _validate_config(config: BenchmarkConfig) -> None:
         raise ValueError("self_play_games must be positive")
     if config.mcts_simulations <= 0:
         raise ValueError("mcts_simulations must be positive")
+    if config.mcts_batch_size <= 0:
+        raise ValueError("mcts_batch_size must be positive")
     if config.train_epochs <= 0:
         raise ValueError("train_epochs must be positive")
     if config.batch_size <= 0:

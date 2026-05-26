@@ -20,6 +20,37 @@ class DummyNet:
         self.action_size = action_size
         self._priors = priors
         self._value = value
+        self.predict_calls = 0
+        self.predict_batch_calls = 0
+        self.batch_sizes: list[int] = []
+
+    def _policy(self) -> np.ndarray:
+        if self._priors is None:
+            return np.ones(self.action_size, dtype=np.float32) / self.action_size
+        return np.asarray(self._priors, dtype=np.float32)
+
+    def predict(self, state_encoding: np.ndarray) -> tuple[np.ndarray, float]:
+        self.predict_calls += 1
+        return self._policy(), float(self._value)
+
+    def predict_batch(
+        self, state_encodings: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        self.predict_batch_calls += 1
+        batch_size = state_encodings.shape[0]
+        self.batch_sizes.append(batch_size)
+        probs = np.stack([self._policy() for _ in range(batch_size)], axis=0)
+        values = np.full(batch_size, self._value, dtype=np.float32)
+        return probs, values
+
+
+class PredictOnlyDummyNet:
+    """Dummy net without predict_batch, exercising MCTS' sequential fallback."""
+
+    def __init__(self, action_size: int, priors=None, value: float = 0.0) -> None:
+        self.action_size = action_size
+        self._priors = priors
+        self._value = value
 
     def predict(self, state_encoding: np.ndarray) -> tuple[np.ndarray, float]:
         if self._priors is None:
@@ -62,6 +93,21 @@ def test_pi_zero_on_illegal_moves(game: TicTacToe) -> None:
     assert legal_mass == pytest.approx(1.0, abs=1e-9)
 
 
+def test_batched_pi_is_distribution_over_legal_moves(game: TicTacToe) -> None:
+    state = _state_after(game, [0, 4])  # occupied: 0,4
+    net = DummyNet(game.action_size)
+    mcts = MCTS(net, game, num_simulations=64, seed=0, batch_size=8)
+
+    pi = mcts.run(state)
+
+    assert pi.shape == (game.action_size,)
+    assert pi.sum() == pytest.approx(1.0, abs=1e-9)
+    assert np.all(pi >= 0)
+    for illegal in (0, 4):
+        assert pi[illegal] == 0
+    assert any(size > 1 for size in net.batch_sizes)
+
+
 def test_run_on_terminal_state_returns_zero_policy(game: TicTacToe) -> None:
     terminal = _state_after(game, [0, 3, 1, 4, 2])  # X completes the top row
     assert game.is_terminal(terminal)
@@ -81,6 +127,46 @@ def test_finds_immediate_winning_move(game: TicTacToe) -> None:
     pi = mcts.run(state)
     assert int(np.argmax(pi)) == 2  # the winning move dominates the visits
     assert pi[2] > 0.5
+
+
+def test_batched_mcts_finds_immediate_winning_move(game: TicTacToe) -> None:
+    # X at 0,1 (top row, needs cell 2); O at 3,4. X to move and wins by playing 2.
+    state = _state_after(game, [0, 3, 1, 4])
+    net = DummyNet(game.action_size)
+    mcts = MCTS(net, game, num_simulations=100, seed=0, batch_size=8)
+
+    pi = mcts.run(state)
+
+    assert int(np.argmax(pi)) == 2
+    assert pi[2] > 0.5
+
+
+def test_batch_size_one_matches_sequential_search(game: TicTacToe) -> None:
+    state = _state_after(game, [0, 4, 8])
+    priors = np.asarray([9, 1, 4, 2, 8, 3, 7, 5, 6], dtype=np.float32)
+    priors /= priors.sum()
+    batched_net = DummyNet(game.action_size, priors=priors, value=0.15)
+    sequential_net = PredictOnlyDummyNet(game.action_size, priors=priors, value=0.15)
+
+    batched = MCTS(
+        batched_net,
+        game,
+        num_simulations=48,
+        seed=0,
+        batch_size=1,
+        dirichlet_eps=0.0,
+    ).run(state)
+    sequential = MCTS(
+        sequential_net,
+        game,
+        num_simulations=48,
+        seed=0,
+        batch_size=1,
+        dirichlet_eps=0.0,
+    ).run(state)
+
+    np.testing.assert_allclose(batched, sequential, atol=0.0)
+    assert set(batched_net.batch_sizes) == {1}
 
 
 def test_blocks_opponents_immediate_win(game: TicTacToe) -> None:

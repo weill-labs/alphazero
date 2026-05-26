@@ -87,17 +87,39 @@ class AlphaZeroNet(nn.Module):
                 f"expected state encoding shape {expected_shape}, got {state_encoding.shape}"
             )
 
+        policy_probs, values = self.predict_batch(
+            np.expand_dims(state_encoding, axis=0)
+        )
+        return policy_probs[0], float(values[0])
+
+    def predict_batch(
+        self, state_encodings: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Evaluate a batch of encoded states.
+
+        Returns policy probabilities with shape ``(B, action_size)`` and values
+        with shape ``(B,)`` from each state's current-player perspective.
+        """
+
+        expected_shape = (self.num_planes, *self.board_shape)
+        if (
+            state_encodings.ndim != 4
+            or tuple(state_encodings.shape[1:]) != expected_shape
+        ):
+            raise ValueError(
+                f"expected state encodings shape (B, {expected_shape}), "
+                f"got {state_encodings.shape}"
+            )
+
         was_training = self.training
         self.train(False)
         try:
             with torch.no_grad():
                 device = next(self.parameters()).device
-                x = torch.as_tensor(
-                    state_encoding, dtype=torch.float32, device=device
-                ).unsqueeze(0)
+                x = torch.as_tensor(state_encodings, dtype=torch.float32, device=device)
                 policy_logits, value = self(x)
-                policy_probs = F.softmax(policy_logits, dim=-1).squeeze(0)
-                return policy_probs.cpu().numpy(), float(value.item())
+                policy_probs = F.softmax(policy_logits, dim=-1)
+                return policy_probs.cpu().numpy(), value.cpu().numpy()
         finally:
             if was_training:
                 self.train()
