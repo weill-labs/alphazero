@@ -52,6 +52,15 @@ wandb/
 .dolt/
 *.db
 .beads-credential-key
+.beads/interactions.jsonl
+.beads/README.md
+.beads/hooks/
+.beads/dolt*
+.beads/dolt*/.beads/*-wal
+.beads/.br_history/
+.beads/.br_recovery/
+.beads/*.lock
+.beads/last-touched
 
 # old beads_rust data (pre-bd migration), kept locally
 .beads_br_backup/

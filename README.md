@@ -42,6 +42,20 @@ uv sync --extra dev     # + pytest
 uv sync --extra modal   # + modal (for cloud training)
 ```
 
+To sync every optional dependency used by the local helper commands:
+
+```bash
+make sync
+```
+
+## Common commands
+
+```bash
+make test   # uv run --extra dev pytest
+make modal  # uv run --extra modal modal run modal_app.py
+make bench  # uv run --extra dev python -m alphazero.benchmark
+```
+
 ## Train locally
 
 ```bash
