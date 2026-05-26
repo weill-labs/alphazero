@@ -113,6 +113,23 @@ def test_modal_app_registers_remote_training_without_real_modal(monkeypatch) -> 
     assert module.app.entrypoint.__defaults__[:4] == ("tictactoe", None, None, None)
 
 
+def test_modal_app_constructs_with_real_modal() -> None:
+    # Smoke test against the real modal package (skipped when it isn't
+    # installed). Guards the #7-style regression where modal_app.py was emptied:
+    # the fake-modal tests above cannot catch a broken real-modal app/image.
+    pytest.importorskip("modal")
+
+    module = load_modal_app()
+
+    assert module.app is not None, "modal_app.app is None — entrypoint missing"
+    assert module.app.name == "alphazero"
+    assert module.image is not None, "modal_app.image is None"
+    # Under real modal these are wrapped objects (a Function / local entrypoint),
+    # not plain callables; their existence proves the app was constructed.
+    assert module.train_remote is not None
+    assert module.main is not None
+
+
 def test_modal_app_game_defaults_are_game_specific(monkeypatch) -> None:
     real_import = builtins.__import__
 
