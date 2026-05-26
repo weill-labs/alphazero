@@ -5,9 +5,16 @@ from __future__ import annotations
 import json
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 WANDB_PROJECT = "alphazero-tictactoe"
+_DEFAULT_GATING_INTERVAL = 5
+_DEFAULT_GATING_GAMES = 20
+_DEFAULT_GATING_THRESHOLD = 0.55
+_DEFAULT_EVAL_INTERVAL = 5
+_DEFAULT_LADDER_GAMES = 20
+_DEFAULT_LADDER_DEPTHS = (1, 2, 4)
+_DEFAULT_LADDER_DEPTHS_CLI = ",".join(str(depth) for depth in _DEFAULT_LADDER_DEPTHS)
 _TICTACTOE_DEFAULTS = {
     "iterations": 60,
     "self_play_games": 24,
@@ -99,6 +106,39 @@ def _resolve_training_args(
     )
 
 
+def _parse_ladder_depths(ladder_depths: str | Sequence[int]) -> tuple[int, ...]:
+    if isinstance(ladder_depths, str):
+        depths = tuple(
+            int(part.strip()) for part in ladder_depths.split(",") if part.strip()
+        )
+    else:
+        depths = tuple(int(depth) for depth in ladder_depths)
+    if not depths:
+        raise ValueError("ladder_depths must contain at least one depth")
+    if any(depth < 1 for depth in depths):
+        raise ValueError("ladder_depths must all be at least 1")
+    return depths
+
+
+def _resolve_eval_args(
+    *,
+    gating_interval: int,
+    gating_games: int,
+    gating_threshold: float,
+    eval_interval: int,
+    ladder_games: int,
+    ladder_depths: str | Sequence[int],
+) -> dict[str, object]:
+    return {
+        "gating_interval": gating_interval,
+        "gating_games": gating_games,
+        "gating_threshold": gating_threshold,
+        "eval_interval": eval_interval,
+        "ladder_games": ladder_games,
+        "ladder_depths": _parse_ladder_depths(ladder_depths),
+    }
+
+
 if modal is None:
     app = None
     image = None
@@ -131,6 +171,12 @@ else:
         gpu: str | None = None,
         eval_games: int = 40,
         eval_sims: int = 200,
+        gating_interval: int = _DEFAULT_GATING_INTERVAL,
+        gating_games: int = _DEFAULT_GATING_GAMES,
+        gating_threshold: float = _DEFAULT_GATING_THRESHOLD,
+        eval_interval: int = _DEFAULT_EVAL_INTERVAL,
+        ladder_games: int = _DEFAULT_LADDER_GAMES,
+        ladder_depths: str = _DEFAULT_LADDER_DEPTHS_CLI,
     ) -> dict[str, object]:
         from alphazero.arena import (
             MCTSPlayer,
@@ -151,6 +197,14 @@ else:
             sims=sims,
         )
         selected_game = ConnectFour() if game == "connectfour" else TicTacToe()
+        eval_args = _resolve_eval_args(
+            gating_interval=gating_interval,
+            gating_games=gating_games,
+            gating_threshold=gating_threshold,
+            eval_interval=eval_interval,
+            ladder_games=ladder_games,
+            ladder_depths=ladder_depths,
+        )
         run_config = {
             "game": game,
             "iterations": iterations,
@@ -160,6 +214,7 @@ else:
             "requested_gpu": gpu,
             "eval_games": eval_games,
             "eval_sims": eval_sims,
+            **eval_args,
         }
         wandb_run = _wandb_init(
             run_name=f"modal-{game}-seed-{seed}",
@@ -179,6 +234,7 @@ else:
                 "seed": seed,
                 "wandb_run": wandb_run,
                 "wandb_config": run_config,
+                **eval_args,
             }
             if game == "tictactoe":
                 net, metrics = train_tictactoe_agent(**training_kwargs)
@@ -282,6 +338,12 @@ else:
         gpu: str | None = None,
         eval_games: int = 40,
         eval_sims: int = 200,
+        gating_interval: int = _DEFAULT_GATING_INTERVAL,
+        gating_games: int = _DEFAULT_GATING_GAMES,
+        gating_threshold: float = _DEFAULT_GATING_THRESHOLD,
+        eval_interval: int = _DEFAULT_EVAL_INTERVAL,
+        ladder_games: int = _DEFAULT_LADDER_GAMES,
+        ladder_depths: str = _DEFAULT_LADDER_DEPTHS_CLI,
     ) -> None:
         remote_train = train_remote.with_options(gpu=gpu) if gpu else train_remote
         result = remote_train.remote(
@@ -293,5 +355,11 @@ else:
             gpu=gpu,
             eval_games=eval_games,
             eval_sims=eval_sims,
+            gating_interval=gating_interval,
+            gating_games=gating_games,
+            gating_threshold=gating_threshold,
+            eval_interval=eval_interval,
+            ladder_games=ladder_games,
+            ladder_depths=ladder_depths,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
