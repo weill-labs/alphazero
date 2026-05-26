@@ -1,4 +1,4 @@
-"""Optional Modal app for cloud tic-tac-toe AlphaZero training."""
+"""Optional Modal app for cloud AlphaZero training."""
 
 from __future__ import annotations
 
@@ -8,6 +8,16 @@ import time
 from collections.abc import Mapping
 
 WANDB_PROJECT = "alphazero-tictactoe"
+_TICTACTOE_DEFAULTS = {
+    "iterations": 60,
+    "self_play_games": 24,
+    "sims": 128,
+}
+_CONNECTFOUR_DEFAULTS = {
+    "iterations": 120,
+    "self_play_games": 48,
+    "sims": 256,
+}
 
 try:
     import modal
@@ -25,7 +35,7 @@ def _modal_missing() -> RuntimeError:
 def _wandb_init(
     *,
     run_name: str,
-    config: Mapping[str, int | str | None],
+    config: Mapping[str, object],
 ):
     try:
         import wandb
@@ -66,6 +76,29 @@ def _wandb_finish(run) -> None:
         print(f"Warning: wandb finish skipped: {exc}", file=sys.stderr)
 
 
+def _defaults_for_game(game: str) -> Mapping[str, int]:
+    if game == "tictactoe":
+        return _TICTACTOE_DEFAULTS
+    if game == "connectfour":
+        return _CONNECTFOUR_DEFAULTS
+    raise ValueError("game must be 'tictactoe' or 'connectfour'")
+
+
+def _resolve_training_args(
+    *,
+    game: str,
+    iterations: int | None,
+    self_play_games: int | None,
+    sims: int | None,
+) -> tuple[int, int, int]:
+    defaults = _defaults_for_game(game)
+    return (
+        defaults["iterations"] if iterations is None else iterations,
+        defaults["self_play_games"] if self_play_games is None else self_play_games,
+        defaults["sims"] if sims is None else sims,
+    )
+
+
 if modal is None:
     app = None
     image = None
@@ -90,9 +123,10 @@ else:
         secrets=[modal.Secret.from_name("wandb")],
     )
     def train_remote(
-        iterations: int = 60,
-        self_play_games: int = 24,
-        sims: int = 128,
+        game: str = "tictactoe",
+        iterations: int | None = None,
+        self_play_games: int | None = None,
+        sims: int | None = None,
         seed: int = 0,
         gpu: str | None = None,
         eval_games: int = 40,
@@ -102,12 +136,23 @@ else:
             MCTSPlayer,
             PerfectPlayer,
             RandomPlayer,
+            evaluate_connect_four_tactics,
             play_match,
+            train_agent,
             train_tictactoe_agent,
         )
+        from alphazero.games.connectfour import ConnectFour
         from alphazero.games.tictactoe import TicTacToe
 
+        iterations, self_play_games, sims = _resolve_training_args(
+            game=game,
+            iterations=iterations,
+            self_play_games=self_play_games,
+            sims=sims,
+        )
+        selected_game = ConnectFour() if game == "connectfour" else TicTacToe()
         run_config = {
+            "game": game,
             "iterations": iterations,
             "self_play_games": self_play_games,
             "self_play_sims": sims,
@@ -117,41 +162,83 @@ else:
             "eval_sims": eval_sims,
         }
         wandb_run = _wandb_init(
-            run_name=f"modal-tictactoe-seed-{seed}",
+            run_name=f"modal-{game}-seed-{seed}",
             config=run_config,
         )
         _print_wandb_url(wandb_run)
         try:
             training_started = time.perf_counter()
-            net, metrics = train_tictactoe_agent(
-                iterations=iterations,
-                self_play_games_per_iteration=self_play_games,
-                self_play_mcts_cfg={
+            training_kwargs = {
+                "iterations": iterations,
+                "self_play_games_per_iteration": self_play_games,
+                "self_play_mcts_cfg": {
                     "num_simulations": sims,
                     "dirichlet_eps": 0.25,
                 },
-                checkpoint_path=None,
-                seed=seed,
-                wandb_run=wandb_run,
-                wandb_config=run_config,
-            )
+                "checkpoint_path": None,
+                "seed": seed,
+                "wandb_run": wandb_run,
+                "wandb_config": run_config,
+            }
+            if game == "tictactoe":
+                net, metrics = train_tictactoe_agent(**training_kwargs)
+            else:
+                net, metrics = train_agent(selected_game, **training_kwargs)
             training_seconds = max(time.perf_counter() - training_started, 1e-12)
             metrics["modal_training_seconds"] = training_seconds
             metrics["modal_iters_per_sec"] = iterations / training_seconds
             metrics["modal_self_play_games_per_sec"] = (
                 iterations * self_play_games / training_seconds
             )
-            game = TicTacToe()
+
+            if game == "connectfour":
+                agent = MCTSPlayer(net, num_simulations=eval_sims, seed=seed)
+                tactical_metrics = evaluate_connect_four_tactics(agent, selected_game)
+                random_wins, random_draws, random_losses = play_match(
+                    agent,
+                    RandomPlayer(seed=seed),
+                    selected_game,
+                    eval_games,
+                )
+                random_win_rate = random_wins / eval_games
+                eval_metrics = {
+                    "eval/c4_immediate_win_rate": tactical_metrics[
+                        "immediate_win_rate"
+                    ],
+                    "eval/c4_block_rate": tactical_metrics["block_rate"],
+                    "eval/c4_random_wins": random_wins,
+                    "eval/c4_random_draws": random_draws,
+                    "eval/c4_random_losses": random_losses,
+                    "eval/c4_random_win_rate": random_win_rate,
+                    "modal_training_seconds": metrics["modal_training_seconds"],
+                    "modal_iters_per_sec": metrics["modal_iters_per_sec"],
+                    "modal_self_play_games_per_sec": metrics[
+                        "modal_self_play_games_per_sec"
+                    ],
+                }
+                _wandb_log(wandb_run, eval_metrics, step=iterations)
+                return {
+                    "metrics": metrics,
+                    "c4_tactics": tactical_metrics,
+                    "vs_random": {
+                        "wins": random_wins,
+                        "draws": random_draws,
+                        "losses": random_losses,
+                        "win_rate": random_win_rate,
+                    },
+                    "config": run_config,
+                }
+
             perfect_wins, perfect_draws, perfect_losses = play_match(
                 MCTSPlayer(net, num_simulations=eval_sims, seed=seed),
                 PerfectPlayer(),
-                game,
+                selected_game,
                 eval_games,
             )
             random_wins, random_draws, random_losses = play_match(
                 MCTSPlayer(net, num_simulations=eval_sims, seed=seed + 1),
                 RandomPlayer(seed=seed),
-                game,
+                selected_game,
                 eval_games,
             )
             eval_metrics = {
@@ -187,9 +274,10 @@ else:
 
     @app.local_entrypoint()
     def main(
-        iterations: int = 60,
-        self_play_games: int = 24,
-        sims: int = 128,
+        game: str = "tictactoe",
+        iterations: int | None = None,
+        self_play_games: int | None = None,
+        sims: int | None = None,
         seed: int = 0,
         gpu: str | None = None,
         eval_games: int = 40,
@@ -197,6 +285,7 @@ else:
     ) -> None:
         remote_train = train_remote.with_options(gpu=gpu) if gpu else train_remote
         result = remote_train.remote(
+            game=game,
             iterations=iterations,
             self_play_games=self_play_games,
             sims=sims,

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import builtins
+import json
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 
 def load_modal_app():
@@ -102,4 +105,123 @@ def test_modal_app_registers_remote_training_without_real_modal(monkeypatch) -> 
     assert module.app.functions[0].options["image"] is module.image
     assert module.app.functions[0].options["timeout"] == 6 * 60 * 60
     assert module.app.entrypoint is not None
-    assert module.app.entrypoint.__defaults__[:3] == (60, 24, 128)
+    assert module.app.entrypoint.__defaults__[:4] == ("tictactoe", None, None, None)
+
+
+def test_modal_app_game_defaults_are_game_specific(monkeypatch) -> None:
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "modal":
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    module = load_modal_app()
+
+    assert module._resolve_training_args(
+        game="tictactoe",
+        iterations=None,
+        self_play_games=None,
+        sims=None,
+    ) == (60, 24, 128)
+    assert module._resolve_training_args(
+        game="connectfour",
+        iterations=None,
+        self_play_games=None,
+        sims=None,
+    ) == (120, 48, 256)
+    assert module._resolve_training_args(
+        game="connectfour",
+        iterations=3,
+        self_play_games=4,
+        sims=5,
+    ) == (3, 4, 5)
+    with pytest.raises(ValueError, match="game must be"):
+        module._resolve_training_args(
+            game="chess",
+            iterations=None,
+            self_play_games=None,
+            sims=None,
+        )
+
+
+def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
+    class FakeImage:
+        def pip_install(self, *packages: str):
+            return self
+
+        def add_local_python_source(self, *modules: str):
+            return self
+
+    class FakeImageFactory:
+        @staticmethod
+        def debian_slim(python_version: str | None = None) -> FakeImage:
+            return FakeImage()
+
+    class FakeFunction:
+        def __init__(self) -> None:
+            self.options: dict[str, object] = {}
+
+        def with_options(self, **kwargs):
+            self.options.update(kwargs)
+            return self
+
+        def remote(self, **kwargs):
+            return kwargs
+
+    class FakeApp:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.entrypoint = None
+
+        def function(self, **options):
+            def decorate(func):
+                return FakeFunction()
+
+            return decorate
+
+        def local_entrypoint(self):
+            def decorate(func):
+                self.entrypoint = func
+                return func
+
+            return decorate
+
+    class FakeSecret:
+        @staticmethod
+        def from_name(name: str) -> SimpleNamespace:
+            return SimpleNamespace(name=name)
+
+    fake_modal = SimpleNamespace(
+        App=FakeApp,
+        Image=FakeImageFactory,
+        Secret=FakeSecret,
+    )
+    monkeypatch.setitem(sys.modules, "modal", fake_modal)
+    module = load_modal_app()
+
+    module.app.entrypoint(
+        game="connectfour",
+        iterations=3,
+        self_play_games=4,
+        sims=5,
+        seed=6,
+        gpu="A10G",
+        eval_games=7,
+        eval_sims=8,
+    )
+
+    expected = {
+        "eval_games": 7,
+        "eval_sims": 8,
+        "game": "connectfour",
+        "gpu": "A10G",
+        "iterations": 3,
+        "seed": 6,
+        "self_play_games": 4,
+        "sims": 5,
+    }
+    assert (
+        capsys.readouterr().out == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+    )
