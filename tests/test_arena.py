@@ -28,6 +28,7 @@ from alphazero.arena import (
 from alphazero.game import Game, State
 from alphazero.games.connectfour import ConnectFour
 from alphazero.games.tictactoe import TicTacToe
+from alphazero.network import AlphaZeroNet
 
 
 class OneMoveState(NamedTuple):
@@ -219,6 +220,61 @@ def test_train_agent_self_play_uses_latest_net(monkeypatch) -> None:
 
     assert len(seen_weight_sums) == 2
     assert seen_weight_sums[1] > seen_weight_sums[0]
+
+
+def test_parallel_self_play_matches_sequential_shapes_and_is_deterministic() -> None:
+    torch.manual_seed(0)
+    game = TicTacToe()
+    net = AlphaZeroNet(game.num_planes, game.board_shape, game.action_size)
+    game_seeds = [101, 202]
+    mcts_cfg = {"num_simulations": 2, "dirichlet_eps": 0.25}
+
+    sequential = arena._self_play_examples_for_iteration(
+        net,
+        game,
+        mcts_cfg,
+        game_seeds,
+        n_selfplay_workers=1,
+    )
+    parallel = arena._self_play_examples_for_iteration(
+        net,
+        game,
+        mcts_cfg,
+        game_seeds,
+        n_selfplay_workers=2,
+    )
+    parallel_again = arena._self_play_examples_for_iteration(
+        net,
+        game,
+        mcts_cfg,
+        game_seeds,
+        n_selfplay_workers=2,
+    )
+
+    assert len(parallel) == len(sequential)
+    assert len(parallel_again) == len(parallel)
+    for expected, actual in zip(sequential, parallel, strict=True):
+        expected_state, expected_policy, _ = expected
+        actual_state, actual_policy, actual_value = actual
+        assert (
+            actual_state.shape
+            == expected_state.shape
+            == (
+                game.num_planes,
+                *game.board_shape,
+            )
+        )
+        assert actual_policy.shape == expected_policy.shape == (game.action_size,)
+        assert actual_value in {-1, 0, 1}
+        assert np.isclose(actual_policy.sum(), 1.0)
+        assert np.all(actual_policy >= 0.0)
+
+    for first, second in zip(parallel, parallel_again, strict=True):
+        first_state, first_policy, first_value = first
+        second_state, second_policy, second_value = second
+        np.testing.assert_array_equal(first_state, second_state)
+        np.testing.assert_array_equal(first_policy, second_policy)
+        assert first_value == second_value
 
 
 def test_train_agent_returns_and_checkpoints_latest_net_when_gate_rejects(

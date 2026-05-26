@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
+import torch.multiprocessing as torch_mp
 
 from alphazero.baselines import NegamaxPlayer
 from alphazero.c4_solver import NodeBudgetExceeded, solve as solve_connect_four
@@ -552,6 +554,149 @@ def _clone_net(net: AlphaZeroNet) -> AlphaZeroNet:
     return clone
 
 
+def _worker_net_kwargs(net: AlphaZeroNet) -> dict[str, object]:
+    return {
+        "num_planes": net.num_planes,
+        "board_shape": net.board_shape,
+        "action_size": net.action_size,
+        "channels": net.channels,
+        "num_res_blocks": net.num_res_blocks,
+    }
+
+
+def _worker_state_dict(net: AlphaZeroNet) -> dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu() for name, tensor in net.state_dict().items()}
+
+
+def _self_play_worker(
+    task: tuple[
+        dict[str, object],
+        dict[str, torch.Tensor],
+        Game,
+        dict[str, object],
+        list[tuple[int, int]],
+        bool,
+    ],
+) -> tuple[list[tuple[int, list[SelfPlayExample]]], list[tuple[str, float]]]:
+    (
+        net_kwargs,
+        state_dict,
+        game,
+        self_play_mcts_cfg,
+        indexed_game_seeds,
+        collect_timings,
+    ) = task
+    torch.set_num_threads(1)
+    net = AlphaZeroNet(
+        int(net_kwargs["num_planes"]),
+        cast(tuple[int, int], net_kwargs["board_shape"]),
+        int(net_kwargs["action_size"]),
+        channels=int(net_kwargs["channels"]),
+        num_res_blocks=int(net_kwargs["num_res_blocks"]),
+    )
+    net.load_state_dict(state_dict)
+    net.train(False)
+
+    timing_events: list[tuple[str, float]] = []
+
+    def record_timing(name: str, seconds: float) -> None:
+        timing_events.append((name, seconds))
+
+    timing_hook = record_timing if collect_timings else None
+    results: list[tuple[int, list[SelfPlayExample]]] = []
+    for game_index, game_seed in indexed_game_seeds:
+        results.append(
+            (
+                game_index,
+                play_game(
+                    net,
+                    game,
+                    _self_play_cfg(self_play_mcts_cfg, game_seed),
+                    temperature_schedule=opening_temperature_schedule,
+                    timing_hook=timing_hook,
+                ),
+            )
+        )
+    return results, timing_events
+
+
+def _chunk_indexed_seeds(
+    indexed_game_seeds: Sequence[tuple[int, int]],
+    worker_count: int,
+) -> list[list[tuple[int, int]]]:
+    chunk_size = max(1, math.ceil(len(indexed_game_seeds) / worker_count))
+    return [
+        list(indexed_game_seeds[start : start + chunk_size])
+        for start in range(0, len(indexed_game_seeds), chunk_size)
+    ]
+
+
+def _self_play_examples_for_iteration(
+    net: AlphaZeroNet,
+    game: Game,
+    self_play_mcts_cfg: Mapping[str, object] | None,
+    game_seeds: Sequence[int],
+    *,
+    n_selfplay_workers: int,
+    timing_hook: Callable[[str, float], None] | None = None,
+) -> list[SelfPlayExample]:
+    if n_selfplay_workers <= 0:
+        raise ValueError("n_selfplay_workers must be positive")
+
+    indexed_game_seeds = [(index, int(seed)) for index, seed in enumerate(game_seeds)]
+    if n_selfplay_workers == 1:
+        examples: list[SelfPlayExample] = []
+        for _, game_seed in indexed_game_seeds:
+            play_kwargs: dict[str, Any] = {}
+            if timing_hook is not None:
+                play_kwargs["timing_hook"] = timing_hook
+            examples.extend(
+                play_game(
+                    net,
+                    game,
+                    _self_play_cfg(self_play_mcts_cfg, game_seed),
+                    temperature_schedule=opening_temperature_schedule,
+                    **play_kwargs,
+                )
+            )
+        return examples
+
+    if not indexed_game_seeds:
+        return []
+
+    worker_count = min(n_selfplay_workers, len(indexed_game_seeds))
+    chunks = _chunk_indexed_seeds(indexed_game_seeds, worker_count)
+    net_kwargs = _worker_net_kwargs(net)
+    state_dict = _worker_state_dict(net)
+    task_cfg = dict(self_play_mcts_cfg or {})
+    tasks = [
+        (
+            net_kwargs,
+            state_dict,
+            game,
+            task_cfg,
+            chunk,
+            timing_hook is not None,
+        )
+        for chunk in chunks
+    ]
+
+    ctx = torch_mp.get_context("spawn")
+    by_game_index: dict[int, list[SelfPlayExample]] = {}
+    with ctx.Pool(processes=worker_count) as pool:
+        for worker_results, timing_events in pool.map(_self_play_worker, tasks):
+            for game_index, game_examples in worker_results:
+                by_game_index[game_index] = game_examples
+            if timing_hook is not None:
+                for name, seconds in timing_events:
+                    timing_hook(name, seconds)
+
+    examples = []
+    for game_index, _ in indexed_game_seeds:
+        examples.extend(by_game_index[game_index])
+    return examples
+
+
 def _training_run_config(
     *,
     iterations: int,
@@ -570,6 +715,7 @@ def _training_run_config(
     eval_interval: int = 5,
     ladder_games: int = 20,
     ladder_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
+    n_selfplay_workers: int = 1,
 ) -> dict[str, object]:
     mcts_cfg = _self_play_cfg(self_play_mcts_cfg, seed)
     return {
@@ -592,6 +738,7 @@ def _training_run_config(
         "eval_interval": eval_interval,
         "ladder_games": ladder_games,
         "ladder_depths": list(ladder_depths),
+        "self_play_workers": n_selfplay_workers,
     }
 
 
@@ -680,6 +827,7 @@ def train_agent(
     eval_interval: int = 5,
     ladder_games: int = 20,
     ladder_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
+    n_selfplay_workers: int = 1,
     timing_hook: Callable[[str, float], None] | None = None,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
     """Train an AlphaZero agent for `game` from tabula-rasa self-play only."""
@@ -700,6 +848,8 @@ def train_agent(
         raise ValueError("ladder_games must be positive")
     if any(depth < 1 for depth in ladder_depths):
         raise ValueError("ladder_depths must all be at least 1")
+    if n_selfplay_workers <= 0:
+        raise ValueError("n_selfplay_workers must be positive")
 
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -729,6 +879,7 @@ def train_agent(
         eval_interval=eval_interval,
         ladder_games=ladder_games,
         ladder_depths=ladder_depths,
+        n_selfplay_workers=n_selfplay_workers,
     )
     run_config["game"] = type(game).__name__
     if wandb_config is not None:
@@ -750,21 +901,18 @@ def train_agent(
         for iteration in range(iterations):
             iteration_number = iteration + 1
             iteration_started = time.perf_counter()
-            examples: list[SelfPlayExample] = []
-            for _ in range(self_play_games_per_iteration):
-                game_seed = int(rng.integers(0, np.iinfo(np.int32).max))
-                play_kwargs = {}
-                if timing_hook is not None:
-                    play_kwargs["timing_hook"] = timing_hook
-                examples.extend(
-                    play_game(
-                        net,
-                        game,
-                        _self_play_cfg(self_play_mcts_cfg, game_seed),
-                        temperature_schedule=opening_temperature_schedule,
-                        **play_kwargs,
-                    )
-                )
+            game_seeds = [
+                int(rng.integers(0, np.iinfo(np.int32).max))
+                for _ in range(self_play_games_per_iteration)
+            ]
+            examples = _self_play_examples_for_iteration(
+                net,
+                game,
+                self_play_mcts_cfg,
+                game_seeds,
+                n_selfplay_workers=n_selfplay_workers,
+                timing_hook=timing_hook,
+            )
             loss_before, _ = compute_loss(net, examples, l2_reg=l2_reg)
             metrics = train_iteration(
                 net,
@@ -891,6 +1039,7 @@ def train_tictactoe_agent(
     eval_interval: int = 5,
     ladder_games: int = 20,
     ladder_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
+    n_selfplay_workers: int = 1,
     timing_hook: Callable[[str, float], None] | None = None,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
     """Train a compact tic-tac-toe agent from tabula-rasa self-play only."""
@@ -919,6 +1068,7 @@ def train_tictactoe_agent(
         eval_interval=eval_interval,
         ladder_games=ladder_games,
         ladder_depths=ladder_depths,
+        n_selfplay_workers=n_selfplay_workers,
         timing_hook=timing_hook,
     )
 
@@ -937,6 +1087,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--self-play-games", type=int, default=24)
     parser.add_argument("--self-play-sims", type=int, default=128)
+    parser.add_argument(
+        "--self-play-workers",
+        type=int,
+        default=1,
+        help="Number of spawned worker processes for self-play games.",
+    )
     parser.add_argument("--dirichlet-eps", type=float, default=0.25)
     parser.add_argument(
         "--mcts-batch-size",
@@ -992,6 +1148,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         eval_interval=args.eval_interval,
         ladder_games=args.ladder_games,
         ladder_depths=args.ladder_depths,
+        n_selfplay_workers=args.self_play_workers,
     )
     run_config.update(
         {
@@ -1030,6 +1187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             eval_interval=args.eval_interval,
             ladder_games=args.ladder_games,
             ladder_depths=args.ladder_depths,
+            n_selfplay_workers=args.self_play_workers,
         )
 
         if args.game == "connectfour":
