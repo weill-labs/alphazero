@@ -938,6 +938,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--self-play-games", type=int, default=24)
     parser.add_argument("--self-play-sims", type=int, default=128)
     parser.add_argument("--dirichlet-eps", type=float, default=0.25)
+    parser.add_argument(
+        "--mcts-batch-size",
+        type=int,
+        default=16,
+        help="Leaf-parallel self-play MCTS batch size (1 = sequential search).",
+    )
     parser.add_argument("--replay-capacity", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=5e-3)
     parser.add_argument("--l2-reg", type=float, default=1e-5)
@@ -967,6 +973,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     self_play_mcts_cfg = {
         "num_simulations": args.self_play_sims,
         "dirichlet_eps": args.dirichlet_eps,
+        "batch_size": args.mcts_batch_size,
     }
     run_config = _training_run_config(
         iterations=args.iterations,

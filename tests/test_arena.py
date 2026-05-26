@@ -437,6 +437,44 @@ def test_arena_main_wandb_project_defaults_to_game_and_allows_override(
     capsys.readouterr()
 
 
+def test_self_play_cfg_passes_batch_size_through() -> None:
+    assert arena._self_play_cfg({"batch_size": 8}, seed=3)["batch_size"] == 8
+    # Without an explicit batch size, self-play falls back to MCTS's default.
+    assert "batch_size" not in arena._self_play_cfg(None, seed=3)
+
+
+def test_arena_main_threads_mcts_batch_size_into_self_play(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_train_agent(game, **kwargs):
+        captured.update(kwargs)
+        return object(), {"self_play_examples": 1}
+
+    monkeypatch.setattr(arena, "_init_wandb", lambda *a, **k: None)
+    monkeypatch.setattr(arena, "train_agent", fake_train_agent)
+    monkeypatch.setattr(arena, "play_match", lambda *a, **k: (1, 0, 0))
+    monkeypatch.setattr(
+        arena,
+        "evaluate_connect_four_tactics",
+        lambda *a, **k: {"immediate_win_rate": 1.0, "block_rate": 1.0},
+    )
+    monkeypatch.setattr(
+        arena, "evaluate_connect_four_solver_anchor", lambda *a, **k: {}
+    )
+
+    assert (
+        arena.main(
+            ["--game", "connectfour", "--iterations", "1", "--mcts-batch-size", "7"]
+        )
+        == 0
+    )
+    assert captured["self_play_mcts_cfg"]["batch_size"] == 7
+
+    captured.clear()
+    assert arena.main(["--game", "connectfour", "--iterations", "1"]) == 0
+    assert captured["self_play_mcts_cfg"]["batch_size"] == 16  # default
+
+
 def test_train_agent_connect_four_one_iteration_yields_net(tmp_path) -> None:
     game = ConnectFour()
 
