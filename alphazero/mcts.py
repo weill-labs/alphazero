@@ -3,9 +3,10 @@
 MCTS turns the network's raw policy/value estimates into a stronger move
 distribution by simulating many lookahead paths. Each edge accumulates the
 statistics ``N`` (visit count), ``W`` (total value), ``Q`` (mean value = W/N),
-and ``P`` (network prior). Selection uses the PUCT rule; leaves are evaluated
-with a single network call; values are backed up with a per-ply sign flip
-because the game is zero-sum. See docs/ARCHITECTURE.md for the contract.
+and ``P`` (network prior). Selection uses the PUCT rule; leaves are collected
+into leaf-parallel batches for network evaluation; values are backed up with a
+per-ply sign flip because the game is zero-sum. See docs/ARCHITECTURE.md for
+the contract.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ class _Net(Protocol):
 
 
 TimingHook = Callable[[str, float], None]
+_SearchPath = list[tuple["_Node", int]]
 
 
 class _Node:
@@ -65,7 +67,10 @@ class MCTS:
         dirichlet_eps: float = 0.25,
         seed: int | None = None,
         timing_hook: TimingHook | None = None,
+        batch_size: int = 1,
     ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         self.net = net
         self.game = game
         self.c_puct = c_puct
@@ -74,6 +79,7 @@ class MCTS:
         self.dirichlet_eps = dirichlet_eps
         self.rng = np.random.default_rng(seed)
         self.timing_hook = timing_hook
+        self.batch_size = batch_size
 
     # -- public API ----------------------------------------------------------
 
@@ -93,8 +99,9 @@ class MCTS:
         if add_noise:
             self._add_dirichlet_noise(root)
 
-        for _ in range(self.num_simulations):
-            self._simulate(root)
+        completed = 0
+        while completed < self.num_simulations:
+            completed += self._simulate_batch(root, self.num_simulations - completed)
 
         total = sum(root.N.values())
         if total > 0:
@@ -141,17 +148,21 @@ class MCTS:
         )
 
     def _expand(self, node: _Node) -> float:
-        """Evaluate `node` with one network call, set masked/renormalized
-        priors, and return the value from `node.player`'s perspective."""
-        encoded = self.game.encode(node.state)
-        if self.timing_hook is None:
-            probs, value = self.net.predict(encoded)
-        else:
-            started = time.perf_counter()
-            probs, value = self.net.predict(encoded)
-            self.timing_hook("network_inference", time.perf_counter() - started)
+        """Evaluate one node, set priors, and return current-player value."""
+        probs_batch, values = self._predict_batch([self.game.encode(node.state)])
+        self._expand_with_prediction(node, probs_batch[0])
+        return float(values[0])
+
+    def _expand_with_prediction(self, node: _Node, probs: np.ndarray) -> None:
+        """Set masked/renormalized priors from an already computed policy."""
+        policy = np.asarray(probs, dtype=np.float64)
+        if policy.shape != (self.game.action_size,):
+            raise ValueError(
+                f"expected policy shape ({self.game.action_size},), got {policy.shape}"
+            )
+
         legal = self.game.legal_moves(node.state)
-        masked = {a: max(float(probs[a]), 0.0) for a in legal}
+        masked = {a: max(float(policy[a]), 0.0) for a in legal}
         total = sum(masked.values())
         if total > 0:
             node.P = {a: p / total for a, p in masked.items()}
@@ -161,7 +172,6 @@ class MCTS:
         node.N = {a: 0 for a in legal}
         node.W = {a: 0.0 for a in legal}
         node.expanded = True
-        return value
 
     def _add_dirichlet_noise(self, node: _Node) -> None:
         if self.dirichlet_eps <= 0:
@@ -188,8 +198,53 @@ class MCTS:
         return best_action
 
     def _simulate(self, root: _Node) -> None:
+        self._simulate_batch(root, 1)
+
+    def _simulate_batch(self, root: _Node, max_simulations: int) -> int:
+        """Run up to one leaf-parallel batch and return completed simulations."""
+        pending: list[tuple[_Node, _SearchPath]] = []
+        pending_node_ids: set[int] = set()
+        completed = 0
+
+        while completed < max_simulations and len(pending) < self.batch_size:
+            node, path = self._select_leaf(root)
+
+            if node.is_terminal:
+                value = self.game.winner(node.state) * node.player
+                self._backup(path, value)
+                completed += 1
+                continue
+
+            node_id = id(node)
+            if node_id in pending_node_ids:
+                if pending:
+                    break
+                # Defensive fallback for unusual game/tree shapes.
+                self._reserve_path(path)
+                pending.append((node, path))
+                completed += 1
+                continue
+
+            self._reserve_path(path)
+            pending.append((node, path))
+            pending_node_ids.add(node_id)
+            completed += 1
+
+        if pending:
+            encodings = [self.game.encode(node.state) for node, _ in pending]
+            probs_batch, values = self._predict_batch(encodings)
+            for (node, path), probs, value in zip(
+                pending, probs_batch, values, strict=True
+            ):
+                self._unreserve_path(path)
+                self._expand_with_prediction(node, probs)
+                self._backup(path, float(value))
+
+        return completed
+
+    def _select_leaf(self, root: _Node) -> tuple[_Node, _SearchPath]:
         node = root
-        path: list[tuple[_Node, int]] = []
+        path: _SearchPath = []
         # Selection: descend via PUCT until we reach a leaf (unexpanded or terminal).
         while node.expanded and not node.is_terminal:
             action = self._puct_select(node)
@@ -198,16 +253,63 @@ class MCTS:
                 node.children[action] = self._make_node(child_state)
             path.append((node, action))
             node = node.children[action]
+        return node, path
 
-        # Evaluation: value is from the leaf's player's perspective.
-        if node.is_terminal:
-            value = self.game.winner(node.state) * node.player
+    def _predict_batch(
+        self, encodings: list[np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not encodings:
+            raise ValueError("encodings must not be empty")
+
+        batch = np.stack(encodings, axis=0)
+        started = time.perf_counter() if self.timing_hook is not None else 0.0
+        predictor = getattr(self.net, "predict_batch", None)
+        if callable(predictor):
+            probs, values = predictor(batch)
         else:
-            value = self._expand(node)
+            predictions = [self.net.predict(encoding) for encoding in encodings]
+            probs = np.stack([policy for policy, _ in predictions], axis=0)
+            values = np.asarray([value for _, value in predictions], dtype=np.float64)
 
-        self._backup(path, value)
+        if self.timing_hook is not None:
+            self._record_network_inference(
+                time.perf_counter() - started, len(encodings)
+            )
 
-    def _backup(self, path: list[tuple[_Node, int]], value: float) -> None:
+        probs_array = np.asarray(probs, dtype=np.float64)
+        values_array = np.asarray(values, dtype=np.float64)
+        expected_policy_shape = (len(encodings), self.game.action_size)
+        if probs_array.shape != expected_policy_shape:
+            raise ValueError(
+                f"expected policy batch shape {expected_policy_shape}, "
+                f"got {probs_array.shape}"
+            )
+        if values_array.shape != (len(encodings),):
+            raise ValueError(
+                f"expected value batch shape ({len(encodings)},), "
+                f"got {values_array.shape}"
+            )
+        return probs_array, values_array
+
+    def _record_network_inference(self, seconds: float, positions: int) -> None:
+        if self.timing_hook is None:
+            return
+        # Benchmark counts are position-evals; seconds are charged once per batch.
+        self.timing_hook("network_inference", seconds)
+        for _ in range(positions - 1):
+            self.timing_hook("network_inference", 0.0)
+
+    def _reserve_path(self, path: _SearchPath) -> None:
+        for parent, action in path:
+            parent.N[action] += 1
+            parent.W[action] -= 1.0
+
+    def _unreserve_path(self, path: _SearchPath) -> None:
+        for parent, action in path:
+            parent.N[action] -= 1
+            parent.W[action] += 1.0
+
+    def _backup(self, path: _SearchPath, value: float) -> None:
         """Propagate `value` up the path, negating once per ply (zero-sum)."""
         for parent, action in reversed(path):
             value = -value  # flip to the perspective of `parent`'s player
