@@ -28,7 +28,7 @@ from alphazero.train import (
 )
 
 WANDB_PROJECT = "alphazero-tictactoe"
-DEFAULT_LADDER_DEPTHS = (1, 2, 4)
+DEFAULT_LADDER_DEPTHS = [1, 2, 4, 6]
 DEFAULT_ELO = 0.0
 ELO_K = 32.0
 
@@ -557,9 +557,8 @@ def train_agent(
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     net = AlphaZeroNet(game.num_planes, game.board_shape, game.action_size)
-    best_net = _clone_net(net)
-    best_elo = DEFAULT_ELO
-    completed_gates = 0
+    reference_net = _clone_net(net)
+    reference_elo = DEFAULT_ELO
     last_gating_winrate = 0.0
     optimizer = make_optimizer(net, optimizer_name="adam", lr=lr)
     replay_buffer = ReplayBuffer(replay_capacity)
@@ -609,7 +608,7 @@ def train_agent(
                 game_seed = int(rng.integers(0, np.iinfo(np.int32).max))
                 examples.extend(
                     play_game(
-                        best_net,
+                        net,
                         game,
                         _self_play_cfg(self_play_mcts_cfg, game_seed),
                         temperature_schedule=opening_temperature_schedule,
@@ -644,7 +643,6 @@ def train_agent(
 
             promoted = 0
             if iteration_number % gating_interval == 0:
-                completed_gates += 1
                 candidate_net = _clone_net(net)
                 gate_seed = int(rng.integers(0, np.iinfo(np.int32).max))
                 gate = gating_match(
@@ -654,7 +652,7 @@ def train_agent(
                         seed=gate_seed,
                     ),
                     _mcts_player(
-                        best_net,
+                        reference_net,
                         evaluation_mcts_cfg,
                         seed=gate_seed + 1,
                     ),
@@ -669,14 +667,14 @@ def train_agent(
                 metrics["eval/gating_losses"] = int(gate["losses"])
                 metrics["eval/gating_score"] = float(gate["score"])
                 if promoted:
-                    best_elo = update_elo(
-                        best_elo,
-                        best_elo,
+                    reference_elo = update_elo(
+                        reference_elo,
+                        reference_elo,
                         float(gate["score"]),
                     )
-                    best_net = candidate_net
+                    reference_net = candidate_net
 
-            metrics["eval/elo"] = best_elo
+            metrics["eval/elo"] = reference_elo
             metrics["eval/gating_winrate"] = last_gating_winrate
             metrics["eval/promoted"] = promoted
 
@@ -697,16 +695,15 @@ def train_agent(
         if owns_wandb_run:
             _wandb_finish(active_wandb_run)
 
-    trained_net = best_net if completed_gates > 0 else net
     if checkpoint_path is not None:
         save_checkpoint(
-            trained_net,
+            net,
             checkpoint_path,
-            optimizer=optimizer if trained_net is net else None,
+            optimizer=optimizer,
             metrics=metrics,
         )
         metrics["checkpoint_path"] = str(checkpoint_path)
-    return trained_net, metrics
+    return net, metrics
 
 
 def train_tictactoe_agent(
