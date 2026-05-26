@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Global pre-commit hook for Python and Rust linting
+# Installed via: git config --global core.hooksPath ~/.config/git/hooks
+
+set -euo pipefail
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+repo_pre_commit_config="$repo_root/.pre-commit-config.yaml"
+REPO_HOOK="$(git rev-parse --git-dir)/hooks/pre-commit.local"
+repo_has_ruff_format=0
+
+if [[ -x "$REPO_HOOK" ]] && [[ -f "$repo_pre_commit_config" ]] && grep -q "ruff format" "$repo_pre_commit_config"; then
+    repo_has_ruff_format=1
+fi
+
+# Get staged files
+STAGED_PY_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' || true)
+STAGED_RS_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
+
+# Check for submodule changes (prevent accidental inclusion)
+STAGED_SUBMODULES=$(git diff --cached --name-only | grep -E '^submodules/' || true)
+if [[ -n "$STAGED_SUBMODULES" ]]; then
+    echo -e "${RED}❌ Submodule changes detected and blocked:${NC}"
+    echo "$STAGED_SUBMODULES"
+    echo -e "${YELLOW}Submodule updates must be in separate, dedicated PRs${NC}"
+    echo -e "${YELLOW}To unstage: git reset HEAD $STAGED_SUBMODULES${NC}"
+    EXIT_CODE=1
+fi
+
+EXIT_CODE=0
+
+# Python: ruff format check
+if [[ -n "$STAGED_PY_FILES" ]] && [[ "$repo_has_ruff_format" -eq 0 ]]; then
+    if command -v ruff &>/dev/null; then
+        echo -e "${YELLOW}Running ruff format check...${NC}"
+        if ! echo "$STAGED_PY_FILES" | xargs ruff format --check 2>/dev/null; then
+            echo -e "${RED}Python formatting issues found. Run: ruff format <files>${NC}"
+            EXIT_CODE=1
+        else
+            echo -e "${GREEN}Python format OK${NC}"
+        fi
+    elif command -v uvx &>/dev/null; then
+        echo -e "${YELLOW}Running ruff format check (via uvx)...${NC}"
+        if ! echo "$STAGED_PY_FILES" | xargs uvx ruff format --check 2>/dev/null; then
+            echo -e "${RED}Python formatting issues found. Run: uvx ruff format <files>${NC}"
+            EXIT_CODE=1
+        else
+            echo -e "${GREEN}Python format OK${NC}"
+        fi
+    fi
+elif [[ -n "$STAGED_PY_FILES" ]] && [[ "$repo_has_ruff_format" -eq 1 ]]; then
+    echo -e "${YELLOW}Skipping global ruff format check; repo pre-commit config already enforces it.${NC}"
+fi
+
+# Rust: cargo fmt + clippy check
+if [[ -n "$STAGED_RS_FILES" ]]; then
+    if command -v cargo &>/dev/null; then
+        # Only run if we're in a cargo project
+        if [[ -f "Cargo.toml" ]]; then
+            echo -e "${YELLOW}Running cargo fmt check...${NC}"
+            if ! cargo fmt --check 2>/dev/null; then
+                echo -e "${RED}Rust formatting issues found. Run: cargo fmt${NC}"
+                EXIT_CODE=1
+            else
+                echo -e "${GREEN}Rust format OK${NC}"
+            fi
+
+            # Find which packages have staged files and run clippy on them
+            # Note: clippy runs on entire packages, not just staged files — this
+            # catches pre-existing issues in modified packages (intentional).
+            CLIPPY_ARGS=()
+            while IFS= read -r f; do
+                [[ -z "$f" ]] && continue
+                dir=$(dirname "$f")
+                while [[ "$dir" != "." && "$dir" != "/" ]]; do
+                    if [[ -f "$dir/Cargo.toml" ]] && grep -q '^\[package\]' "$dir/Cargo.toml" 2>/dev/null; then
+                        pkg=$(grep -m1 '^name' "$dir/Cargo.toml" | sed 's/name *= *"\(.*\)"/\1/' | tr -d ' ')
+                        [[ -n "$pkg" ]] && CLIPPY_ARGS+=(-p "$pkg")
+                        break
+                    fi
+                    dir=$(dirname "$dir")
+                done
+            done <<< "$STAGED_RS_FILES"
+
+            # Deduplicate package args
+            if [[ ${#CLIPPY_ARGS[@]} -gt 0 ]]; then
+                UNIQUE_ARGS=()
+                declare -A _seen_pkgs
+                for ((i=0; i<${#CLIPPY_ARGS[@]}; i+=2)); do
+                    pkg="${CLIPPY_ARGS[i+1]}"
+                    if [[ -z "${_seen_pkgs[$pkg]:-}" ]]; then
+                        _seen_pkgs[$pkg]=1
+                        UNIQUE_ARGS+=(-p "$pkg")
+                    fi
+                done
+                echo -e "${YELLOW}Running cargo clippy...${NC}"
+                if ! cargo clippy "${UNIQUE_ARGS[@]}" -- -D warnings; then
+                    echo -e "${RED}Clippy warnings found. Fix them or run: cargo clippy ${UNIQUE_ARGS[*]} -- -D warnings${NC}"
+                    EXIT_CODE=1
+                else
+                    echo -e "${GREEN}Clippy OK${NC}"
+                fi
+            fi
+        fi
+    fi
+fi
+
+# Chain to repo-specific pre-commit hook if it exists
+if [[ -x "$REPO_HOOK" ]]; then
+    echo -e "${YELLOW}Running repo-specific hook...${NC}"
+    "$REPO_HOOK"
+fi
+
+exit $EXIT_CODE
+
+# --- BEGIN BEADS INTEGRATION v1.0.4 ---
+# This section is managed by beads. Do not remove these markers.
+if command -v bd >/dev/null 2>&1; then
+  export BD_GIT_HOOK=1
+  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_bd_timeout" bd hooks run pre-commit "$@"
+    _bd_exit=$?
+    if [ $_bd_exit -eq 124 ]; then
+      echo >&2 "beads: hook 'pre-commit' timed out after ${_bd_timeout}s — continuing without beads"
+      _bd_exit=0
+    fi
+  else
+    bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  fi
+  if [ $_bd_exit -eq 3 ]; then
+    echo >&2 "beads: database not initialized — skipping hook 'pre-commit'"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
+fi
+# --- END BEADS INTEGRATION v1.0.4 ---
