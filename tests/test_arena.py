@@ -3,21 +3,73 @@
 from __future__ import annotations
 
 import builtins
+from typing import NamedTuple
+
+import numpy as np
 
 from alphazero.arena import (
     MCTSPlayer,
     PerfectPlayer,
     RandomPlayer,
+    evaluate_ladder,
     evaluate_connect_four_tactics,
+    gating_match,
     immediate_blocking_moves,
     immediate_winning_moves,
     play_match,
     train_agent,
     train_tictactoe_agent,
+    update_elo,
 )
 from alphazero.game import Game, State
 from alphazero.games.connectfour import ConnectFour
 from alphazero.games.tictactoe import TicTacToe
+
+
+class OneMoveState(NamedTuple):
+    player: int
+    winner: int | None = None
+
+
+class OneMoveGame(Game):
+    action_size = 2
+    board_shape = (1, 2)
+    num_planes = 2
+
+    def initial_state(self) -> OneMoveState:
+        return OneMoveState(player=1)
+
+    def current_player(self, s: OneMoveState) -> int:
+        return s.player
+
+    def legal_moves(self, s: OneMoveState) -> list[int]:
+        return [] if self.is_terminal(s) else [0, 1]
+
+    def apply_move(self, s: OneMoveState, a: int) -> OneMoveState:
+        winner = s.player if a == 1 else -s.player
+        return OneMoveState(player=-s.player, winner=winner)
+
+    def is_terminal(self, s: OneMoveState) -> bool:
+        return s.winner is not None
+
+    def winner(self, s: OneMoveState) -> int | None:
+        return s.winner
+
+    def encode(self, s: OneMoveState) -> np.ndarray:
+        return np.zeros((self.num_planes, *self.board_shape), dtype=np.float32)
+
+    def __str__(self, s: OneMoveState) -> str:
+        return str(s)
+
+
+class FixedActionPlayer:
+    def __init__(self, action: int) -> None:
+        self.action = action
+
+    def select_action(self, game: Game, state: State) -> int:
+        if self.action not in game.legal_moves(state):
+            raise ValueError(f"fixed action {self.action} is illegal")
+        return self.action
 
 
 class RowPlayer:
@@ -72,6 +124,57 @@ def test_play_match_tallies_wins_draws_and_losses() -> None:
     wins_a, draws, wins_b = play_match(top_row, bottom_row, game, n_games=1)
 
     assert (wins_a, draws, wins_b) == (1, 0, 0)
+
+
+def test_gating_promotes_clearly_stronger_candidate() -> None:
+    result = gating_match(
+        FixedActionPlayer(1),
+        FixedActionPlayer(0),
+        OneMoveGame(),
+        n_games=4,
+        threshold=0.55,
+    )
+
+    assert result["promoted"] == 1
+    assert result["winrate"] == 1.0
+
+
+def test_gating_rejects_weaker_candidate() -> None:
+    result = gating_match(
+        FixedActionPlayer(0),
+        FixedActionPlayer(1),
+        OneMoveGame(),
+        n_games=4,
+        threshold=0.55,
+    )
+
+    assert result["promoted"] == 0
+    assert result["winrate"] == 0.0
+
+
+def test_elo_moves_up_after_win_and_down_after_loss() -> None:
+    base_rating = 1000.0
+
+    assert update_elo(base_rating, base_rating, 1.0) > base_rating
+    assert update_elo(base_rating, base_rating, 0.0) < base_rating
+
+
+def test_ladder_eval_returns_expected_winrate_keys() -> None:
+    metrics = evaluate_ladder(
+        RowPlayer(tuple(range(9))),
+        TicTacToe(),
+        n_games=2,
+        negamax_depths=(1, 2),
+        seed=0,
+    )
+
+    assert set(metrics) == {
+        "eval/ladder_random_winrate",
+        "eval/ladder_negamax_d1_winrate",
+        "eval/ladder_negamax_d2_winrate",
+    }
+    for winrate in metrics.values():
+        assert 0.0 <= winrate <= 1.0
 
 
 def test_short_self_play_training_beats_random_and_reduces_loss(tmp_path) -> None:
