@@ -11,11 +11,13 @@ from collections.abc import Callable
 
 from alphazero.game import Game
 from alphazero.games.connectfour import ConnectFour
+from alphazero.games.gomoku import Gomoku
 from alphazero.games.tictactoe import TicTacToe
 
 GAMES: dict[str, Callable[[], Game]] = {
     "tictactoe": TicTacToe,
     "connectfour": ConnectFour,
+    "gomoku": Gomoku,
 }
 
 GAME_CHOICES: tuple[str, ...] = tuple(GAMES)
