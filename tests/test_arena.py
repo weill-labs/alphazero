@@ -8,10 +8,15 @@ from alphazero.arena import (
     MCTSPlayer,
     PerfectPlayer,
     RandomPlayer,
+    evaluate_connect_four_tactics,
+    immediate_blocking_moves,
+    immediate_winning_moves,
     play_match,
+    train_agent,
     train_tictactoe_agent,
 )
 from alphazero.game import Game, State
+from alphazero.games.connectfour import ConnectFour
 from alphazero.games.tictactoe import TicTacToe
 
 
@@ -25,6 +30,28 @@ class RowPlayer:
             if action in legal:
                 return action
         return legal[0]
+
+
+class TacticalOraclePlayer:
+    def select_action(self, game: Game, state: State) -> int:
+        for targets in (
+            immediate_winning_moves(game, state),
+            immediate_blocking_moves(game, state),
+        ):
+            if targets:
+                return targets[0]
+        return game.legal_moves(state)[0]
+
+
+class TacticalAvoiderPlayer:
+    def select_action(self, game: Game, state: State) -> int:
+        targets = immediate_winning_moves(game, state)
+        if not targets:
+            targets = immediate_blocking_moves(game, state)
+        for action in game.legal_moves(state):
+            if action not in targets:
+                return action
+        return game.legal_moves(state)[0]
 
 
 def test_perfect_player_vs_perfect_player_always_draws() -> None:
@@ -111,6 +138,48 @@ def test_train_wandb_disabled_by_default_does_not_import_wandb(
     assert metrics["iters_per_sec"] > 0
     assert metrics["self_play_games_per_sec"] > 0
     assert wins + draws + losses == 2
+
+
+def test_train_agent_connect_four_one_iteration_yields_net(tmp_path) -> None:
+    game = ConnectFour()
+
+    net, metrics = train_agent(
+        game,
+        iterations=1,
+        self_play_games_per_iteration=1,
+        self_play_mcts_cfg={
+            "num_simulations": 2,
+            "dirichlet_eps": 0.25,
+            "seed": 3,
+        },
+        batch_size=16,
+        epochs=1,
+        checkpoint_path=tmp_path / "connectfour.pt",
+        seed=3,
+    )
+
+    assert net.action_size == game.action_size
+    assert net.board_shape == game.board_shape
+    assert metrics["self_play_examples"] > 0
+    assert metrics["checkpoint_path"] == str(tmp_path / "connectfour.pt")
+
+
+def test_connect_four_tactical_metrics_score_oracle_and_avoider() -> None:
+    game = ConnectFour()
+
+    oracle_metrics = evaluate_connect_four_tactics(TacticalOraclePlayer(), game)
+    avoider_metrics = evaluate_connect_four_tactics(TacticalAvoiderPlayer(), game)
+
+    expected_oracle_metrics = {
+        "immediate_win_rate": 1.0,
+        "block_rate": 1.0,
+    }
+    if oracle_metrics != expected_oracle_metrics:
+        raise AssertionError(oracle_metrics)
+    if avoider_metrics["immediate_win_rate"] >= 1.0:
+        raise AssertionError(avoider_metrics)
+    if avoider_metrics["block_rate"] >= 1.0:
+        raise AssertionError(avoider_metrics)
 
 
 def test_wandb_import_failure_is_nonfatal(monkeypatch, tmp_path, capsys) -> None:

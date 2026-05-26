@@ -69,6 +69,27 @@ Runs training in the cloud without using local resources; local training is unch
 > inference, so a GPU does not help (and can be slower) at this scale. GPUs pay off with
 > batched MCTS and larger networks/games.
 
+## Connect Four
+
+Connect Four is supported as a larger game-agnostic validation target. The board has
+`7` columns by `6` rows, moves are gravity drops into a column, and a player wins by
+making `4` in a row horizontally, vertically, or diagonally.
+
+Select the game with `--game {tictactoe,connectfour}`. Tic-tac-toe remains the default.
+
+```bash
+uv run python -m alphazero.arena --game connectfour
+uv run --extra modal modal run modal_app.py --game connectfour
+```
+
+Connect Four does not have a tractable perfect oracle in this project, so evaluation uses
+practical checks instead:
+
+- **Tactical correctness:** never miss an immediate win and always block an immediate loss.
+- **Baseline strength:** win-rate against `RandomPlayer`.
+- **Search baseline:** games against a negamax/alpha-beta baseline opponent.
+- **Human inspection:** human-vs-agent play through `alphazero/play.py`.
+
 ## Test
 
 ```bash

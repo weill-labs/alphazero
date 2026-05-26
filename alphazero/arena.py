@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from alphazero.game import Game, State
+from alphazero.games.connectfour import ConnectFour
 from alphazero.games.tictactoe import TicTacToe
 from alphazero.mcts import MCTS
 from alphazero.network import AlphaZeroNet
@@ -173,6 +174,117 @@ def play_match(
     return wins_a, draws, wins_b
 
 
+def immediate_winning_moves(game: Game, state: State) -> list[int]:
+    """Return legal moves that win immediately for the player to move."""
+
+    player = game.current_player(state)
+    return [
+        action
+        for action in game.legal_moves(state)
+        if game.winner(game.apply_move(state, action)) == player
+    ]
+
+
+def immediate_blocking_moves(game: Game, state: State) -> list[int]:
+    """Return legal moves that remove every opponent one-ply win.
+
+    A position only counts as a block tactic if at least one legal move would
+    leave the opponent with an immediate win. Winning immediately is also a
+    valid block because the opponent never gets the threatened reply.
+    """
+
+    legal = game.legal_moves(state)
+    if not legal:
+        return []
+
+    safe_moves: list[int] = []
+    unsafe_found = False
+    for action in legal:
+        next_state = game.apply_move(state, action)
+        if game.is_terminal(next_state):
+            safe_moves.append(action)
+            continue
+        if immediate_winning_moves(game, next_state):
+            unsafe_found = True
+        else:
+            safe_moves.append(action)
+
+    return safe_moves if unsafe_found else []
+
+
+def tactical_action_rate(
+    player: Player,
+    game: Game,
+    positions: Sequence[State],
+    target_moves: Callable[[Game, State], list[int]],
+) -> float:
+    """Score how often `player` selects one of the exact tactical targets."""
+
+    hits = 0
+    total = 0
+    for state in positions:
+        targets = target_moves(game, state)
+        if not targets:
+            continue
+        action = player.select_action(game, state)
+        if action not in game.legal_moves(state):
+            raise ValueError(f"player selected illegal action {action}")
+        total += 1
+        if action in targets:
+            hits += 1
+
+    if total == 0:
+        raise ValueError("no tactical positions with target moves")
+    return hits / total
+
+
+def connect_four_tactical_positions(
+    game: ConnectFour | None = None,
+) -> tuple[list[State], list[State]]:
+    """Return fixed Connect Four positions for one-ply wins and blocks."""
+
+    c4 = game if game is not None else ConnectFour()
+    win_sequences = (
+        (0, 0, 1, 1, 2, 2),  # horizontal
+        (0, 1, 0, 1, 0, 2),  # vertical
+        (0, 1, 1, 2, 3, 2, 2, 3, 4, 3),  # diagonal up-right
+        (6, 5, 5, 4, 3, 4, 4, 3, 2, 3),  # diagonal down-right
+    )
+    block_sequences = (
+        (2, 0, 4, 0, 6, 0),  # vertical threat
+        (6, 0, 6, 1, 5, 2),  # horizontal threat
+    )
+    return (
+        [_state_after_moves(c4, moves) for moves in win_sequences],
+        [_state_after_moves(c4, moves) for moves in block_sequences],
+    )
+
+
+def evaluate_connect_four_tactics(
+    player: Player,
+    game: ConnectFour | None = None,
+) -> dict[str, float]:
+    """Evaluate exact one-ply Connect Four win and block tactics."""
+
+    c4 = game if game is not None else ConnectFour()
+    win_positions, block_positions = connect_four_tactical_positions(c4)
+    return {
+        "immediate_win_rate": tactical_action_rate(
+            player, c4, win_positions, immediate_winning_moves
+        ),
+        "block_rate": tactical_action_rate(
+            player, c4, block_positions, immediate_blocking_moves
+        ),
+    }
+
+
+def _state_after_moves(game: Game, moves: Sequence[int]) -> State:
+    state = game.initial_state()
+    for move in moves:
+        state = game.apply_move(state, move)
+    return state
+
+
 def opening_temperature_schedule(move_index: int) -> float:
     """Explore early openings, then play greedily from MCTS visits."""
 
@@ -290,7 +402,8 @@ def _wandb_finish(run: WandbRun | None) -> None:
         print(f"Warning: wandb finish skipped: {exc}", file=sys.stderr)
 
 
-def train_tictactoe_agent(
+def train_agent(
+    game: Game,
     *,
     iterations: int = 25,
     self_play_games_per_iteration: int = 8,
@@ -308,7 +421,7 @@ def train_tictactoe_agent(
     wandb_run: WandbRun | None = None,
     wandb_config: Mapping[str, object] | None = None,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
-    """Train a compact tic-tac-toe agent from tabula-rasa self-play only."""
+    """Train an AlphaZero agent for `game` from tabula-rasa self-play only."""
 
     if iterations <= 0:
         raise ValueError("iterations must be positive")
@@ -317,7 +430,6 @@ def train_tictactoe_agent(
 
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
-    game = TicTacToe()
     net = AlphaZeroNet(game.num_planes, game.board_shape, game.action_size)
     optimizer = make_optimizer(net, optimizer_name="adam", lr=lr)
     replay_buffer = ReplayBuffer(replay_capacity)
@@ -333,6 +445,7 @@ def train_tictactoe_agent(
         checkpoint_path=checkpoint_path,
         seed=seed,
     )
+    run_config["game"] = type(game).__name__
     if wandb_config is not None:
         run_config.update(wandb_config)
 
@@ -399,9 +512,62 @@ def train_tictactoe_agent(
     return net, metrics
 
 
+def train_tictactoe_agent(
+    *,
+    iterations: int = 25,
+    self_play_games_per_iteration: int = 8,
+    self_play_mcts_cfg: Mapping[str, object] | None = None,
+    replay_capacity: int = 8192,
+    batch_size: int = 64,
+    epochs: int = 2,
+    lr: float = 5e-3,
+    l2_reg: float = 1e-5,
+    checkpoint_path: str | Path | None = None,
+    seed: int = 0,
+    wandb_enabled: bool = False,
+    wandb_project: str = WANDB_PROJECT,
+    wandb_run_name: str | None = None,
+    wandb_run: WandbRun | None = None,
+    wandb_config: Mapping[str, object] | None = None,
+) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
+    """Train a compact tic-tac-toe agent from tabula-rasa self-play only."""
+
+    return train_agent(
+        TicTacToe(),
+        iterations=iterations,
+        self_play_games_per_iteration=self_play_games_per_iteration,
+        self_play_mcts_cfg=self_play_mcts_cfg,
+        replay_capacity=replay_capacity,
+        batch_size=batch_size,
+        epochs=epochs,
+        lr=lr,
+        l2_reg=l2_reg,
+        checkpoint_path=checkpoint_path,
+        seed=seed,
+        wandb_enabled=wandb_enabled,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run_name,
+        wandb_run=wandb_run,
+        wandb_config=wandb_config,
+    )
+
+
+def _game_from_name(name: str) -> Game:
+    if name == "tictactoe":
+        return TicTacToe()
+    if name == "connectfour":
+        return ConnectFour()
+    raise ValueError(f"unknown game {name!r}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a tic-tac-toe AlphaZero agent."
+        description="Train and evaluate an AlphaZero agent."
+    )
+    parser.add_argument(
+        "--game",
+        choices=("tictactoe", "connectfour"),
+        default="tictactoe",
     )
     parser.add_argument("--iterations", type=int, default=60)
     parser.add_argument("--epochs", type=int, default=2)
@@ -415,14 +581,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--eval-games", type=int, default=40)
     parser.add_argument("--eval-sims", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--checkpoint", type=Path, default=Path("checkpoints/tictactoe.pt")
-    )
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--no-wandb", action="store_false", dest="wandb", default=True)
     parser.add_argument("--wandb-project", default=WANDB_PROJECT)
     parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args(argv)
 
+    game = _game_from_name(args.game)
+    checkpoint = args.checkpoint or Path(f"checkpoints/{args.game}.pt")
     self_play_mcts_cfg = {
         "num_simulations": args.self_play_sims,
         "dirichlet_eps": args.dirichlet_eps,
@@ -436,11 +602,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         epochs=args.epochs,
         lr=args.lr,
         l2_reg=args.l2_reg,
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=checkpoint,
         seed=args.seed,
     )
     run_config.update(
         {
+            "game": args.game,
             "eval_games": args.eval_games,
             "eval_sims": args.eval_sims,
         }
@@ -453,7 +620,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     _print_wandb_url(wandb_run)
     try:
-        net, metrics = train_tictactoe_agent(
+        net, metrics = train_agent(
+            game,
             iterations=args.iterations,
             self_play_games_per_iteration=args.self_play_games,
             self_play_mcts_cfg=self_play_mcts_cfg,
@@ -462,12 +630,50 @@ def main(argv: Sequence[str] | None = None) -> int:
             epochs=args.epochs,
             lr=args.lr,
             l2_reg=args.l2_reg,
-            checkpoint_path=args.checkpoint,
+            checkpoint_path=checkpoint,
             seed=args.seed,
             wandb_run=wandb_run,
             wandb_config=run_config,
         )
-        game = TicTacToe()
+
+        if args.game == "connectfour":
+            agent = MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed)
+            tactical_metrics = evaluate_connect_four_tactics(
+                agent, cast(ConnectFour, game)
+            )
+            random_wins, random_draws, random_losses = play_match(
+                agent,
+                RandomPlayer(seed=args.seed),
+                game,
+                args.eval_games,
+            )
+            vs_random = {
+                "wins": random_wins,
+                "draws": random_draws,
+                "losses": random_losses,
+            }
+            _wandb_log(
+                wandb_run,
+                {
+                    "eval/c4_immediate_win_rate": tactical_metrics[
+                        "immediate_win_rate"
+                    ],
+                    "eval/c4_block_rate": tactical_metrics["block_rate"],
+                    "eval/c4_random_wins": random_wins,
+                    "eval/c4_random_draws": random_draws,
+                    "eval/c4_random_losses": random_losses,
+                },
+                step=args.iterations,
+            )
+            print(
+                {
+                    "metrics": metrics,
+                    "c4_tactics": tactical_metrics,
+                    "vs_random": vs_random,
+                }
+            )
+            return 0
+
         perfect_wins, perfect_draws, perfect_losses = play_match(
             MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed),
             PerfectPlayer(),

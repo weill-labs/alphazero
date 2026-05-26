@@ -47,3 +47,11 @@ checkpoints/
 
 # wandb local run data (generated)
 wandb/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# old beads_rust data (pre-bd migration), kept locally
+.beads_br_backup/
