@@ -256,6 +256,7 @@ def test_modal_remote_threads_eval_args_to_training(monkeypatch) -> None:
         iterations=1,
         self_play_games=1,
         sims=1,
+        mcts_batch_size=8,
         eval_games=1,
         eval_sims=1,
         gating_interval=2,
@@ -272,7 +273,9 @@ def test_modal_remote_threads_eval_args_to_training(monkeypatch) -> None:
     assert captured_kwargs["eval_interval"] == 4
     assert captured_kwargs["ladder_games"] == 5
     assert captured_kwargs["ladder_depths"] == (1, 4)
+    assert captured_kwargs["self_play_mcts_cfg"]["batch_size"] == 8
     assert result["config"]["ladder_depths"] == (1, 4)
+    assert result["config"]["mcts_batch_size"] == 8
 
 
 def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
@@ -335,6 +338,7 @@ def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
         iterations=3,
         self_play_games=4,
         sims=5,
+        mcts_batch_size=13,
         seed=6,
         gpu="A10G",
         eval_games=7,
@@ -359,6 +363,7 @@ def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
         "iterations": 3,
         "ladder_depths": "1,2",
         "ladder_games": 12,
+        "mcts_batch_size": 13,
         "seed": 6,
         "self_play_games": 4,
         "sims": 5,
