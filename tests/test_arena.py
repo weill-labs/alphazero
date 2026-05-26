@@ -3,21 +3,77 @@
 from __future__ import annotations
 
 import builtins
+from typing import NamedTuple
 
+import numpy as np
+import torch
+
+import alphazero.arena as arena
 from alphazero.arena import (
+    DEFAULT_ELO,
+    DEFAULT_LADDER_DEPTHS,
     MCTSPlayer,
     PerfectPlayer,
     RandomPlayer,
     evaluate_connect_four_tactics,
+    evaluate_ladder,
+    gating_match,
     immediate_blocking_moves,
     immediate_winning_moves,
     play_match,
     train_agent,
     train_tictactoe_agent,
+    update_elo,
 )
 from alphazero.game import Game, State
 from alphazero.games.connectfour import ConnectFour
 from alphazero.games.tictactoe import TicTacToe
+
+
+class OneMoveState(NamedTuple):
+    player: int
+    winner: int | None = None
+
+
+class OneMoveGame(Game):
+    action_size = 2
+    board_shape = (1, 2)
+    num_planes = 2
+
+    def initial_state(self) -> OneMoveState:
+        return OneMoveState(player=1)
+
+    def current_player(self, s: OneMoveState) -> int:
+        return s.player
+
+    def legal_moves(self, s: OneMoveState) -> list[int]:
+        return [] if self.is_terminal(s) else [0, 1]
+
+    def apply_move(self, s: OneMoveState, a: int) -> OneMoveState:
+        winner = s.player if a == 1 else -s.player
+        return OneMoveState(player=-s.player, winner=winner)
+
+    def is_terminal(self, s: OneMoveState) -> bool:
+        return s.winner is not None
+
+    def winner(self, s: OneMoveState) -> int | None:
+        return s.winner
+
+    def encode(self, s: OneMoveState) -> np.ndarray:
+        return np.zeros((self.num_planes, *self.board_shape), dtype=np.float32)
+
+    def __str__(self, s: OneMoveState) -> str:
+        return str(s)
+
+
+class FixedActionPlayer:
+    def __init__(self, action: int) -> None:
+        self.action = action
+
+    def select_action(self, game: Game, state: State) -> int:
+        if self.action not in game.legal_moves(state):
+            raise ValueError(f"fixed action {self.action} is illegal")
+        return self.action
 
 
 class RowPlayer:
@@ -54,6 +110,15 @@ class TacticalAvoiderPlayer:
         return game.legal_moves(state)[0]
 
 
+def _stub_self_play_examples(game: Game):
+    policy = np.ones(game.action_size, dtype=np.float32) / game.action_size
+    return [(game.encode(game.initial_state()), policy, 0.0)]
+
+
+def _stub_loss(*args, **kwargs):
+    return torch.tensor(1.0), {}
+
+
 def test_perfect_player_vs_perfect_player_always_draws() -> None:
     game = TicTacToe()
 
@@ -72,6 +137,183 @@ def test_play_match_tallies_wins_draws_and_losses() -> None:
     wins_a, draws, wins_b = play_match(top_row, bottom_row, game, n_games=1)
 
     assert (wins_a, draws, wins_b) == (1, 0, 0)
+
+
+def test_gating_promotes_clearly_stronger_candidate() -> None:
+    result = gating_match(
+        FixedActionPlayer(1),
+        FixedActionPlayer(0),
+        OneMoveGame(),
+        n_games=4,
+        threshold=0.55,
+    )
+
+    assert result["promoted"] == 1
+    assert result["winrate"] == 1.0
+
+
+def test_gating_rejects_weaker_candidate() -> None:
+    result = gating_match(
+        FixedActionPlayer(0),
+        FixedActionPlayer(1),
+        OneMoveGame(),
+        n_games=4,
+        threshold=0.55,
+    )
+
+    assert result["promoted"] == 0
+    assert result["winrate"] == 0.0
+
+
+def test_elo_moves_up_after_win_and_down_after_loss() -> None:
+    base_rating = 1000.0
+
+    assert update_elo(base_rating, base_rating, 1.0) > base_rating
+    assert update_elo(base_rating, base_rating, 0.0) < base_rating
+
+
+def test_ladder_eval_returns_expected_winrate_keys() -> None:
+    metrics = evaluate_ladder(
+        FixedActionPlayer(1),
+        OneMoveGame(),
+        n_games=2,
+        seed=0,
+    )
+
+    assert DEFAULT_LADDER_DEPTHS == [1, 2, 4, 6]
+    assert set(metrics) == {
+        "eval/ladder_random_winrate",
+        *{f"eval/ladder_negamax_d{depth}_winrate" for depth in DEFAULT_LADDER_DEPTHS},
+    }
+    for winrate in metrics.values():
+        assert 0.0 <= winrate <= 1.0
+
+
+def test_train_agent_self_play_uses_latest_net(monkeypatch) -> None:
+    game = OneMoveGame()
+    seen_weight_sums: list[float] = []
+
+    def fake_play_game(net, game_arg, cfg, temperature_schedule):
+        seen_weight_sums.append(float(next(net.parameters()).detach().sum().item()))
+        return _stub_self_play_examples(game_arg)
+
+    def fake_train_iteration(net, examples, **kwargs):
+        with torch.no_grad():
+            next(net.parameters()).add_(1.0)
+        return {"loss": 1.0}
+
+    monkeypatch.setattr(arena, "play_game", fake_play_game)
+    monkeypatch.setattr(arena, "compute_loss", _stub_loss)
+    monkeypatch.setattr(arena, "train_iteration", fake_train_iteration)
+
+    train_agent(
+        game,
+        iterations=2,
+        self_play_games_per_iteration=1,
+        batch_size=1,
+        epochs=1,
+        gating_interval=99,
+        eval_interval=99,
+        seed=0,
+    )
+
+    assert len(seen_weight_sums) == 2
+    assert seen_weight_sums[1] > seen_weight_sums[0]
+
+
+def test_train_agent_returns_and_checkpoints_latest_net_when_gate_rejects(
+    monkeypatch, tmp_path
+) -> None:
+    game = OneMoveGame()
+    saved: dict[str, object] = {}
+
+    def fake_play_game(net, game_arg, cfg, temperature_schedule):
+        return _stub_self_play_examples(game_arg)
+
+    def fake_train_iteration(net, examples, **kwargs):
+        with torch.no_grad():
+            next(net.parameters()).fill_(3.0)
+        return {"loss": 1.0}
+
+    def fake_gating_match(candidate, best, game_arg, *, n_games, threshold):
+        return {
+            "wins": 0,
+            "draws": 0,
+            "losses": n_games,
+            "winrate": 0.0,
+            "score": 0.0,
+            "promoted": 0,
+        }
+
+    def fake_save_checkpoint(net, checkpoint_path, *, optimizer=None, metrics=None):
+        saved["path"] = checkpoint_path
+        saved["weight_sum"] = float(next(net.parameters()).detach().sum().item())
+        saved["has_optimizer"] = optimizer is not None
+
+    monkeypatch.setattr(arena, "play_game", fake_play_game)
+    monkeypatch.setattr(arena, "compute_loss", _stub_loss)
+    monkeypatch.setattr(arena, "train_iteration", fake_train_iteration)
+    monkeypatch.setattr(arena, "gating_match", fake_gating_match)
+    monkeypatch.setattr(arena, "save_checkpoint", fake_save_checkpoint)
+
+    net, metrics = train_agent(
+        game,
+        iterations=1,
+        self_play_games_per_iteration=1,
+        batch_size=1,
+        epochs=1,
+        checkpoint_path=tmp_path / "model.pt",
+        gating_interval=1,
+        gating_games=2,
+        eval_interval=99,
+        seed=0,
+    )
+
+    returned_sum = float(next(net.parameters()).detach().sum().item())
+    assert returned_sum == saved["weight_sum"]
+    assert returned_sum > 0.0
+    assert saved["has_optimizer"]
+    assert metrics["checkpoint_path"] == str(tmp_path / "model.pt")
+
+
+def test_train_agent_gating_promotes_candidate_against_reference_and_bumps_elo(
+    monkeypatch,
+) -> None:
+    game = OneMoveGame()
+
+    def fake_play_game(net, game_arg, cfg, temperature_schedule):
+        return _stub_self_play_examples(game_arg)
+
+    def fake_train_iteration(net, examples, **kwargs):
+        with torch.no_grad():
+            next(net.parameters()).fill_(42.0)
+        return {"loss": 1.0}
+
+    def fake_mcts_player(net, cfg, *, seed):
+        first_weight = float(next(net.parameters()).flatten()[0].detach().item())
+        return FixedActionPlayer(1 if first_weight > 10.0 else 0)
+
+    monkeypatch.setattr(arena, "play_game", fake_play_game)
+    monkeypatch.setattr(arena, "compute_loss", _stub_loss)
+    monkeypatch.setattr(arena, "train_iteration", fake_train_iteration)
+    monkeypatch.setattr(arena, "_mcts_player", fake_mcts_player)
+
+    _, metrics = train_agent(
+        game,
+        iterations=1,
+        self_play_games_per_iteration=1,
+        batch_size=1,
+        epochs=1,
+        gating_interval=1,
+        gating_games=4,
+        gating_threshold=0.55,
+        eval_interval=99,
+        seed=0,
+    )
+
+    assert metrics["eval/promoted"] == 1
+    assert metrics["eval/gating_winrate"] == 1.0
+    assert metrics["eval/elo"] > DEFAULT_ELO
 
 
 def test_short_self_play_training_beats_random_and_reduces_loss(tmp_path) -> None:

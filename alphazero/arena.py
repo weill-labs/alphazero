@@ -12,6 +12,7 @@ from typing import Protocol, cast
 import numpy as np
 import torch
 
+from alphazero.baselines import NegamaxPlayer
 from alphazero.game import Game, State
 from alphazero.games.connectfour import ConnectFour
 from alphazero.games.tictactoe import TicTacToe
@@ -27,6 +28,9 @@ from alphazero.train import (
 )
 
 WANDB_PROJECT = "alphazero-tictactoe"
+DEFAULT_LADDER_DEPTHS = [1, 2, 4, 6]
+DEFAULT_ELO = 0.0
+ELO_K = 32.0
 
 
 class WandbRun(Protocol):
@@ -174,6 +178,72 @@ def play_match(
     return wins_a, draws, wins_b
 
 
+def update_elo(
+    rating: float,
+    opponent_rating: float,
+    score: float,
+    *,
+    k: float = ELO_K,
+) -> float:
+    """Return an Elo rating updated from one aggregate match score."""
+
+    expected = 1.0 / (1.0 + 10.0 ** ((opponent_rating - rating) / 400.0))
+    return rating + k * (score - expected)
+
+
+def gating_match(
+    candidate: Player,
+    best: Player,
+    game: Game,
+    *,
+    n_games: int,
+    threshold: float,
+) -> dict[str, float | int]:
+    """Evaluate whether a candidate should replace the current best player."""
+
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+
+    wins, draws, losses = play_match(candidate, best, game, n_games)
+    decisive_games = wins + losses
+    gating_winrate = wins / decisive_games if decisive_games > 0 else 0.0
+    match_score = (wins + 0.5 * draws) / n_games
+    promoted = int(gating_winrate >= threshold)
+    return {
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "winrate": gating_winrate,
+        "score": match_score,
+        "promoted": promoted,
+    }
+
+
+def evaluate_ladder(
+    player: Player,
+    game: Game,
+    *,
+    n_games: int,
+    negamax_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
+    seed: int = 0,
+) -> dict[str, float]:
+    """Evaluate a player against random play and negamax depth baselines."""
+
+    random_wins, _, _ = play_match(
+        player,
+        RandomPlayer(seed=seed),
+        game,
+        n_games,
+    )
+    metrics = {"eval/ladder_random_winrate": random_wins / n_games}
+    for depth in negamax_depths:
+        if depth < 1:
+            raise ValueError("negamax depths must be at least 1")
+        wins, _, _ = play_match(player, NegamaxPlayer(depth=depth), game, n_games)
+        metrics[f"eval/ladder_negamax_d{depth}_winrate"] = wins / n_games
+    return metrics
+
+
 def immediate_winning_moves(game: Game, state: State) -> list[int]:
     """Return legal moves that win immediately for the player to move."""
 
@@ -311,6 +381,31 @@ def _self_play_cfg(
     return merged
 
 
+def _mcts_player(
+    net,
+    cfg: Mapping[str, object] | None,
+    *,
+    seed: int,
+) -> MCTSPlayer:
+    cfg = cfg or {}
+    return MCTSPlayer(
+        net,
+        c_puct=float(cfg.get("c_puct", 1.5)),
+        num_simulations=int(cfg.get("num_simulations", 100)),
+        dirichlet_alpha=float(cfg.get("dirichlet_alpha", 0.3)),
+        dirichlet_eps=float(cfg.get("dirichlet_eps", 0.0)),
+        temperature=float(cfg.get("temperature", 0.0)),
+        seed=seed,
+    )
+
+
+def _clone_net(net: AlphaZeroNet) -> AlphaZeroNet:
+    clone = AlphaZeroNet(net.num_planes, net.board_shape, net.action_size)
+    clone.load_state_dict(net.state_dict())
+    clone.train(False)
+    return clone
+
+
 def _training_run_config(
     *,
     iterations: int,
@@ -323,6 +418,12 @@ def _training_run_config(
     l2_reg: float,
     checkpoint_path: str | Path | None,
     seed: int,
+    gating_interval: int = 5,
+    gating_games: int = 20,
+    gating_threshold: float = 0.55,
+    eval_interval: int = 5,
+    ladder_games: int = 20,
+    ladder_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
 ) -> dict[str, object]:
     mcts_cfg = _self_play_cfg(self_play_mcts_cfg, seed)
     return {
@@ -339,6 +440,12 @@ def _training_run_config(
         "l2_reg": l2_reg,
         "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else "",
         "seed": seed,
+        "gating_interval": gating_interval,
+        "gating_games": gating_games,
+        "gating_threshold": gating_threshold,
+        "eval_interval": eval_interval,
+        "ladder_games": ladder_games,
+        "ladder_depths": list(ladder_depths),
     }
 
 
@@ -408,6 +515,7 @@ def train_agent(
     iterations: int = 25,
     self_play_games_per_iteration: int = 8,
     self_play_mcts_cfg: Mapping[str, object] | None = None,
+    eval_mcts_cfg: Mapping[str, object] | None = None,
     replay_capacity: int = 8192,
     batch_size: int = 64,
     epochs: int = 2,
@@ -420,6 +528,12 @@ def train_agent(
     wandb_run_name: str | None = None,
     wandb_run: WandbRun | None = None,
     wandb_config: Mapping[str, object] | None = None,
+    gating_interval: int = 5,
+    gating_games: int = 20,
+    gating_threshold: float = 0.55,
+    eval_interval: int = 5,
+    ladder_games: int = 20,
+    ladder_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
     """Train an AlphaZero agent for `game` from tabula-rasa self-play only."""
 
@@ -427,12 +541,30 @@ def train_agent(
         raise ValueError("iterations must be positive")
     if self_play_games_per_iteration <= 0:
         raise ValueError("self_play_games_per_iteration must be positive")
+    if gating_interval <= 0:
+        raise ValueError("gating_interval must be positive")
+    if gating_games <= 0:
+        raise ValueError("gating_games must be positive")
+    if not 0.0 <= gating_threshold <= 1.0:
+        raise ValueError("gating_threshold must be in [0, 1]")
+    if eval_interval <= 0:
+        raise ValueError("eval_interval must be positive")
+    if ladder_games <= 0:
+        raise ValueError("ladder_games must be positive")
+    if any(depth < 1 for depth in ladder_depths):
+        raise ValueError("ladder_depths must all be at least 1")
 
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     net = AlphaZeroNet(game.num_planes, game.board_shape, game.action_size)
+    reference_net = _clone_net(net)
+    reference_elo = DEFAULT_ELO
+    last_gating_winrate = 0.0
     optimizer = make_optimizer(net, optimizer_name="adam", lr=lr)
     replay_buffer = ReplayBuffer(replay_capacity)
+    evaluation_mcts_cfg = (
+        eval_mcts_cfg if eval_mcts_cfg is not None else self_play_mcts_cfg
+    )
     run_config = _training_run_config(
         iterations=iterations,
         self_play_games_per_iteration=self_play_games_per_iteration,
@@ -444,6 +576,12 @@ def train_agent(
         l2_reg=l2_reg,
         checkpoint_path=checkpoint_path,
         seed=seed,
+        gating_interval=gating_interval,
+        gating_games=gating_games,
+        gating_threshold=gating_threshold,
+        eval_interval=eval_interval,
+        ladder_games=ladder_games,
+        ladder_depths=ladder_depths,
     )
     run_config["game"] = type(game).__name__
     if wandb_config is not None:
@@ -463,6 +601,7 @@ def train_agent(
     metrics: dict[str, float | int | str] = {}
     try:
         for iteration in range(iterations):
+            iteration_number = iteration + 1
             iteration_started = time.perf_counter()
             examples: list[SelfPlayExample] = []
             for _ in range(self_play_games_per_iteration):
@@ -488,7 +627,7 @@ def train_agent(
                 rng=rng,
             )
             loss_after, _ = compute_loss(net, examples, l2_reg=l2_reg)
-            metrics["iteration"] = iteration + 1
+            metrics["iteration"] = iteration_number
             metrics["self_play_examples"] = len(examples)
             metrics["loss_before"] = float(loss_before.detach().cpu().item())
             metrics["loss_after"] = float(loss_after.detach().cpu().item())
@@ -501,13 +640,68 @@ def train_agent(
             metrics["self_play_games_per_sec"] = (
                 self_play_games_per_iteration / iteration_seconds
             )
+
+            promoted = 0
+            if iteration_number % gating_interval == 0:
+                candidate_net = _clone_net(net)
+                gate_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+                gate = gating_match(
+                    _mcts_player(
+                        candidate_net,
+                        evaluation_mcts_cfg,
+                        seed=gate_seed,
+                    ),
+                    _mcts_player(
+                        reference_net,
+                        evaluation_mcts_cfg,
+                        seed=gate_seed + 1,
+                    ),
+                    game,
+                    n_games=gating_games,
+                    threshold=gating_threshold,
+                )
+                last_gating_winrate = float(gate["winrate"])
+                promoted = int(gate["promoted"])
+                metrics["eval/gating_wins"] = int(gate["wins"])
+                metrics["eval/gating_draws"] = int(gate["draws"])
+                metrics["eval/gating_losses"] = int(gate["losses"])
+                metrics["eval/gating_score"] = float(gate["score"])
+                if promoted:
+                    reference_elo = update_elo(
+                        reference_elo,
+                        reference_elo,
+                        float(gate["score"]),
+                    )
+                    reference_net = candidate_net
+
+            metrics["eval/elo"] = reference_elo
+            metrics["eval/gating_winrate"] = last_gating_winrate
+            metrics["eval/promoted"] = promoted
+
+            if iteration_number % eval_interval == 0:
+                ladder_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+                metrics.update(
+                    evaluate_ladder(
+                        _mcts_player(net, evaluation_mcts_cfg, seed=ladder_seed),
+                        game,
+                        n_games=ladder_games,
+                        negamax_depths=ladder_depths,
+                        seed=ladder_seed + 1,
+                    )
+                )
+
             _wandb_log(active_wandb_run, metrics, step=iteration + 1)
     finally:
         if owns_wandb_run:
             _wandb_finish(active_wandb_run)
 
     if checkpoint_path is not None:
-        save_checkpoint(net, checkpoint_path, optimizer=optimizer, metrics=metrics)
+        save_checkpoint(
+            net,
+            checkpoint_path,
+            optimizer=optimizer,
+            metrics=metrics,
+        )
         metrics["checkpoint_path"] = str(checkpoint_path)
     return net, metrics
 
@@ -517,6 +711,7 @@ def train_tictactoe_agent(
     iterations: int = 25,
     self_play_games_per_iteration: int = 8,
     self_play_mcts_cfg: Mapping[str, object] | None = None,
+    eval_mcts_cfg: Mapping[str, object] | None = None,
     replay_capacity: int = 8192,
     batch_size: int = 64,
     epochs: int = 2,
@@ -529,6 +724,12 @@ def train_tictactoe_agent(
     wandb_run_name: str | None = None,
     wandb_run: WandbRun | None = None,
     wandb_config: Mapping[str, object] | None = None,
+    gating_interval: int = 5,
+    gating_games: int = 20,
+    gating_threshold: float = 0.55,
+    eval_interval: int = 5,
+    ladder_games: int = 20,
+    ladder_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
     """Train a compact tic-tac-toe agent from tabula-rasa self-play only."""
 
@@ -537,6 +738,7 @@ def train_tictactoe_agent(
         iterations=iterations,
         self_play_games_per_iteration=self_play_games_per_iteration,
         self_play_mcts_cfg=self_play_mcts_cfg,
+        eval_mcts_cfg=eval_mcts_cfg,
         replay_capacity=replay_capacity,
         batch_size=batch_size,
         epochs=epochs,
@@ -549,6 +751,12 @@ def train_tictactoe_agent(
         wandb_run_name=wandb_run_name,
         wandb_run=wandb_run,
         wandb_config=wandb_config,
+        gating_interval=gating_interval,
+        gating_games=gating_games,
+        gating_threshold=gating_threshold,
+        eval_interval=eval_interval,
+        ladder_games=ladder_games,
+        ladder_depths=ladder_depths,
     )
 
 
@@ -578,6 +786,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--replay-capacity", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=5e-3)
     parser.add_argument("--l2-reg", type=float, default=1e-5)
+    parser.add_argument("--gating-interval", type=int, default=5)
+    parser.add_argument("--gating-games", type=int, default=20)
+    parser.add_argument("--gating-threshold", type=float, default=0.55)
+    parser.add_argument("--eval-interval", type=int, default=5)
+    parser.add_argument("--ladder-games", type=int, default=20)
+    parser.add_argument(
+        "--ladder-depths",
+        type=int,
+        nargs="+",
+        default=DEFAULT_LADDER_DEPTHS,
+    )
     parser.add_argument("--eval-games", type=int, default=40)
     parser.add_argument("--eval-sims", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
@@ -604,6 +823,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         l2_reg=args.l2_reg,
         checkpoint_path=checkpoint,
         seed=args.seed,
+        gating_interval=args.gating_interval,
+        gating_games=args.gating_games,
+        gating_threshold=args.gating_threshold,
+        eval_interval=args.eval_interval,
+        ladder_games=args.ladder_games,
+        ladder_depths=args.ladder_depths,
     )
     run_config.update(
         {
@@ -625,6 +850,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             iterations=args.iterations,
             self_play_games_per_iteration=args.self_play_games,
             self_play_mcts_cfg=self_play_mcts_cfg,
+            eval_mcts_cfg={"num_simulations": args.eval_sims},
             replay_capacity=args.replay_capacity,
             batch_size=args.batch_size,
             epochs=args.epochs,
@@ -634,6 +860,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed,
             wandb_run=wandb_run,
             wandb_config=run_config,
+            gating_interval=args.gating_interval,
+            gating_games=args.gating_games,
+            gating_threshold=args.gating_threshold,
+            eval_interval=args.eval_interval,
+            ladder_games=args.ladder_games,
+            ladder_depths=args.ladder_depths,
         )
 
         if args.game == "connectfour":
