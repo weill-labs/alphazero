@@ -28,7 +28,7 @@ from alphazero.train import (
     train_iteration,
 )
 
-WANDB_PROJECT = "alphazero-tictactoe"
+_WANDB_PROJECT_PREFIX = "alphazero"
 DEFAULT_LADDER_DEPTHS = [1, 2, 4, 6]
 DEFAULT_ELO = 0.0
 ELO_K = 32.0
@@ -532,6 +532,18 @@ def _mcts_player(
     )
 
 
+def _default_wandb_project(game_name: str) -> str:
+    return f"{_WANDB_PROJECT_PREFIX}-{game_name}"
+
+
+def _wandb_project_for_game(game: Game) -> str:
+    if isinstance(game, TicTacToe):
+        return _default_wandb_project("tictactoe")
+    if isinstance(game, ConnectFour):
+        return _default_wandb_project("connectfour")
+    return _default_wandb_project(type(game).__name__.lower())
+
+
 def _clone_net(net: AlphaZeroNet) -> AlphaZeroNet:
     clone = AlphaZeroNet(net.num_planes, net.board_shape, net.action_size)
     clone.load_state_dict(net.state_dict())
@@ -657,7 +669,7 @@ def train_agent(
     checkpoint_path: str | Path | None = None,
     seed: int = 0,
     wandb_enabled: bool = False,
-    wandb_project: str = WANDB_PROJECT,
+    wandb_project: str | None = None,
     wandb_run_name: str | None = None,
     wandb_run: WandbRun | None = None,
     wandb_config: Mapping[str, object] | None = None,
@@ -726,7 +738,7 @@ def train_agent(
     if active_wandb_run is None:
         active_wandb_run = _init_wandb(
             wandb_enabled,
-            project=wandb_project,
+            project=wandb_project or _wandb_project_for_game(game),
             run_name=wandb_run_name,
             config=run_config,
         )
@@ -868,7 +880,7 @@ def train_tictactoe_agent(
     checkpoint_path: str | Path | None = None,
     seed: int = 0,
     wandb_enabled: bool = False,
-    wandb_project: str = WANDB_PROJECT,
+    wandb_project: str | None = None,
     wandb_run_name: str | None = None,
     wandb_run: WandbRun | None = None,
     wandb_config: Mapping[str, object] | None = None,
@@ -952,11 +964,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--no-wandb", action="store_false", dest="wandb", default=True)
-    parser.add_argument("--wandb-project", default=WANDB_PROJECT)
+    parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args(argv)
 
     game = _game_from_name(args.game)
+    wandb_project = args.wandb_project or _default_wandb_project(args.game)
     checkpoint = args.checkpoint or Path(f"checkpoints/{args.game}.pt")
     self_play_mcts_cfg = {
         "num_simulations": args.self_play_sims,
@@ -983,13 +996,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_config.update(
         {
             "game": args.game,
+            "wandb_project": wandb_project,
             "eval_games": args.eval_games,
             "eval_sims": args.eval_sims,
         }
     )
     wandb_run = _init_wandb(
         args.wandb,
-        project=args.wandb_project,
+        project=wandb_project,
         run_name=args.wandb_run_name,
         config=run_config,
     )
