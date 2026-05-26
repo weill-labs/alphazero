@@ -1078,44 +1078,81 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
 
-        perfect_wins, perfect_draws, perfect_losses = play_match(
-            MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed),
-            PerfectPlayer(),
-            game,
-            args.eval_games,
-        )
+        if args.game == "tictactoe":
+            # Tic-tac-toe is the only game with a tractable perfect (minimax)
+            # player to benchmark against.
+            perfect_wins, perfect_draws, perfect_losses = play_match(
+                MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed),
+                PerfectPlayer(),
+                game,
+                args.eval_games,
+            )
+            random_wins, random_draws, random_losses = play_match(
+                MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed + 1),
+                RandomPlayer(seed=args.seed),
+                game,
+                args.eval_games,
+            )
+            _wandb_log(
+                wandb_run,
+                {
+                    "eval/perfect_wins": perfect_wins,
+                    "eval/perfect_draws": perfect_draws,
+                    "eval/perfect_losses": perfect_losses,
+                    "eval/random_wins": random_wins,
+                    "eval/random_draws": random_draws,
+                    "eval/random_losses": random_losses,
+                },
+                step=args.iterations,
+            )
+            print(
+                {
+                    "metrics": metrics,
+                    "vs_perfect": {
+                        "wins": perfect_wins,
+                        "draws": perfect_draws,
+                        "losses": perfect_losses,
+                    },
+                    "vs_random": {
+                        "wins": random_wins,
+                        "draws": random_draws,
+                        "losses": random_losses,
+                    },
+                }
+            )
+            return 0 if perfect_losses == 0 else 1
+
+        # Games without a tractable perfect player (gomoku, go, ...): benchmark
+        # against random play. Gating and the negamax ladder already ran inside
+        # train_agent during training.
         random_wins, random_draws, random_losses = play_match(
-            MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed + 1),
+            MCTSPlayer(net, num_simulations=args.eval_sims, seed=args.seed),
             RandomPlayer(seed=args.seed),
             game,
             args.eval_games,
         )
-        vs_perfect = {
-            "wins": perfect_wins,
-            "draws": perfect_draws,
-            "losses": perfect_losses,
-        }
-        vs_random = {
-            "wins": random_wins,
-            "draws": random_draws,
-            "losses": random_losses,
-        }
         _wandb_log(
             wandb_run,
             {
-                "eval/perfect_wins": perfect_wins,
-                "eval/perfect_draws": perfect_draws,
-                "eval/perfect_losses": perfect_losses,
                 "eval/random_wins": random_wins,
                 "eval/random_draws": random_draws,
                 "eval/random_losses": random_losses,
             },
             step=args.iterations,
         )
-        print({"metrics": metrics, "vs_perfect": vs_perfect, "vs_random": vs_random})
+        print(
+            {
+                "metrics": metrics,
+                "vs_random": {
+                    "wins": random_wins,
+                    "draws": random_draws,
+                    "losses": random_losses,
+                },
+            }
+        )
+        return 0
     finally:
         _wandb_finish(wandb_run)
-    return 0 if perfect_losses == 0 else 1
 
 
 if __name__ == "__main__":
