@@ -382,6 +382,61 @@ def test_train_wandb_disabled_by_default_does_not_import_wandb(
     assert wins + draws + losses == 2
 
 
+def test_arena_main_wandb_project_defaults_to_game_and_allows_override(
+    monkeypatch, capsys
+) -> None:
+    captured: list[tuple[bool, str, str, str]] = []
+
+    def fake_init_wandb(enabled, *, project, run_name, config):
+        captured.append(
+            (
+                enabled,
+                project,
+                str(config["wandb_project"]),
+                str(config["game"]),
+            )
+        )
+        return None
+
+    def fake_train_agent(game, **kwargs):
+        return object(), {"self_play_examples": 1}
+
+    monkeypatch.setattr(arena, "_init_wandb", fake_init_wandb)
+    monkeypatch.setattr(arena, "train_agent", fake_train_agent)
+    monkeypatch.setattr(
+        arena,
+        "evaluate_connect_four_tactics",
+        lambda *args, **kwargs: {"immediate_win_rate": 1.0, "block_rate": 1.0},
+    )
+    monkeypatch.setattr(
+        arena,
+        "evaluate_connect_four_solver_anchor",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(arena, "play_match", lambda *args, **kwargs: (1, 0, 0))
+
+    assert arena.main(["--game", "connectfour", "--iterations", "1"]) == 0
+    assert (
+        arena.main(
+            [
+                "--game",
+                "connectfour",
+                "--iterations",
+                "1",
+                "--wandb-project",
+                "custom-project",
+            ]
+        )
+        == 0
+    )
+
+    assert captured == [
+        (True, "alphazero-connectfour", "alphazero-connectfour", "connectfour"),
+        (True, "custom-project", "custom-project", "connectfour"),
+    ]
+    capsys.readouterr()
+
+
 def test_train_agent_connect_four_one_iteration_yields_net(tmp_path) -> None:
     game = ConnectFour()
 
