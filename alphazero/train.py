@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ from alphazero.game import Game
 from alphazero.selfplay import SelfPlayExample, TemperatureSchedule, play_game
 
 Metrics = dict[str, float | int | str]
+TimingHook = Callable[[str, float], None]
 
 
 class ReplayBuffer:
@@ -155,6 +157,7 @@ def train_iteration(
     device: torch.device | str | None = None,
     shuffle: bool = True,
     rng: np.random.Generator | None = None,
+    timing_hook: TimingHook | None = None,
 ) -> Metrics:
     """Train `net` on self-play examples and return aggregate metrics."""
 
@@ -190,12 +193,15 @@ def train_iteration(
 
     for _ in range(epochs):
         for batch in _batches(training_examples, batch_size, shuffle, generator):
+            batch_started = time.perf_counter() if timing_hook is not None else 0.0
             opt.zero_grad(set_to_none=True)
             components = loss_components(
                 net, batch, l2_reg=l2_reg, device=target_device
             )
             components["loss"].backward()
             opt.step()
+            if timing_hook is not None:
+                timing_hook("train_step", time.perf_counter() - batch_started)
 
             batch_count = len(batch)
             seen += batch_count
@@ -234,6 +240,7 @@ def run_outer_iteration(
     momentum: float = 0.9,
     l2_reg: float = 0.0,
     device: torch.device | str | None = None,
+    timing_hook: TimingHook | None = None,
 ) -> Metrics:
     """Run self-play, train from replay, and checkpoint the model."""
 
@@ -242,7 +249,12 @@ def run_outer_iteration(
 
     generated: list[SelfPlayExample] = []
     for _ in range(num_selfplay_games):
-        generated.extend(play_game(net, game, mcts_cfg, temperature_schedule))
+        play_kwargs = {}
+        if timing_hook is not None:
+            play_kwargs["timing_hook"] = timing_hook
+        generated.extend(
+            play_game(net, game, mcts_cfg, temperature_schedule, **play_kwargs)
+        )
 
     opt = (
         optimizer
@@ -260,6 +272,7 @@ def run_outer_iteration(
         epochs=epochs,
         l2_reg=l2_reg,
         device=device,
+        timing_hook=timing_hook,
     )
     metrics["self_play_examples"] = len(generated)
     save_checkpoint(net, checkpoint_path, optimizer=opt, metrics=metrics)

@@ -11,6 +11,8 @@ because the game is zero-sum. See docs/ARCHITECTURE.md for the contract.
 from __future__ import annotations
 
 import math
+import time
+from collections.abc import Callable
 from typing import Protocol
 
 import numpy as np
@@ -22,6 +24,9 @@ class _Net(Protocol):
     """Subset of the network API that MCTS depends on (see AlphaZeroNet)."""
 
     def predict(self, state_encoding: np.ndarray) -> tuple[np.ndarray, float]: ...
+
+
+TimingHook = Callable[[str, float], None]
 
 
 class _Node:
@@ -59,6 +64,7 @@ class MCTS:
         dirichlet_alpha: float = 0.3,
         dirichlet_eps: float = 0.25,
         seed: int | None = None,
+        timing_hook: TimingHook | None = None,
     ) -> None:
         self.net = net
         self.game = game
@@ -67,6 +73,7 @@ class MCTS:
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_eps = dirichlet_eps
         self.rng = np.random.default_rng(seed)
+        self.timing_hook = timing_hook
 
     # -- public API ----------------------------------------------------------
 
@@ -136,7 +143,13 @@ class MCTS:
     def _expand(self, node: _Node) -> float:
         """Evaluate `node` with one network call, set masked/renormalized
         priors, and return the value from `node.player`'s perspective."""
-        probs, value = self.net.predict(self.game.encode(node.state))
+        encoded = self.game.encode(node.state)
+        if self.timing_hook is None:
+            probs, value = self.net.predict(encoded)
+        else:
+            started = time.perf_counter()
+            probs, value = self.net.predict(encoded)
+            self.timing_hook("network_inference", time.perf_counter() - started)
         legal = self.game.legal_moves(node.state)
         masked = {a: max(float(probs[a]), 0.0) for a in legal}
         total = sum(masked.values())
