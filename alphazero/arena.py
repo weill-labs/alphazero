@@ -667,6 +667,7 @@ def train_agent(
     eval_interval: int = 5,
     ladder_games: int = 20,
     ladder_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
+    timing_hook: Callable[[str, float], None] | None = None,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
     """Train an AlphaZero agent for `game` from tabula-rasa self-play only."""
 
@@ -739,12 +740,16 @@ def train_agent(
             examples: list[SelfPlayExample] = []
             for _ in range(self_play_games_per_iteration):
                 game_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+                play_kwargs = {}
+                if timing_hook is not None:
+                    play_kwargs["timing_hook"] = timing_hook
                 examples.extend(
                     play_game(
                         net,
                         game,
                         _self_play_cfg(self_play_mcts_cfg, game_seed),
                         temperature_schedule=opening_temperature_schedule,
+                        **play_kwargs,
                     )
                 )
             loss_before, _ = compute_loss(net, examples, l2_reg=l2_reg)
@@ -758,6 +763,7 @@ def train_agent(
                 l2_reg=l2_reg,
                 shuffle=True,
                 rng=rng,
+                timing_hook=timing_hook,
             )
             loss_after, _ = compute_loss(net, examples, l2_reg=l2_reg)
             metrics["iteration"] = iteration_number
@@ -872,6 +878,7 @@ def train_tictactoe_agent(
     eval_interval: int = 5,
     ladder_games: int = 20,
     ladder_depths: Sequence[int] = DEFAULT_LADDER_DEPTHS,
+    timing_hook: Callable[[str, float], None] | None = None,
 ) -> tuple[AlphaZeroNet, dict[str, float | int | str]]:
     """Train a compact tic-tac-toe agent from tabula-rasa self-play only."""
 
@@ -899,6 +906,7 @@ def train_tictactoe_agent(
         eval_interval=eval_interval,
         ladder_games=ladder_games,
         ladder_depths=ladder_depths,
+        timing_hook=timing_hook,
     )
 
 

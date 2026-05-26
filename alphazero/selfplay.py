@@ -9,7 +9,7 @@ from typing import Protocol
 import numpy as np
 
 from alphazero.game import Game
-from alphazero.mcts import MCTS
+from alphazero.mcts import MCTS, TimingHook
 
 
 class _Net(Protocol):
@@ -27,10 +27,14 @@ def play_game(
     game: Game,
     mcts_cfg: Mapping[str, object] | None,
     temperature_schedule: TemperatureSchedule,
+    *,
+    timing_hook: TimingHook | None = None,
 ) -> list[SelfPlayExample]:
     """Play one self-play game and return ``(encoded_state, pi, z)`` examples."""
 
     mcts_kwargs = dict(mcts_cfg or {})
+    if timing_hook is not None:
+        mcts_kwargs["timing_hook"] = timing_hook
     mcts = MCTS(net, game, **mcts_kwargs)
     state = game.initial_state()
     pending: list[tuple[np.ndarray, np.ndarray, int]] = []
