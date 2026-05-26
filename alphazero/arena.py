@@ -15,6 +15,7 @@ import torch
 from alphazero.baselines import NegamaxPlayer
 from alphazero.c4_solver import NodeBudgetExceeded, solve as solve_connect_four
 from alphazero.game import Game, State
+from alphazero.games import GAME_CHOICES, game_from_name
 from alphazero.games.connectfour import ConnectFour
 from alphazero.games.tictactoe import TicTacToe
 from alphazero.mcts import MCTS
@@ -922,21 +923,13 @@ def train_tictactoe_agent(
     )
 
 
-def _game_from_name(name: str) -> Game:
-    if name == "tictactoe":
-        return TicTacToe()
-    if name == "connectfour":
-        return ConnectFour()
-    raise ValueError(f"unknown game {name!r}")
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Train and evaluate an AlphaZero agent."
     )
     parser.add_argument(
         "--game",
-        choices=("tictactoe", "connectfour"),
+        choices=GAME_CHOICES,
         default="tictactoe",
     )
     parser.add_argument("--iterations", type=int, default=60)
@@ -968,7 +961,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args(argv)
 
-    game = _game_from_name(args.game)
+    game = game_from_name(args.game)
     wandb_project = args.wandb_project or _default_wandb_project(args.game)
     checkpoint = args.checkpoint or Path(f"checkpoints/{args.game}.pt")
     self_play_mcts_cfg = {

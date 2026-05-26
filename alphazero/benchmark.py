@@ -14,9 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from alphazero.game import Game
-from alphazero.games.connectfour import ConnectFour
-from alphazero.games.tictactoe import TicTacToe
+from alphazero.games import GAME_CHOICES, game_from_name
 from alphazero.network import AlphaZeroNet
 from alphazero.selfplay import SelfPlayExample, play_game
 from alphazero.train import make_optimizer, train_iteration
@@ -95,7 +93,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     try:
         torch.manual_seed(config.seed)
         rng = np.random.default_rng(config.seed)
-        game = _game_from_name(config.game_name)
+        game = game_from_name(config.game_name)
         device = torch.device(config.device)
         net = AlphaZeroNet(game.num_planes, game.board_shape, game.action_size)
         net.to(device)
@@ -268,7 +266,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--game",
-        choices=("tictactoe", "connectfour"),
+        choices=GAME_CHOICES,
         default="tictactoe",
     )
     parser.add_argument("--self-play-games", type=int, default=2)
@@ -294,14 +292,6 @@ def _print_profile(profiler: cProfile.Profile, top_n: int) -> None:
     print("")
     print(f"cProfile top {top_n} by cumulative time:")
     print(stream.getvalue(), end="")
-
-
-def _game_from_name(name: str) -> Game:
-    if name == "tictactoe":
-        return TicTacToe()
-    if name == "connectfour":
-        return ConnectFour()
-    raise ValueError(f"unknown game {name!r}")
 
 
 def _validate_config(config: BenchmarkConfig) -> None:
