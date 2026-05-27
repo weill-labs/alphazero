@@ -15,6 +15,14 @@ from pgx.experimental import auto_reset
 from jaxzero.net import AlphaZeroNet, apply_model
 
 ENV_ID = "connect_four"
+# Root exploration noise (AlphaZero defaults). PUCT + Dirichlet makes the
+# visit-count policy target non-uniform from the first game, so the policy
+# learns immediately instead of waiting for the value head to bootstrap. Gumbel
+# MuZero's completed-Q target collapses to uniform with an untrained value head,
+# which left C4 training pinned at uniform; this matches the original PyTorch
+# self-play (PUCT + Dirichlet 0.25/0.3).
+_DIRICHLET_FRACTION = 0.25
+_DIRICHLET_ALPHA = 0.3
 
 
 @dataclass(frozen=True)
@@ -149,15 +157,15 @@ def make_selfplay(
                 value=value,
                 embedding=state,
             )
-            policy_output = mctx.gumbel_muzero_policy(
+            policy_output = mctx.muzero_policy(
                 params=params,
                 rng_key=key1,
                 root=root,
                 recurrent_fn=recurrent_fn,
                 num_simulations=num_simulations,
                 invalid_actions=~state.legal_action_mask,
-                qtransform=mctx.qtransform_completed_by_mix_value,
-                gumbel_scale=1.0,
+                dirichlet_fraction=_DIRICHLET_FRACTION,
+                dirichlet_alpha=_DIRICHLET_ALPHA,
             )
             current_player = state.current_player
             keys = jax.random.split(key2, batch_size)
