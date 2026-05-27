@@ -2,61 +2,50 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple
+import subprocess
+import sys
 
 import numpy as np
 
 from alphazero.elo_ladder import (
     LadderContestant,
     PairingResult,
+    evaluate_checkpoint_ladder,
     evaluate_player_ladder,
     fit_elo_ratings,
+    play_match,
 )
-from alphazero.game import Game, State
+from alphazero.games.connectfour import ConnectFour, ConnectFourState
+from jaxzero.net import AlphaZeroNetConfig, create_model
+from jaxzero.train import save_checkpoint
 
 
-class OneMoveState(NamedTuple):
-    player: int
-    winner: int | None = None
+class ColumnAgent:
+    def __init__(self, column: int) -> None:
+        self.column = column
+        self.game = ConnectFour()
+
+    def move(self, state: ConnectFourState) -> int:
+        if self.column in self.game.legal_moves(state):
+            return self.column
+        return self.game.legal_moves(state)[0]
+
+    def value(self, state: ConnectFourState) -> float:
+        del state
+        return 0.0
 
 
-class OneMoveGame(Game):
-    action_size = 2
-    board_shape = (1, 2)
-    num_planes = 2
-
-    def initial_state(self) -> OneMoveState:
-        return OneMoveState(player=1)
-
-    def current_player(self, s: OneMoveState) -> int:
-        return s.player
-
-    def legal_moves(self, s: OneMoveState) -> list[int]:
-        return [] if self.is_terminal(s) else [0, 1]
-
-    def apply_move(self, s: OneMoveState, a: int) -> OneMoveState:
-        winner = s.player if a == 1 else -s.player
-        return OneMoveState(player=-s.player, winner=winner)
-
-    def is_terminal(self, s: OneMoveState) -> bool:
-        return s.winner is not None
-
-    def winner(self, s: OneMoveState) -> int | None:
-        return s.winner
-
-    def encode(self, s: OneMoveState) -> np.ndarray:
-        return np.zeros((self.num_planes, *self.board_shape), dtype=np.float32)
-
-    def __str__(self, s: OneMoveState) -> str:
-        return str(s)
-
-
-class SeededRandomActionPlayer:
+class SeededRandomAgent:
     def __init__(self, seed: int) -> None:
         self.rng = np.random.default_rng(seed)
+        self.game = ConnectFour()
 
-    def select_action(self, game: Game, state: State) -> int:
-        return int(self.rng.choice(game.legal_moves(state)))
+    def move(self, state: ConnectFourState) -> int:
+        return int(self.rng.choice(self.game.legal_moves(state)))
+
+    def value(self, state: ConnectFourState) -> float:
+        del state
+        return 0.0
 
 
 def test_fit_keeps_anchor_at_zero() -> None:
@@ -102,26 +91,78 @@ def test_monotone_win_pattern_yields_monotone_elo() -> None:
 
 def test_player_ladder_is_deterministic_for_fixed_seed() -> None:
     contestants = [
-        LadderContestant("anchor", lambda seed: SeededRandomActionPlayer(seed)),
-        LadderContestant("candidate", lambda seed: SeededRandomActionPlayer(seed)),
-        LadderContestant("latest", lambda seed: SeededRandomActionPlayer(seed)),
+        LadderContestant("anchor", lambda seed: SeededRandomAgent(seed)),
+        LadderContestant("candidate", lambda seed: SeededRandomAgent(seed)),
+        LadderContestant("latest", lambda seed: SeededRandomAgent(seed)),
     ]
 
     first = evaluate_player_ladder(
         contestants,
-        OneMoveGame(),
+        ConnectFour(),
         anchor_name="anchor",
-        games_per_pairing=6,
+        games_per_pairing=2,
         mode="round-robin",
         seed=123,
     )
     second = evaluate_player_ladder(
         contestants,
-        OneMoveGame(),
+        ConnectFour(),
         anchor_name="anchor",
-        games_per_pairing=6,
+        games_per_pairing=2,
         mode="round-robin",
         seed=123,
     )
 
     assert first.as_dict() == second.as_dict()
+
+
+def test_play_match_uses_agent_move_on_connect_four() -> None:
+    wins_a, draws, wins_b = play_match(
+        ColumnAgent(0),
+        ColumnAgent(1),
+        ConnectFour(),
+        n_games=1,
+    )
+
+    assert (wins_a, draws, wins_b) == (1, 0, 0)
+
+
+def test_checkpoint_ladder_loads_jax_agents(tmp_path) -> None:
+    game = ConnectFour()
+    config = AlphaZeroNetConfig(
+        obs_shape=(6, 7, 2),
+        action_size=game.action_size,
+        channels=4,
+        num_res_blocks=0,
+    )
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    save_checkpoint(create_model(config, seed=0), early)
+    save_checkpoint(create_model(config, seed=1), late)
+
+    result = evaluate_checkpoint_ladder(
+        game,
+        [early, late],
+        games_per_pairing=1,
+        mcts_cfg={"num_simulations": 1},
+        seed=7,
+        fit_iterations=1,
+    )
+
+    assert [point.name for point in result.curve] == ["early", "late"]
+    assert [point.path for point in result.curve] == [early, late]
+    assert len(result.pairings) == 1
+    assert result.pairings[0].games == 1
+
+
+def test_elo_ladder_imports_do_not_load_torch() -> None:
+    code = "import sys, alphazero.elo_ladder; raise SystemExit('torch' in sys.modules)"
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr

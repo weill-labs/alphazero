@@ -13,10 +13,9 @@ from typing import Literal, Protocol, cast
 
 import numpy as np
 
-from alphazero.arena import MCTSPlayer, Player, RandomPlayer, play_match
-from alphazero.game import Game
-from alphazero.games import GAME_CHOICES, game_from_name
-from alphazero.play import load_checkpoint
+from alphazero.c4_certify import Agent, JaxMCTSAgent
+from alphazero.games.connectfour import ConnectFour, ConnectFourState
+from jaxzero.train import load_checkpoint
 
 AnchorChoice = Literal["earliest", "random"]
 PairingMode = Literal["anchored-sequential", "round-robin"]
@@ -115,9 +114,65 @@ class LadderContestant:
     """A ladder participant with a seedable player factory."""
 
     name: str
-    player_factory: Callable[[int], Player]
+    player_factory: Callable[[int], Agent]
     path: Path | None = None
     is_checkpoint: bool = True
+
+
+class RandomAgent:
+    """Uniformly samples legal Connect Four moves."""
+
+    def __init__(self, seed: int | None = None) -> None:
+        self.rng = np.random.default_rng(seed)
+        self.game = ConnectFour()
+
+    def move(self, state: ConnectFourState) -> int:
+        legal_moves = self.game.legal_moves(state)
+        if not legal_moves:
+            raise ValueError("cannot select a move for a terminal/full state")
+        return int(self.rng.choice(legal_moves))
+
+    def value(self, state: ConnectFourState) -> float:
+        del state
+        return 0.0
+
+
+def play_match(
+    player_a: Agent,
+    player_b: Agent,
+    game: ConnectFour,
+    n_games: int,
+) -> tuple[int, int, int]:
+    """Play ``n_games`` on Connect Four, alternating seats."""
+
+    if n_games <= 0:
+        raise ValueError("n_games must be positive")
+
+    wins_a = 0
+    draws = 0
+    wins_b = 0
+    for game_index in range(n_games):
+        state = game.initial_state()
+        player_a_mark = 1 if game_index % 2 == 0 else -1
+
+        while not game.is_terminal(state):
+            player = (
+                player_a if game.current_player(state) == player_a_mark else player_b
+            )
+            action = int(player.move(state))
+            if action not in game.legal_moves(state):
+                raise ValueError(f"player selected illegal action {action}")
+            state = game.apply_move(state, action)
+
+        winner = game.winner(state)
+        if winner == 0:
+            draws += 1
+        elif winner == player_a_mark:
+            wins_a += 1
+        else:
+            wins_b += 1
+
+    return wins_a, draws, wins_b
 
 
 def fit_elo_ratings(
@@ -164,7 +219,7 @@ def fit_elo_ratings(
 
 def evaluate_player_ladder(
     contestants: Sequence[LadderContestant],
-    game: Game,
+    game: ConnectFour,
     *,
     anchor_name: str,
     games_per_pairing: int = DEFAULT_GAMES_PER_PAIRING,
@@ -253,7 +308,7 @@ def evaluate_player_ladder(
 
 
 def evaluate_checkpoint_ladder(
-    game: Game,
+    game: ConnectFour,
     checkpoint_paths: Sequence[str | Path],
     *,
     anchor: AnchorChoice = "earliest",
@@ -289,7 +344,7 @@ def evaluate_checkpoint_ladder(
         contestants = [
             LadderContestant(
                 name=anchor_name,
-                player_factory=lambda player_seed: RandomPlayer(seed=player_seed),
+                player_factory=lambda player_seed: RandomAgent(seed=player_seed),
                 is_checkpoint=False,
             ),
             *contestants,
@@ -316,7 +371,7 @@ def resolve_checkpoint_paths(
     *,
     checkpoints: Sequence[str | Path] = (),
     checkpoint_dir: str | Path | None = None,
-    pattern: str = "*.pt",
+    pattern: str = "*.msgpack",
 ) -> list[Path]:
     """Resolve explicit checkpoint paths plus an optional sorted directory glob."""
 
@@ -359,20 +414,19 @@ def log_elo_curve(
 
 def _checkpoint_player_factory(
     checkpoint_path: Path,
-    game: Game,
+    game: ConnectFour,
     mcts_cfg: Mapping[str, object] | None,
-) -> Callable[[int], Player]:
-    net = load_checkpoint(checkpoint_path, game)
+) -> Callable[[int], Agent]:
+    model = load_checkpoint(checkpoint_path)
     cfg = dict(mcts_cfg or {})
 
-    def make_player(player_seed: int) -> Player:
-        return MCTSPlayer(
-            net,
-            c_puct=float(cfg.get("c_puct", 1.5)),
-            num_simulations=int(cfg.get("num_simulations", DEFAULT_MCTS_SIMS)),
-            dirichlet_alpha=float(cfg.get("dirichlet_alpha", 0.3)),
-            dirichlet_eps=float(cfg.get("dirichlet_eps", 0.0)),
-            temperature=float(cfg.get("temperature", 0.0)),
+    if not isinstance(game, ConnectFour):
+        raise ValueError("JAX Elo ladder currently supports Connect Four only")
+
+    def make_player(player_seed: int) -> Agent:
+        return JaxMCTSAgent(
+            model,
+            sims=int(cfg.get("num_simulations", DEFAULT_MCTS_SIMS)),
             seed=player_seed,
         )
 
@@ -484,9 +538,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Evaluate an anchored Elo ladder across AlphaZero checkpoints."
     )
     parser.add_argument("checkpoints", type=Path, nargs="*")
-    parser.add_argument("--game", choices=GAME_CHOICES, required=True)
+    parser.add_argument("--game", choices=("connectfour",), required=True)
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
-    parser.add_argument("--pattern", default="*.pt")
+    parser.add_argument("--pattern", default="*.msgpack")
     parser.add_argument(
         "--anchor",
         choices=("earliest", "random"),
@@ -501,8 +555,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--games-per-pairing", type=int, default=DEFAULT_GAMES_PER_PAIRING
     )
     parser.add_argument("--sims", type=int, default=DEFAULT_MCTS_SIMS)
-    parser.add_argument("--c-puct", type=float, default=1.5)
-    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fit-iterations", type=int, default=DEFAULT_FIT_ITERATIONS)
     parser.add_argument("--elo-k", type=float, default=DEFAULT_ELO_K)
@@ -531,7 +583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not checkpoint_paths:
         parser.error("no checkpoints found")
 
-    game = game_from_name(args.game)
+    game = ConnectFour()
     wandb_project = args.wandb_project or f"alphazero-{args.game}"
     config = {
         "game": args.game,
@@ -540,8 +592,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "mode": args.mode,
         "games_per_pairing": args.games_per_pairing,
         "sims": args.sims,
-        "c_puct": args.c_puct,
-        "temperature": args.temperature,
         "seed": args.seed,
         "fit_iterations": args.fit_iterations,
         "elo_k": args.elo_k,
@@ -561,8 +611,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode=cast(PairingMode, args.mode),
             mcts_cfg={
                 "num_simulations": args.sims,
-                "c_puct": args.c_puct,
-                "temperature": args.temperature,
             },
             seed=args.seed,
             fit_iterations=args.fit_iterations,
