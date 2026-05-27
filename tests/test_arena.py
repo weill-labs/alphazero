@@ -31,6 +31,51 @@ from alphazero.games.tictactoe import TicTacToe
 from alphazero.network import AlphaZeroNet
 
 
+def test_print_iteration_progress_formats_present_metrics(capsys) -> None:
+    arena._print_iteration_progress(
+        7,
+        60,
+        {
+            "loss": 2.3149,
+            "eval/elo": 4.0,
+            "eval/gating_winrate": 0.0,
+            "self_play_games_per_sec": 3.37,
+        },
+    )
+    assert (
+        capsys.readouterr().out.strip()
+        == "iter 7/60 | loss 2.315 | elo 4.0 | gate 0.00 | games/s 3.37"
+    )
+
+
+def test_print_iteration_progress_skips_missing_metrics(capsys) -> None:
+    arena._print_iteration_progress(1, 3, {"loss": 5.0})
+    assert capsys.readouterr().out.strip() == "iter 1/3 | loss 5.000"
+
+
+def test_train_agent_prints_per_iteration_progress(capsys) -> None:
+    train_agent(
+        TicTacToe(),
+        iterations=1,
+        self_play_games_per_iteration=2,
+        self_play_mcts_cfg={"num_simulations": 4, "dirichlet_eps": 0.25},
+        eval_interval=100,
+        gating_interval=100,
+        ladder_depths=[1],
+        ladder_games=2,
+        gating_games=2,
+        batch_size=4,
+        epochs=1,
+        seed=0,
+        n_selfplay_workers=1,
+        wandb_enabled=False,
+        checkpoint_path=None,
+    )
+    out = capsys.readouterr().out
+    assert "iter 1/1" in out
+    assert "loss" in out
+
+
 class OneMoveState(NamedTuple):
     player: int
     winner: int | None = None
