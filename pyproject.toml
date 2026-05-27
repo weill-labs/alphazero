@@ -6,11 +6,17 @@ dependencies = [
     "torch>=2.2",
     "numpy>=1.26",
     "wandb>=0.27.0",
+    "jax>=0.10.1",
+    "pgx>=2.6.0",
+    "mctx>=0.0.6",
+    "flax>=0.12.7",
+    "optax>=0.2.8",
 ]
 
 [project.scripts]
 alphazero-c4-certify = "alphazero.c4_certify:main"
 alphazero-elo-ladder = "alphazero.elo_ladder:main"
+jaxzero-train = "jaxzero.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -28,4 +34,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["alphazero"]
+packages = ["alphazero", "jaxzero"]
