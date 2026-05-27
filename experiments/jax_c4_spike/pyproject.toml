@@ -1,0 +1,18 @@
+[project]
+name = "jax-c4-spike"
+version = "0.0.0"
+description = "JAX+pgx+mctx Connect Four self-play throughput spike (isolated from the main alphazero project)"
+requires-python = ">=3.12"
+dependencies = [
+    "jax",
+    "pgx>=2.0.0",
+    "dm-haiku",
+    "mctx",
+    "optax",
+]
+
+# Standalone project: deliberately NOT part of the parent `alphazero` project's
+# dependency set. Run everything from inside this directory (uv resolves against
+# this pyproject, not the repo root), so JAX never leaks into the main env.
+[tool.uv]
+package = false
