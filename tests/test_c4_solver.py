@@ -81,6 +81,8 @@ _FORCED_BLOCK_DRAW = [
     3,
 ]
 
+_TEST_MAX_NODES = 250_000
+
 
 def _play(moves: list[int]):
     game = ConnectFour()
@@ -90,10 +92,32 @@ def _play(moves: list[int]):
     return game, state
 
 
+def test_opening_book_certifies_empty_board_and_center_reply() -> None:
+    game = ConnectFour()
+    state = game.initial_state()
+
+    assert solve(state, max_nodes=1) == (1, [3])
+
+    center_reply_state = game.apply_move(state, 3)
+    assert solve(center_reply_state, max_nodes=1) == (
+        -1,
+        game.legal_moves(center_reply_state),
+    )
+
+
+def test_midgame_position_still_uses_live_search() -> None:
+    _, state = _play(_FORCED_BLOCK_DRAW)
+
+    with pytest.raises(NodeBudgetExceeded):
+        solve(state, max_nodes=1)
+
+    assert solve(state, max_nodes=_TEST_MAX_NODES) == (0, [1])
+
+
 def test_late_immediate_winning_move_is_optimal() -> None:
     game, state = _play(_DRAW_LINE[:32])
 
-    value, optimal_moves = solve(state)
+    value, optimal_moves = solve(state, max_nodes=_TEST_MAX_NODES)
 
     assert game.winner(game.apply_move(state, 0)) == state.player
     assert value == 1
@@ -103,7 +127,7 @@ def test_late_immediate_winning_move_is_optimal() -> None:
 def test_forced_single_non_losing_move_blocks_direct_threat() -> None:
     game, state = _play(_FORCED_BLOCK_DRAW)
 
-    value, optimal_moves = solve(state)
+    value, optimal_moves = solve(state, max_nodes=_TEST_MAX_NODES)
 
     assert value == 0
     assert optimal_moves == [1]
@@ -115,7 +139,7 @@ def test_forced_single_non_losing_move_blocks_direct_threat() -> None:
 def test_near_full_board_one_move_from_draw() -> None:
     game, state = _play(_DRAW_LINE[:41])
 
-    value, optimal_moves = solve(state)
+    value, optimal_moves = solve(state, max_nodes=_TEST_MAX_NODES)
     final_state = game.apply_move(state, optimal_moves[0])
 
     assert value == 0
@@ -126,8 +150,11 @@ def test_near_full_board_one_move_from_draw() -> None:
 def test_value_is_negated_after_optimal_move() -> None:
     game, state = _play(_FORCED_BLOCK_DRAW)
 
-    value, optimal_moves = solve(state)
-    next_value, _ = solve(game.apply_move(state, optimal_moves[0]))
+    value, optimal_moves = solve(state, max_nodes=_TEST_MAX_NODES)
+    next_value, _ = solve(
+        game.apply_move(state, optimal_moves[0]),
+        max_nodes=_TEST_MAX_NODES,
+    )
 
     assert value == -next_value
 
@@ -135,10 +162,13 @@ def test_value_is_negated_after_optimal_move() -> None:
 def test_multiple_optimal_moves_are_all_returned() -> None:
     game, state = _play(_DRAW_LINE[:38])
 
-    value, optimal_moves = solve(state)
+    value, optimal_moves = solve(state, max_nodes=_TEST_MAX_NODES)
     expected_moves = []
     for move in game.legal_moves(state):
-        child_value, _ = solve(game.apply_move(state, move))
+        child_value, _ = solve(
+            game.apply_move(state, move),
+            max_nodes=_TEST_MAX_NODES,
+        )
         if -child_value == value:
             expected_moves.append(move)
 
@@ -149,7 +179,7 @@ def test_multiple_optimal_moves_are_all_returned() -> None:
 def test_hand_verified_shallow_endgame_win() -> None:
     _, state = _play(_DRAW_LINE[:36])
 
-    value, optimal_moves = solve(state)
+    value, optimal_moves = solve(state, max_nodes=_TEST_MAX_NODES)
 
     assert value == 1
     assert optimal_moves == [0]
@@ -158,7 +188,7 @@ def test_hand_verified_shallow_endgame_win() -> None:
 def test_hand_verified_shallow_endgame_draw() -> None:
     game, state = _play(_DRAW_LINE[:38])
 
-    value, optimal_moves = solve(state)
+    value, optimal_moves = solve(state, max_nodes=_TEST_MAX_NODES)
 
     assert value == 0
     assert optimal_moves == game.legal_moves(state)
