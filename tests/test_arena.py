@@ -236,25 +236,28 @@ def test_parallel_self_play_matches_sequential_shapes_and_is_deterministic() -> 
         game_seeds,
         n_selfplay_workers=1,
     )
-    parallel = arena._self_play_examples_for_iteration(
-        net,
-        game,
-        mcts_cfg,
-        game_seeds,
-        n_selfplay_workers=2,
-    )
-    parallel_again = arena._self_play_examples_for_iteration(
-        net,
-        game,
-        mcts_cfg,
-        game_seeds,
-        n_selfplay_workers=2,
-    )
+    with arena._SelfPlayWorkerPool(worker_count=2) as worker_pool:
+        parallel = arena._self_play_examples_for_iteration(
+            net,
+            game,
+            mcts_cfg,
+            game_seeds,
+            n_selfplay_workers=2,
+            worker_pool=worker_pool,
+        )
+        parallel_again = arena._self_play_examples_for_iteration(
+            net,
+            game,
+            mcts_cfg,
+            game_seeds,
+            n_selfplay_workers=2,
+            worker_pool=worker_pool,
+        )
 
     assert len(parallel) == len(sequential)
     assert len(parallel_again) == len(parallel)
     for expected, actual in zip(sequential, parallel, strict=True):
-        expected_state, expected_policy, _ = expected
+        expected_state, expected_policy, expected_value = expected
         actual_state, actual_policy, actual_value = actual
         assert (
             actual_state.shape
@@ -265,15 +268,17 @@ def test_parallel_self_play_matches_sequential_shapes_and_is_deterministic() -> 
             )
         )
         assert actual_policy.shape == expected_policy.shape == (game.action_size,)
-        assert actual_value in {-1, 0, 1}
+        assert np.array_equal(actual_state, expected_state)
+        assert np.allclose(actual_policy, expected_policy)
+        assert actual_value == expected_value
         assert np.isclose(actual_policy.sum(), 1.0)
         assert np.all(actual_policy >= 0.0)
 
     for first, second in zip(parallel, parallel_again, strict=True):
         first_state, first_policy, first_value = first
         second_state, second_policy, second_value = second
-        np.testing.assert_array_equal(first_state, second_state)
-        np.testing.assert_array_equal(first_policy, second_policy)
+        assert np.array_equal(first_state, second_state)
+        assert np.allclose(first_policy, second_policy)
         assert first_value == second_value
 
 
