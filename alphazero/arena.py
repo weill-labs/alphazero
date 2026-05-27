@@ -910,6 +910,27 @@ def _wandb_log(
         print(f"Warning: wandb log skipped: {exc}", file=sys.stderr)
 
 
+def _print_iteration_progress(
+    iteration: int, total: int, metrics: Mapping[str, object]
+) -> None:
+    """Emit a one-line per-iteration progress summary to stdout.
+
+    Independent of wandb, so local and --no-wandb runs still show progress.
+    """
+
+    parts = [f"iter {iteration}/{total}"]
+    for key, label, fmt in (
+        ("loss", "loss", "{:.3f}"),
+        ("eval/elo", "elo", "{:.1f}"),
+        ("eval/gating_winrate", "gate", "{:.2f}"),
+        ("self_play_games_per_sec", "games/s", "{:.2f}"),
+    ):
+        value = metrics.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            parts.append(f"{label} {fmt.format(float(value))}")
+    print(" | ".join(parts), flush=True)
+
+
 def _wandb_finish(run: WandbRun | None) -> None:
     if run is None:
         return
@@ -1149,6 +1170,7 @@ def train_agent(
                 metrics["checkpoint/periodic_path"] = str(periodic_path)
 
             _wandb_log(active_wandb_run, metrics, step=iteration + 1)
+            _print_iteration_progress(iteration_number, iterations, metrics)
     except BaseException:
         terminate_self_play_pool = True
         raise
