@@ -9,6 +9,9 @@ dependencies = [
     "dm-haiku",
     "mctx",
     "optax",
+    # Local jax stays CPU; modal is only the launcher for the GPU benchmark
+    # (the GPU image installs jax[cuda12] separately).
+    "modal>=0.64",
 ]
 
 # Standalone project: deliberately NOT part of the parent `alphazero` project's

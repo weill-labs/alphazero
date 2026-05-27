@@ -7,13 +7,11 @@ the main `alphazero` repo (which logs `self_play_games_per_sec` to wandb).
 
 The self-play structure mirrors pgx's official examples/alphazero/train.py,
 reduced to inference-only timing: no gradient updates, no checkpointing, and a
-single-device `jax.jit` instead of `jax.pmap` (this box is CPU-only).
+single-device `jax.jit` instead of `jax.pmap`.
 
-IMPORTANT — what this does and does not measure:
-  - On CPU, XLA still vmaps the whole batch and fuses the scan, so this captures
-    the *vectorization* characteristic of the JAX stack vs a Python loop.
-  - It does NOT capture JAX's headline 10-100x, which is a GPU/TPU result. For
-    that number, run this same script in a GPU container (e.g. Modal A10/A100).
+`run_benchmark` is the reusable core (returns a metrics dict); `main` is the
+CLI. The same `run_benchmark` is invoked on a Modal GPU by `modal_bench.py` so
+the CPU and GPU numbers come from identical code.
 
 Usage:
     uv run python bench.py --batch-size 256 --num-simulations 32 \
@@ -111,6 +109,75 @@ def make_selfplay(
     return jax.jit(selfplay)
 
 
+def run_benchmark(
+    *,
+    batch_size: int = 256,
+    num_simulations: int = 32,
+    num_channels: int = 64,
+    num_blocks: int = 5,
+    max_steps: int = 64,
+    timed_iters: int = 3,
+    seed: int = 0,
+) -> dict[str, object]:
+    """Time batched self-play and return throughput metrics.
+
+    Compilation (the first call) is excluded from the timed average. Completed
+    games are counted from the per-step termination mask, so games/sec is
+    directly comparable to the PyTorch `self_play_games_per_sec`.
+    """
+    env = pgx.make(_ENV_ID)
+    forward = build_forward(env.num_actions, num_channels, num_blocks)
+
+    key = jax.random.PRNGKey(seed)
+    dummy = jax.vmap(env.init)(jax.random.split(key, 2))
+    model = forward.init(key, dummy.observation)  # (params, bn_state)
+
+    selfplay = make_selfplay(
+        env,
+        forward,
+        num_simulations=num_simulations,
+        batch_size=batch_size,
+        max_steps=max_steps,
+    )
+
+    # Warmup triggers XLA compilation (excluded from timing).
+    t0 = time.perf_counter()
+    term = selfplay(model, key)
+    term.block_until_ready()
+    compile_s = time.perf_counter() - t0
+
+    total_s = 0.0
+    total_games = 0
+    for i in range(timed_iters):
+        k = jax.random.fold_in(key, i + 1)
+        t0 = time.perf_counter()
+        term = selfplay(model, k)
+        term.block_until_ready()
+        total_s += time.perf_counter() - t0
+        total_games += int(term.sum())  # completed games (auto_reset terminations)
+
+    env_steps = batch_size * max_steps * timed_iters
+    steps_per_sec = env_steps / total_s
+    return {
+        "jax_version": jax.__version__,
+        "devices": str(jax.devices()),
+        "config": {
+            "batch_size": batch_size,
+            "num_simulations": num_simulations,
+            "num_channels": num_channels,
+            "num_blocks": num_blocks,
+            "max_steps": max_steps,
+            "timed_iters": timed_iters,
+        },
+        "compile_s": round(compile_s, 2),
+        "avg_call_s": round(total_s / timed_iters, 3),
+        "completed_games": total_games,
+        "games_per_sec": round(total_games / total_s, 2),
+        "env_steps_per_sec": round(steps_per_sec, 1),
+        "mcts_env_steps_per_sec": round(steps_per_sec * num_simulations, 1),
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--batch-size", type=int, default=256)
@@ -122,59 +189,17 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
-    print(f"jax {jax.__version__} | devices: {jax.devices()}")
-    print(
-        f"config: batch={args.batch_size} sims={args.num_simulations} "
-        f"net={args.num_channels}ch x{args.num_blocks} max_steps={args.max_steps}"
-    )
-
-    env = pgx.make(_ENV_ID)
-    forward = build_forward(env.num_actions, args.num_channels, args.num_blocks)
-
-    key = jax.random.PRNGKey(args.seed)
-    dummy = jax.vmap(env.init)(jax.random.split(key, 2))
-    model = forward.init(key, dummy.observation)  # (params, bn_state)
-
-    selfplay = make_selfplay(
-        env,
-        forward,
-        num_simulations=args.num_simulations,
+    result = run_benchmark(
         batch_size=args.batch_size,
+        num_simulations=args.num_simulations,
+        num_channels=args.num_channels,
+        num_blocks=args.num_blocks,
         max_steps=args.max_steps,
+        timed_iters=args.timed_iters,
+        seed=args.seed,
     )
-
-    # Warmup: triggers XLA compilation (excluded from timing).
-    t0 = time.perf_counter()
-    term = selfplay(model, key)
-    term.block_until_ready()
-    compile_s = time.perf_counter() - t0
-    print(f"compile + first run: {compile_s:.1f}s")
-
-    # Timed runs.
-    total_s = 0.0
-    total_games = 0
-    for i in range(args.timed_iters):
-        k = jax.random.fold_in(key, i + 1)
-        t0 = time.perf_counter()
-        term = selfplay(model, k)
-        term.block_until_ready()
-        dt = time.perf_counter() - t0
-        games = int(term.sum())  # completed games (auto_reset terminations)
-        total_s += dt
-        total_games += games
-
-    env_steps = args.batch_size * args.max_steps * args.timed_iters
-    games_per_sec = total_games / total_s
-    steps_per_sec = env_steps / total_s
-    # Each ply runs `num_simulations` batched env.step calls inside MCTS.
-    sims_per_sec = steps_per_sec * args.num_simulations
-
-    print("\n=== throughput (CPU, single device) ===")
-    print(f"avg time / self-play call : {total_s / args.timed_iters:.2f}s")
-    print(f"completed games           : {total_games} over {args.timed_iters} calls")
-    print(f"COMPLETED GAMES / SEC     : {games_per_sec:.1f}")
-    print(f"env-steps / sec           : {steps_per_sec:.0f}")
-    print(f"MCTS env.step calls / sec : {sims_per_sec:.0f}")
+    for key, value in result.items():
+        print(f"{key}: {value}")
 
 
 if __name__ == "__main__":
