@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import time
 
 import haiku as hk
@@ -118,12 +119,17 @@ def run_benchmark(
     max_steps: int = 64,
     timed_iters: int = 3,
     seed: int = 0,
+    profile_dir: str | None = None,
 ) -> dict[str, object]:
     """Time batched self-play and return throughput metrics.
 
     Compilation (the first call) is excluded from the timed average. Completed
     games are counted from the per-step termination mask, so games/sec is
     directly comparable to the PyTorch `self_play_games_per_sec`.
+
+    When ``profile_dir`` is set, the timed runs (post-compile, steady state) are
+    wrapped in a ``jax.profiler.trace`` so the XLA op-level breakdown is captured
+    for TensorBoard/Perfetto.
     """
     env = pgx.make(_ENV_ID)
     forward = build_forward(env.num_actions, num_channels, num_blocks)
@@ -148,13 +154,17 @@ def run_benchmark(
 
     total_s = 0.0
     total_games = 0
-    for i in range(timed_iters):
-        k = jax.random.fold_in(key, i + 1)
-        t0 = time.perf_counter()
-        term = selfplay(model, k)
-        term.block_until_ready()
-        total_s += time.perf_counter() - t0
-        total_games += int(term.sum())  # completed games (auto_reset terminations)
+    profile_ctx = (
+        jax.profiler.trace(profile_dir) if profile_dir else contextlib.nullcontext()
+    )
+    with profile_ctx:
+        for i in range(timed_iters):
+            k = jax.random.fold_in(key, i + 1)
+            t0 = time.perf_counter()
+            term = selfplay(model, k)
+            term.block_until_ready()
+            total_s += time.perf_counter() - t0
+            total_games += int(term.sum())  # completed games (auto_reset terminations)
 
     env_steps = batch_size * max_steps * timed_iters
     steps_per_sec = env_steps / total_s
@@ -175,6 +185,7 @@ def run_benchmark(
         "games_per_sec": round(total_games / total_s, 2),
         "env_steps_per_sec": round(steps_per_sec, 1),
         "mcts_env_steps_per_sec": round(steps_per_sec * num_simulations, 1),
+        "profile_dir": profile_dir,
     }
 
 
@@ -187,6 +198,16 @@ def main() -> None:
     p.add_argument("--max-steps", type=int, default=64)
     p.add_argument("--timed-iters", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help="capture a jax.profiler trace of the timed runs (XLA op breakdown)",
+    )
+    p.add_argument(
+        "--profile-dir",
+        default="jax_trace",
+        help="directory for the profiler trace (with --profile)",
+    )
     args = p.parse_args()
 
     result = run_benchmark(
@@ -197,9 +218,16 @@ def main() -> None:
         max_steps=args.max_steps,
         timed_iters=args.timed_iters,
         seed=args.seed,
+        profile_dir=args.profile_dir if args.profile else None,
     )
     for key, value in result.items():
         print(f"{key}: {value}")
+    if result.get("profile_dir"):
+        print(
+            f"\ntrace written to {result['profile_dir']}/ — view with:\n"
+            f"  tensorboard --logdir {result['profile_dir']}\n"
+            "(needs: pip install tensorboard tensorboard-plugin-profile)"
+        )
 
 
 if __name__ == "__main__":
