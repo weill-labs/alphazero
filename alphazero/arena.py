@@ -546,6 +546,28 @@ def _wandb_project_for_game(game: Game) -> str:
     return _default_wandb_project(type(game).__name__.lower())
 
 
+def _checkpoint_game_name(game: Game) -> str:
+    known_names = {
+        "TicTacToe": "tictactoe",
+        "ConnectFour": "connectfour",
+        "Gomoku": "gomoku",
+        "Go": "go",
+    }
+    return known_names.get(type(game).__name__, type(game).__name__.lower())
+
+
+def _periodic_checkpoint_path(
+    checkpoint_dir: str | Path,
+    game: Game,
+    iteration_number: int,
+) -> Path:
+    return (
+        Path(checkpoint_dir)
+        / _checkpoint_game_name(game)
+        / f"iter_{iteration_number:04d}.pt"
+    )
+
+
 def _clone_net(net: AlphaZeroNet) -> AlphaZeroNet:
     clone = AlphaZeroNet(net.num_planes, net.board_shape, net.action_size)
     clone.load_state_dict(net.state_dict())
@@ -800,6 +822,8 @@ def _training_run_config(
     lr: float,
     l2_reg: float,
     checkpoint_path: str | Path | None,
+    checkpoint_every: int | None,
+    checkpoint_dir: str | Path,
     seed: int,
     gating_interval: int = 5,
     gating_games: int = 20,
@@ -823,6 +847,8 @@ def _training_run_config(
         "lr": lr,
         "l2_reg": l2_reg,
         "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else "",
+        "checkpoint_every": checkpoint_every or 0,
+        "checkpoint_dir": str(checkpoint_dir),
         "seed": seed,
         "gating_interval": gating_interval,
         "gating_games": gating_games,
@@ -907,6 +933,8 @@ def train_agent(
     lr: float = 5e-3,
     l2_reg: float = 1e-5,
     checkpoint_path: str | Path | None = None,
+    checkpoint_every: int | None = None,
+    checkpoint_dir: str | Path = "checkpoints",
     seed: int = 0,
     wandb_enabled: bool = False,
     wandb_project: str | None = None,
@@ -942,6 +970,8 @@ def train_agent(
         raise ValueError("ladder_depths must all be at least 1")
     if n_selfplay_workers <= 0:
         raise ValueError("n_selfplay_workers must be positive")
+    if checkpoint_every is not None and checkpoint_every <= 0:
+        raise ValueError("checkpoint_every must be positive when set")
 
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -964,6 +994,8 @@ def train_agent(
         lr=lr,
         l2_reg=l2_reg,
         checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        checkpoint_dir=checkpoint_dir,
         seed=seed,
         gating_interval=gating_interval,
         gating_games=gating_games,
@@ -1099,6 +1131,23 @@ def train_agent(
                         )
                     )
 
+            if (
+                checkpoint_every is not None
+                and iteration_number % checkpoint_every == 0
+            ):
+                periodic_path = _periodic_checkpoint_path(
+                    checkpoint_dir,
+                    game,
+                    iteration_number,
+                )
+                save_checkpoint(
+                    net,
+                    periodic_path,
+                    optimizer=optimizer,
+                    metrics=metrics,
+                )
+                metrics["checkpoint/periodic_path"] = str(periodic_path)
+
             _wandb_log(active_wandb_run, metrics, step=iteration + 1)
     except BaseException:
         terminate_self_play_pool = True
@@ -1132,6 +1181,8 @@ def train_tictactoe_agent(
     lr: float = 5e-3,
     l2_reg: float = 1e-5,
     checkpoint_path: str | Path | None = None,
+    checkpoint_every: int | None = None,
+    checkpoint_dir: str | Path = "checkpoints",
     seed: int = 0,
     wandb_enabled: bool = False,
     wandb_project: str | None = None,
@@ -1161,6 +1212,8 @@ def train_tictactoe_agent(
         lr=lr,
         l2_reg=l2_reg,
         checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        checkpoint_dir=checkpoint_dir,
         seed=seed,
         wandb_enabled=wandb_enabled,
         wandb_project=wandb_project,
@@ -1223,10 +1276,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--eval-sims", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="Save checkpoints/<game>/iter_NNNN.pt every N iterations.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("checkpoints"),
+        help="Root directory for periodic per-game checkpoints.",
+    )
     parser.add_argument("--no-wandb", action="store_false", dest="wandb", default=True)
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args(argv)
+
+    if args.checkpoint_every is not None and args.checkpoint_every <= 0:
+        parser.error("--checkpoint-every must be positive when set")
 
     game = game_from_name(args.game)
     wandb_project = args.wandb_project or _default_wandb_project(args.game)
@@ -1246,6 +1314,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         lr=args.lr,
         l2_reg=args.l2_reg,
         checkpoint_path=checkpoint,
+        checkpoint_every=args.checkpoint_every,
+        checkpoint_dir=args.checkpoint_dir,
         seed=args.seed,
         gating_interval=args.gating_interval,
         gating_games=args.gating_games,
@@ -1283,6 +1353,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             lr=args.lr,
             l2_reg=args.l2_reg,
             checkpoint_path=checkpoint,
+            checkpoint_every=args.checkpoint_every,
+            checkpoint_dir=args.checkpoint_dir,
             seed=args.seed,
             wandb_run=wandb_run,
             wandb_config=run_config,
