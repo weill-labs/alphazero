@@ -90,10 +90,23 @@ def test_modal_app_registers_remote_training_without_real_modal(monkeypatch) -> 
         def from_name(name: str) -> SimpleNamespace:
             return SimpleNamespace(name=name)
 
+    class FakeVolume:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.committed = False
+
+        @staticmethod
+        def from_name(name: str, create_if_missing: bool = False) -> "FakeVolume":
+            return FakeVolume(name)
+
+        def commit(self) -> None:
+            self.committed = True
+
     fake_modal = SimpleNamespace(
         App=FakeApp,
         Image=FakeImageFactory,
         Secret=FakeSecret,
+        Volume=FakeVolume,
     )
     monkeypatch.setitem(sys.modules, "modal", fake_modal)
 
@@ -110,6 +123,9 @@ def test_modal_app_registers_remote_training_without_real_modal(monkeypatch) -> 
     assert module.app.functions[0].options["image"] is module.image
     assert module.app.functions[0].options["cpu"] == 8
     assert module.app.functions[0].options["timeout"] == 6 * 60 * 60
+    volumes = module.app.functions[0].options["volumes"]
+    assert "/checkpoints" in volumes
+    assert volumes["/checkpoints"].name == "alphazero-checkpoints"
     assert module.app.entrypoint is not None
     assert module.app.entrypoint.__defaults__[:4] == ("tictactoe", None, None, None)
 
@@ -258,10 +274,23 @@ def test_modal_remote_threads_eval_args_to_training(monkeypatch) -> None:
         def from_name(name: str) -> SimpleNamespace:
             return SimpleNamespace(name=name)
 
+    class FakeVolume:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.committed = False
+
+        @staticmethod
+        def from_name(name: str, create_if_missing: bool = False) -> "FakeVolume":
+            return FakeVolume(name)
+
+        def commit(self) -> None:
+            self.committed = True
+
     fake_modal = SimpleNamespace(
         App=FakeApp,
         Image=FakeImageFactory,
         Secret=FakeSecret,
+        Volume=FakeVolume,
     )
     monkeypatch.setitem(sys.modules, "modal", fake_modal)
     module = load_modal_app()
@@ -309,6 +338,13 @@ def test_modal_remote_threads_eval_args_to_training(monkeypatch) -> None:
     assert result["config"]["ladder_depths"] == (1, 4)
     assert result["config"]["mcts_batch_size"] == 8
     assert result["config"]["self_play_workers"] == 2
+    # The trained net is persisted to the mounted volume, and the volume is
+    # committed so the write survives container teardown.
+    assert captured_kwargs["checkpoint_path"].startswith("/checkpoints/")
+    assert captured_kwargs["checkpoint_path"].endswith("/tictactoe/final.pt")
+    assert captured_kwargs["checkpoint_every"] is None
+    assert captured_kwargs["checkpoint_dir"].startswith("/checkpoints/")
+    assert module.checkpoint_volume.committed is True
 
 
 def test_modal_remote_trains_go_generically(monkeypatch) -> None:
@@ -339,10 +375,27 @@ def test_modal_remote_trains_go_generically(monkeypatch) -> None:
         def from_name(name: str) -> SimpleNamespace:
             return SimpleNamespace(name=name)
 
+    class FakeVolume:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.committed = False
+
+        @staticmethod
+        def from_name(name: str, create_if_missing: bool = False) -> "FakeVolume":
+            return FakeVolume(name)
+
+        def commit(self) -> None:
+            self.committed = True
+
     monkeypatch.setitem(
         sys.modules,
         "modal",
-        SimpleNamespace(App=FakeApp, Image=FakeImageFactory, Secret=FakeSecret),
+        SimpleNamespace(
+            App=FakeApp,
+            Image=FakeImageFactory,
+            Secret=FakeSecret,
+            Volume=FakeVolume,
+        ),
     )
     module = load_modal_app()
 
@@ -417,10 +470,23 @@ def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
         def from_name(name: str) -> SimpleNamespace:
             return SimpleNamespace(name=name)
 
+    class FakeVolume:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.committed = False
+
+        @staticmethod
+        def from_name(name: str, create_if_missing: bool = False) -> "FakeVolume":
+            return FakeVolume(name)
+
+        def commit(self) -> None:
+            self.committed = True
+
     fake_modal = SimpleNamespace(
         App=FakeApp,
         Image=FakeImageFactory,
         Secret=FakeSecret,
+        Volume=FakeVolume,
     )
     monkeypatch.setitem(sys.modules, "modal", fake_modal)
     module = load_modal_app()
@@ -445,6 +511,7 @@ def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
     )
 
     expected = {
+        "checkpoint_every": None,
         "eval_interval": 11,
         "eval_games": 7,
         "eval_sims": 8,
@@ -465,3 +532,37 @@ def test_modal_entrypoint_forwards_game_to_remote(monkeypatch, capsys) -> None:
     assert (
         capsys.readouterr().out == json.dumps(expected, indent=2, sort_keys=True) + "\n"
     )
+
+
+def _load_modal_app_without_modal(monkeypatch):
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "modal":
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    return load_modal_app()
+
+
+def test_resolve_checkpoint_paths_under_volume(monkeypatch) -> None:
+    module = _load_modal_app_without_modal(monkeypatch)
+    final_path, checkpoint_dir = module._resolve_checkpoint_paths(
+        "connectfour", "7jlfmjgu"
+    )
+    assert checkpoint_dir == "/checkpoints/7jlfmjgu"
+    assert final_path == "/checkpoints/7jlfmjgu/connectfour/final.pt"
+    # Final net lives in the same per-game dir as the periodic iter_*.pt files
+    # train_agent writes from checkpoint_dir, so a whole run is co-located.
+    assert final_path.startswith(checkpoint_dir + "/connectfour/")
+
+
+def test_checkpoint_run_tag_prefers_wandb_id(monkeypatch) -> None:
+    module = _load_modal_app_without_modal(monkeypatch)
+    assert module._checkpoint_run_tag(SimpleNamespace(id="abc123"), seed=0) == "abc123"
+
+
+def test_checkpoint_run_tag_falls_back_without_run(monkeypatch) -> None:
+    module = _load_modal_app_without_modal(monkeypatch)
+    assert module._checkpoint_run_tag(None, seed=7).startswith("seed7-")
