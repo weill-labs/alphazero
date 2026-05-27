@@ -15,6 +15,10 @@ _DEFAULT_GATING_GAMES = 20
 _DEFAULT_GATING_THRESHOLD = 0.55
 _DEFAULT_EVAL_INTERVAL = 5
 _DEFAULT_LADDER_GAMES = 20
+# Trained nets are written to a persistent Modal Volume so a finished run can be
+# certified/replayed; the container filesystem itself is ephemeral.
+_CHECKPOINT_VOLUME_NAME = "alphazero-checkpoints"
+_CHECKPOINT_MOUNT = "/checkpoints"
 # Per-game training defaults; each value is overridable via a CLI flag. gomoku
 # and go use a shallow negamax ladder because deep negamax is intractable on
 # their larger boards.
@@ -166,6 +170,32 @@ def _resolve_eval_args(
     }
 
 
+def _checkpoint_run_tag(wandb_run, seed: int) -> str:
+    """Per-run subdirectory tag: the wandb run id when available (so the saved
+    net correlates with its run), else a timestamped fallback."""
+    run_id = getattr(wandb_run, "id", None)
+    if run_id:
+        return str(run_id)
+    return f"seed{seed}-{time.strftime('%Y%m%d-%H%M%S')}"
+
+
+def _resolve_checkpoint_paths(
+    game: str,
+    run_tag: str,
+    *,
+    root: str = _CHECKPOINT_MOUNT,
+) -> tuple[str, str]:
+    """Return ``(final_checkpoint_path, checkpoint_dir)`` on the persisted volume.
+
+    Everything for a run lives under ``<root>/<run_tag>/``; the final net is
+    written next to the periodic ``<game>/iter_NNNN.pt`` checkpoints that
+    ``train_agent`` emits from ``checkpoint_dir``.
+    """
+    checkpoint_dir = f"{root}/{run_tag}"
+    final_path = f"{checkpoint_dir}/{game}/final.pt"
+    return final_path, checkpoint_dir
+
+
 if modal is None:
     app = None
     image = None
@@ -178,6 +208,9 @@ if modal is None:
 
 else:
     app = modal.App("alphazero")
+    checkpoint_volume = modal.Volume.from_name(
+        _CHECKPOINT_VOLUME_NAME, create_if_missing=True
+    )
     image = (
         modal.Image.debian_slim(python_version="3.12")
         # CPU-only torch: sequential MCTS gets no GPU benefit, and the CPU
@@ -196,6 +229,7 @@ else:
         cpu=_DEFAULT_MODAL_CPU,
         timeout=6 * 60 * 60,
         secrets=[modal.Secret.from_name("wandb")],
+        volumes={_CHECKPOINT_MOUNT: checkpoint_volume},
     )
     def train_remote(
         game: str = "tictactoe",
@@ -214,6 +248,7 @@ else:
         eval_interval: int = _DEFAULT_EVAL_INTERVAL,
         ladder_games: int = _DEFAULT_LADDER_GAMES,
         ladder_depths: str | None = None,
+        checkpoint_every: int | None = None,
     ) -> dict[str, object]:
         from alphazero.arena import (
             DEFAULT_C4_SOLVER_POSITIONS,
@@ -267,6 +302,9 @@ else:
             config=run_config,
         )
         _print_wandb_url(wandb_run)
+        run_tag = _checkpoint_run_tag(wandb_run, seed)
+        checkpoint_path, checkpoint_dir = _resolve_checkpoint_paths(game, run_tag)
+        print(f"checkpoint: {checkpoint_path} (volume {_CHECKPOINT_VOLUME_NAME})")
         try:
             training_started = time.perf_counter()
             training_kwargs = {
@@ -278,7 +316,9 @@ else:
                     "batch_size": mcts_batch_size,
                 },
                 "n_selfplay_workers": self_play_workers,
-                "checkpoint_path": None,
+                "checkpoint_path": checkpoint_path,
+                "checkpoint_every": checkpoint_every,
+                "checkpoint_dir": checkpoint_dir,
                 "seed": seed,
                 "wandb_run": wandb_run,
                 "wandb_config": run_config,
@@ -294,6 +334,7 @@ else:
             metrics["modal_self_play_games_per_sec"] = (
                 iterations * self_play_games / training_seconds
             )
+            metrics["checkpoint_volume"] = _CHECKPOINT_VOLUME_NAME
 
             if game == "connectfour":
                 agent = MCTSPlayer(net, num_simulations=eval_sims, seed=seed)
@@ -415,6 +456,9 @@ else:
                 "config": run_config,
             }
         finally:
+            # Persist whatever was written (final net, and any periodic
+            # checkpoints) even if training raised partway through.
+            checkpoint_volume.commit()
             _wandb_finish(wandb_run)
 
     @app.local_entrypoint()
@@ -435,6 +479,7 @@ else:
         eval_interval: int = _DEFAULT_EVAL_INTERVAL,
         ladder_games: int = _DEFAULT_LADDER_GAMES,
         ladder_depths: str | None = None,
+        checkpoint_every: int | None = None,
     ) -> None:
         remote_train = train_remote.with_options(gpu=gpu) if gpu else train_remote
         result = remote_train.remote(
@@ -454,5 +499,6 @@ else:
             eval_interval=eval_interval,
             ladder_games=ladder_games,
             ladder_depths=ladder_depths,
+            checkpoint_every=checkpoint_every,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
