@@ -337,6 +337,47 @@ def test_train_agent_returns_and_checkpoints_latest_net_when_gate_rejects(
     assert metrics["checkpoint_path"] == str(tmp_path / "model.pt")
 
 
+def test_train_agent_saves_periodic_checkpoints_to_game_directory(
+    monkeypatch, tmp_path
+) -> None:
+    game = TicTacToe()
+    saved_paths: list[str] = []
+
+    def fake_play_game(net, game_arg, cfg, temperature_schedule):
+        return _stub_self_play_examples(game_arg)
+
+    def fake_train_iteration(net, examples, **kwargs):
+        return {"loss": 1.0}
+
+    def fake_save_checkpoint(net, checkpoint_path, *, optimizer=None, metrics=None):
+        saved_paths.append(str(checkpoint_path))
+
+    monkeypatch.setattr(arena, "play_game", fake_play_game)
+    monkeypatch.setattr(arena, "compute_loss", _stub_loss)
+    monkeypatch.setattr(arena, "train_iteration", fake_train_iteration)
+    monkeypatch.setattr(arena, "save_checkpoint", fake_save_checkpoint)
+
+    _, metrics = train_agent(
+        game,
+        iterations=3,
+        self_play_games_per_iteration=1,
+        batch_size=1,
+        epochs=1,
+        checkpoint_path=tmp_path / "final.pt",
+        checkpoint_every=2,
+        checkpoint_dir=tmp_path / "checkpoints",
+        gating_interval=99,
+        eval_interval=99,
+        seed=0,
+    )
+
+    assert saved_paths == [
+        str(tmp_path / "checkpoints" / "tictactoe" / "iter_0002.pt"),
+        str(tmp_path / "final.pt"),
+    ]
+    assert metrics["checkpoint_path"] == saved_paths[1]
+
+
 def test_train_agent_gating_promotes_candidate_against_reference_and_bumps_elo(
     monkeypatch,
 ) -> None:

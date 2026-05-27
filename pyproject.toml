@@ -8,6 +8,9 @@ dependencies = [
     "wandb>=0.27.0",
 ]
 
+[project.scripts]
+alphazero-elo-ladder = "alphazero.elo_ladder:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
