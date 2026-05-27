@@ -16,6 +16,7 @@ from alphazero.game import Game
 _ROWS = 6
 _COLS = 7
 _CONNECT = 4
+_BITBOARD_STRIDE = _ROWS + 1
 _DIRECTIONS: tuple[tuple[int, int], ...] = (
     (0, 1),  # horizontal
     (1, 0),  # vertical
@@ -76,16 +77,37 @@ class ConnectFour(Game):
         return self.winner(s) is not None
 
     def winner(self, s: ConnectFourState) -> int | None:
-        for row in range(_ROWS):
-            for col in range(_COLS):
-                mark = s.board[row][col]
-                if mark == 0:
-                    continue
-                for delta_row, delta_col in _DIRECTIONS:
-                    if self._has_line(s, row, col, delta_row, delta_col, mark):
-                        return mark
+        player_one = 0
+        player_two = 0
+        is_full = True
 
-        if all(cell != 0 for row in s.board for cell in row):
+        for row_index in range(_ROWS):
+            bit_row = _ROWS - 1 - row_index
+            row = s.board[row_index]
+            for col in range(_COLS):
+                cell = row[col]
+                if cell == 0:
+                    is_full = False
+                    continue
+
+                bit = 1 << (col * _BITBOARD_STRIDE + bit_row)
+                if cell == 1:
+                    player_one |= bit
+                elif cell == -1:
+                    player_two |= bit
+                else:
+                    return self._scan_winner(s)
+
+        player_one_won = self._has_won_bits(player_one)
+        player_two_won = self._has_won_bits(player_two)
+
+        if player_one_won:
+            if player_two_won:
+                return self._scan_winner(s)
+            return 1
+        if player_two_won:
+            return -1
+        if is_full:
             return 0
         return None
 
@@ -99,6 +121,36 @@ class ConnectFour(Game):
         glyph = {1: "X", -1: "O", 0: "."}
         rows = [" ".join(glyph[cell] for cell in row) for row in s.board]
         return "\n".join([*rows, "0 1 2 3 4 5 6"])
+
+    def _scan_winner(self, s: ConnectFourState) -> int | None:
+        for row in range(_ROWS):
+            for col in range(_COLS):
+                mark = s.board[row][col]
+                if mark == 0:
+                    continue
+                for delta_row, delta_col in _DIRECTIONS:
+                    if self._has_line(s, row, col, delta_row, delta_col, mark):
+                        return mark
+
+        if all(cell != 0 for row in s.board for cell in row):
+            return 0
+        return None
+
+    def _has_won_bits(self, position: int) -> bool:
+        vertical = position & (position >> 1)
+        if vertical & (vertical >> 2):
+            return True
+
+        horizontal = position & (position >> _BITBOARD_STRIDE)
+        if horizontal & (horizontal >> (2 * _BITBOARD_STRIDE)):
+            return True
+
+        diagonal_up = position & (position >> _ROWS)
+        if diagonal_up & (diagonal_up >> (2 * _ROWS)):
+            return True
+
+        diagonal_down = position & (position >> (_ROWS + 2))
+        return bool(diagonal_down & (diagonal_down >> (2 * (_ROWS + 2))))
 
     def _has_line(
         self,

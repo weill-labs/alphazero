@@ -1,7 +1,19 @@
+import random
+
 import numpy as np
 import pytest
 
-from alphazero.games.connectfour import ConnectFour
+from alphazero.games.connectfour import ConnectFour, ConnectFourState
+
+_ROWS = 6
+_COLS = 7
+_CONNECT = 4
+_DIRECTIONS: tuple[tuple[int, int], ...] = (
+    (0, 1),
+    (1, 0),
+    (1, 1),
+    (-1, 1),
+)
 
 
 def _play(game: ConnectFour, moves: list[int]):
@@ -9,6 +21,57 @@ def _play(game: ConnectFour, moves: list[int]):
     for move in moves:
         state = game.apply_move(state, move)
     return state
+
+
+def _reference_winner(s: ConnectFourState) -> int | None:
+    for row in range(_ROWS):
+        for col in range(_COLS):
+            mark = s.board[row][col]
+            if mark == 0:
+                continue
+            for delta_row, delta_col in _DIRECTIONS:
+                if _reference_has_line(s, row, col, delta_row, delta_col, mark):
+                    return mark
+
+    if all(cell != 0 for row in s.board for cell in row):
+        return 0
+    return None
+
+
+def _reference_has_line(
+    s: ConnectFourState,
+    row: int,
+    col: int,
+    delta_row: int,
+    delta_col: int,
+    mark: int,
+) -> bool:
+    for offset in range(_CONNECT):
+        next_row = row + offset * delta_row
+        next_col = col + offset * delta_col
+        if not (0 <= next_row < _ROWS and 0 <= next_col < _COLS):
+            return False
+        if s.board[next_row][next_col] != mark:
+            return False
+    return True
+
+
+def _reference_apply_move(s: ConnectFourState, col: int) -> ConnectFourState:
+    row_to_fill = next(
+        row for row in range(_ROWS - 1, -1, -1) if s.board[row][col] == 0
+    )
+    new_board = [list(row) for row in s.board]
+    new_board[row_to_fill][col] = s.player
+    return ConnectFourState(
+        board=tuple(tuple(row) for row in new_board),
+        player=-s.player,
+    )
+
+
+def _reference_legal_moves(s: ConnectFourState) -> list[int]:
+    if _reference_winner(s) is not None:
+        return []
+    return [col for col in range(_COLS) if s.board[0][col] == 0]
 
 
 def test_horizontal_win():
@@ -45,6 +108,55 @@ def test_diagonal_down_right_win():
 
     assert game.winner(state) == 1
     assert game.is_terminal(state)
+
+
+def test_winner_matches_full_scan_reference_for_random_positions():
+    game = ConnectFour()
+    rng = random.Random(20260527)
+    states = [
+        game.initial_state(),
+        ConnectFourState(
+            board=(
+                (-1, -1, -1, -1, 0, 0, 0),
+                (1, 1, 1, 1, 0, 0, 0),
+                (0, 0, 0, 0, 0, 0, 0),
+                (0, 0, 0, 0, 0, 0, 0),
+                (0, 0, 0, 0, 0, 0, 0),
+                (0, 0, 0, 0, 0, 0, 0),
+            ),
+            player=1,
+        ),
+    ]
+
+    for _ in range(2_000):
+        board = tuple(
+            tuple(rng.choice((-1, 0, 1)) for _ in range(_COLS)) for _ in range(_ROWS)
+        )
+        states.append(ConnectFourState(board=board, player=rng.choice((-1, 1))))
+
+    terminal_count = 0
+    for _ in range(250):
+        state = game.initial_state()
+        states.append(state)
+
+        while _reference_winner(state) is None:
+            legal_moves = _reference_legal_moves(state)
+            if not legal_moves:
+                break
+            state = _reference_apply_move(state, rng.choice(legal_moves))
+            states.append(state)
+
+        if _reference_winner(state) is not None:
+            terminal_count += 1
+
+    if terminal_count != 250:
+        pytest.fail(f"expected 250 terminal games, got {terminal_count}")
+
+    for state in states:
+        expected = _reference_winner(state)
+        actual = game.winner(state)
+        if actual != expected:
+            pytest.fail(f"winner mismatch: expected {expected}, got {actual}")
 
 
 def test_full_board_draw_has_no_winner():
