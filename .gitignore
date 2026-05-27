@@ -64,3 +64,6 @@ wandb/
 
 # old beads_rust data (pre-bd migration), kept locally
 .beads_br_backup/
+
+# orca agent orchestration clone pool (local, per-project)
+.orca/
