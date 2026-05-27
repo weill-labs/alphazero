@@ -197,6 +197,7 @@ Key invariants:
 - `.beads/issues.jsonl` is the git-tracked source of truth and **must be committed** with code changes.
 - Do not edit `.beads/*.jsonl` directly; only via `bd`.
 - The Dolt DB under `.beads/` is gitignored and lives in the main checkout, so run `bd` from the main repo (not a worktree).
+- **Delegated workers in a git worktree:** do not touch `.beads` at all — make a **code-only commit**. The Dolt DB is not present in worktrees, so the orchestrator runs `bd update`/`bd close` and commits `.beads/issues.jsonl` centrally from the main checkout.
 
 ### Basics
 
