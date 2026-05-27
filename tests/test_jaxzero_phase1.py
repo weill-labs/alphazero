@@ -1,0 +1,152 @@
+"""Phase 1 JAX pipeline smoke and determinism tests."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+from jaxzero.net import AlphaZeroNetConfig, create_model
+from jaxzero.selfplay import (
+    SelfPlayConfig,
+    discounted_returns,
+    flatten_selfplay_data,
+    initial_observation_shape,
+    make_env,
+    make_selfplay,
+)
+from jaxzero.train import TrainingConfig, load_checkpoint, run_training, save_checkpoint
+
+
+def _tiny_training_config(
+    *, seed: int = 0, checkpoint_path: str | None = None
+) -> TrainingConfig:
+    return TrainingConfig(
+        iterations=1,
+        batch_size=2,
+        num_simulations=1,
+        max_steps=2,
+        channels=4,
+        num_res_blocks=1,
+        learning_rate=1e-2,
+        seed=seed,
+        checkpoint_path=checkpoint_path,
+    )
+
+
+def _tree_leaves(params):
+    return jax.tree.leaves(nnx.to_pure_dict(params))
+
+
+def test_nnx_net_forward_matches_contract() -> None:
+    env = make_env()
+    config = AlphaZeroNetConfig(
+        obs_shape=initial_observation_shape(),
+        action_size=env.num_actions,
+        channels=4,
+        num_res_blocks=1,
+    )
+    model = create_model(config, seed=0)
+    obs = jnp.zeros((3, *config.obs_shape), dtype=jnp.bool_)
+
+    policy_logits, value = model(obs)
+
+    assert policy_logits.shape == (3, env.num_actions)
+    assert value.shape == (3,)
+    assert jnp.all(value <= 1.0)
+    assert jnp.all(value >= -1.0)
+
+
+def test_selfplay_smoke_produces_training_data() -> None:
+    env = make_env()
+    config = AlphaZeroNetConfig(
+        obs_shape=initial_observation_shape(),
+        action_size=env.num_actions,
+        channels=4,
+        num_res_blocks=1,
+    )
+    graphdef, params = nnx.split(create_model(config, seed=0), nnx.Param)
+    selfplay = make_selfplay(
+        SelfPlayConfig(batch_size=2, num_simulations=1, max_steps=2),
+        graphdef,
+    )
+
+    data = selfplay(params, jax.random.PRNGKey(0))
+    flat = flatten_selfplay_data(data)
+
+    assert data.observation.shape == (2, 2, *config.obs_shape)
+    assert flat.action_weights.shape == (4, env.num_actions)
+    assert jnp.allclose(jnp.sum(flat.action_weights, axis=-1), 1.0)
+    assert flat.value_target.shape == (4,)
+    assert flat.value_mask.shape == (4,)
+
+
+def test_discounted_returns_mask_truncated_suffix() -> None:
+    rewards = jnp.array([[0.0], [1.0], [0.0], [0.0]])
+    discounts = jnp.array([[-1.0], [0.0], [-1.0], [-1.0]])
+    terminated = jnp.array([[False], [True], [False], [False]])
+
+    targets, mask = discounted_returns(rewards, discounts, terminated)
+
+    assert jnp.allclose(targets[:, 0], jnp.array([-1.0, 1.0, 0.0, 0.0]))
+    assert mask[:, 0].tolist() == [True, True, False, False]
+
+
+def test_training_smoke_and_checkpoint_round_trip(tmp_path) -> None:
+    checkpoint = tmp_path / "jaxzero.msgpack"
+    result = run_training(_tiny_training_config(checkpoint_path=str(checkpoint)))
+
+    model = load_checkpoint(checkpoint)
+    reloaded_leaves = _tree_leaves(nnx.state(model, nnx.Param))
+    result_leaves = _tree_leaves(result.params)
+
+    assert len(result.metrics) == 1
+    assert jnp.isfinite(result.metrics[0]["loss"])
+    assert len(reloaded_leaves) == len(result_leaves)
+    for actual, expected in zip(reloaded_leaves, result_leaves, strict=True):
+        assert jnp.allclose(actual, expected)
+
+
+def test_checkpoint_helpers_store_net_config(tmp_path) -> None:
+    env = make_env()
+    config = AlphaZeroNetConfig(
+        obs_shape=initial_observation_shape(),
+        action_size=env.num_actions,
+        channels=4,
+        num_res_blocks=1,
+    )
+    model = create_model(config, seed=0)
+    checkpoint = tmp_path / "model.msgpack"
+
+    save_checkpoint(model, checkpoint)
+    loaded = load_checkpoint(checkpoint)
+
+    assert loaded.config == config
+
+
+def test_same_seed_reproduces_params() -> None:
+    first = run_training(_tiny_training_config(seed=123))
+    second = run_training(_tiny_training_config(seed=123))
+
+    for actual, expected in zip(
+        _tree_leaves(first.params), _tree_leaves(second.params), strict=True
+    ):
+        assert jnp.array_equal(actual, expected)
+
+
+def test_jaxzero_imports_do_not_load_torch() -> None:
+    code = (
+        "import sys, jaxzero, jaxzero.train; raise SystemExit('torch' in sys.modules)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
