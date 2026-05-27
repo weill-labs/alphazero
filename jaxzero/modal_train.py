@@ -153,6 +153,7 @@ else:
         channels: int = 64,
         num_res_blocks: int = 5,
         learning_rate: float = 1e-3,
+        minibatch_size: int = 1024,
         seed: int = 0,
         requested_gpu: str = _DEFAULT_GPU,
     ) -> dict[str, object]:
@@ -168,6 +169,7 @@ else:
             "channels": channels,
             "num_res_blocks": num_res_blocks,
             "learning_rate": learning_rate,
+            "minibatch_size": minibatch_size,
             "seed": seed,
             "requested_gpu": requested_gpu,
         }
@@ -182,6 +184,12 @@ else:
         print(f"checkpoint: {checkpoint_path} (volume {_CHECKPOINT_VOLUME_NAME})")
         try:
             training_started = time.perf_counter()
+
+            def _log_iteration(metrics: dict[str, float | int]) -> None:
+                # Stream each iteration's metrics live so the wandb charts
+                # update during the run (not in one batch at the end).
+                _wandb_log(wandb_run, metrics, step=int(metrics.get("iteration", 0)))
+
             result = run_training(
                 TrainingConfig(
                     iterations=iterations,
@@ -191,14 +199,13 @@ else:
                     channels=channels,
                     num_res_blocks=num_res_blocks,
                     learning_rate=learning_rate,
+                    minibatch_size=minibatch_size,
                     seed=seed,
                     checkpoint_path=checkpoint_path,
-                )
+                ),
+                on_iteration=_log_iteration,
             )
             training_seconds = max(time.perf_counter() - training_started, 1e-12)
-            for metrics in result.metrics:
-                step = int(metrics.get("iteration", 0))
-                _wandb_log(wandb_run, metrics, step=step)
 
             final_metrics = _last_metrics(result.metrics)
             modal_metrics = {
@@ -230,6 +237,7 @@ else:
         channels: int = 64,
         num_res_blocks: int = 5,
         learning_rate: float = 1e-3,
+        minibatch_size: int = 1024,
         seed: int = 0,
         gpu: str = _DEFAULT_GPU,
     ) -> None:
@@ -245,6 +253,7 @@ else:
             channels=channels,
             num_res_blocks=num_res_blocks,
             learning_rate=learning_rate,
+            minibatch_size=minibatch_size,
             seed=seed,
             requested_gpu=gpu,
         )

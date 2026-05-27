@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +34,7 @@ class TrainingConfig:
     channels: int = 64
     num_res_blocks: int = 5
     learning_rate: float = 1e-3
+    minibatch_size: int = 1024
     seed: int = 0
     checkpoint_path: str | None = None
 
@@ -42,6 +44,9 @@ class TrainingConfig:
             raise ValueError(msg)
         if self.learning_rate <= 0:
             msg = "learning_rate must be positive"
+            raise ValueError(msg)
+        if self.minibatch_size <= 0:
+            msg = "minibatch_size must be positive"
             raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
@@ -137,8 +142,52 @@ def _host_metrics(
     }
 
 
-def run_training(config: TrainingConfig) -> TrainingResult:
-    """Run buffer-free self-play/training for ``config.iterations``."""
+def _train_epoch(
+    update_step,
+    params: nnx.State,
+    opt_state: optax.OptState,
+    data: SelfPlayData,
+    minibatch_size: int,
+    key: jax.Array,
+) -> tuple[nnx.State, optax.OptState, dict[str, jax.Array]]:
+    """One pass over the iteration's self-play data in fixed-size minibatches.
+
+    A single full-batch gradient over ``batch_size * max_steps`` examples OOMs at
+    GPU scale (the backprop activations don't fit). Minibatching bounds each
+    step's activation memory and yields several gradient steps per iteration.
+    The trailing partial minibatch is dropped so every step shares one shape.
+    """
+    n = int(data.observation.shape[0])
+    size = min(minibatch_size, n)
+    num_minibatches = n // size
+    perm = jax.random.permutation(key, n)[: num_minibatches * size]
+    perm = perm.reshape(num_minibatches, size)
+
+    metric_totals: dict[str, jax.Array] | None = None
+    for i in range(num_minibatches):
+        minibatch = jax.tree.map(lambda leaf, idx=perm[i]: leaf[idx], data)
+        params, opt_state, metrics = update_step(params, opt_state, minibatch)
+        if metric_totals is None:
+            metric_totals = dict(metrics)
+        else:
+            metric_totals = {k: metric_totals[k] + v for k, v in metrics.items()}
+
+    assert metric_totals is not None  # num_minibatches >= 1 since size <= n
+    mean_metrics = {k: v / num_minibatches for k, v in metric_totals.items()}
+    return params, opt_state, mean_metrics
+
+
+def run_training(
+    config: TrainingConfig,
+    *,
+    on_iteration: Callable[[dict[str, float | int]], None] | None = None,
+) -> TrainingResult:
+    """Run buffer-free self-play/training for ``config.iterations``.
+
+    Each iteration generates fresh self-play data and takes one pass of
+    minibatched gradient steps over it. ``on_iteration`` (if given) receives the
+    per-iteration host metrics as they are produced, for live logging.
+    """
 
     net_config = build_net_config(config)
     model = create_model(net_config, seed=config.seed)
@@ -159,10 +208,15 @@ def run_training(config: TrainingConfig) -> TrainingResult:
     key = jax.random.PRNGKey(config.seed)
     history: list[dict[str, float | int]] = []
     for iteration in range(config.iterations):
-        key, selfplay_key = jax.random.split(key)
+        key, selfplay_key, shuffle_key = jax.random.split(key, 3)
         data = flatten_selfplay_data(selfplay(params, selfplay_key))
-        params, opt_state, metrics = update_step(params, opt_state, data)
-        history.append(_host_metrics(metrics, iteration=iteration))
+        params, opt_state, metrics = _train_epoch(
+            update_step, params, opt_state, data, config.minibatch_size, shuffle_key
+        )
+        host_metrics = _host_metrics(metrics, iteration=iteration)
+        history.append(host_metrics)
+        if on_iteration is not None:
+            on_iteration(host_metrics)
 
     if config.checkpoint_path is not None:
         save_checkpoint(nnx.merge(graphdef, params), config.checkpoint_path)

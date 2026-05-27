@@ -229,13 +229,17 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
 
     captured: dict[str, object] = {}
 
-    def fake_run_training(config):
+    def fake_run_training(config, *, on_iteration=None):
         captured["config"] = config
+        metrics = [
+            {"iteration": 0, "loss": 1.25},
+            {"iteration": 1, "loss": 0.5},
+        ]
+        if on_iteration is not None:
+            for entry in metrics:
+                on_iteration(entry)
         return SimpleNamespace(
-            metrics=[
-                {"iteration": 0, "loss": 1.25},
-                {"iteration": 1, "loss": 0.5},
-            ],
+            metrics=metrics,
             checkpoint_path=config.checkpoint_path,
         )
 

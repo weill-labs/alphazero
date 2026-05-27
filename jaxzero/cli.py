@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channels", type=int, default=64)
     parser.add_argument("--num-res-blocks", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--minibatch-size", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", dest="checkpoint_path")
     return parser
@@ -36,6 +37,7 @@ def main(argv: list[str] | None = None) -> None:
         channels=args.channels,
         num_res_blocks=args.num_res_blocks,
         learning_rate=args.learning_rate,
+        minibatch_size=args.minibatch_size,
         seed=args.seed,
         checkpoint_path=args.checkpoint_path,
     )
