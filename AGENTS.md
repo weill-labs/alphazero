@@ -194,6 +194,7 @@ All issue tracking goes through **Beads** — `bd` (github.com/gastownhall/beads
 
 Key invariants:
 
+- **Create a bead _before_ starting any task** — including small or quick changes you do yourself, not just large or delegated work. `bd create` + `bd update <id> --status in_progress` is step one of every task; never begin work without an open bead, and never file the bead only retroactively after the change is done.
 - `.beads/issues.jsonl` is the git-tracked source of truth and **must be committed** with code changes.
 - Do not edit `.beads/*.jsonl` directly; only via `bd`.
 - The Dolt DB under `.beads/` is gitignored and lives in the main checkout, so run `bd` from the main repo (not a worktree).
@@ -212,8 +213,8 @@ bd list --status open
 
 Agent workflow:
 
-1. `bd ready` to find unblocked work.
-2. Claim: `bd update <id> --status in_progress`.
+1. Find or create the bead **first**: `bd ready` for existing unblocked work, or `bd create ...` for new/ad-hoc tasks (including small fixes you do yourself).
+2. Claim: `bd update <id> --status in_progress` before writing any code.
 3. Implement + test.
 4. If you discover new work: `bd create "..." --deps discovered-from:<parent-id>`.
 5. `bd close <id>` when done.
