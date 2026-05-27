@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -565,28 +564,43 @@ def _worker_net_kwargs(net: AlphaZeroNet) -> dict[str, object]:
 
 
 def _worker_state_dict(net: AlphaZeroNet) -> dict[str, torch.Tensor]:
-    return {name: tensor.detach().cpu() for name, tensor in net.state_dict().items()}
+    return {
+        name: tensor.detach().cpu().clone() for name, tensor in net.state_dict().items()
+    }
 
 
-def _self_play_worker(
-    task: tuple[
-        dict[str, object],
-        dict[str, torch.Tensor],
-        Game,
-        dict[str, object],
-        list[tuple[int, int]],
-        bool,
-    ],
-) -> tuple[list[tuple[int, list[SelfPlayExample]]], list[tuple[str, float]]]:
-    (
-        net_kwargs,
-        state_dict,
-        game,
-        self_play_mcts_cfg,
-        indexed_game_seeds,
-        collect_timings,
-    ) = task
+_SELF_PLAY_WORKER_PAYLOAD: Any | None = None
+_SELF_PLAY_WORKER_GENERATION: int | None = None
+_SELF_PLAY_WORKER_NET: AlphaZeroNet | None = None
+_SELF_PLAY_WORKER_GAME: Game | None = None
+_SELF_PLAY_WORKER_MCTS_CFG: dict[str, object] | None = None
+
+
+def _init_self_play_worker(shared_payload: Any) -> None:
+    global _SELF_PLAY_WORKER_PAYLOAD
     torch.set_num_threads(1)
+    _SELF_PLAY_WORKER_PAYLOAD = shared_payload
+
+
+def _load_self_play_worker_generation(generation: int) -> None:
+    global _SELF_PLAY_WORKER_GENERATION
+    global _SELF_PLAY_WORKER_GAME
+    global _SELF_PLAY_WORKER_MCTS_CFG
+    global _SELF_PLAY_WORKER_NET
+
+    if _SELF_PLAY_WORKER_GENERATION == generation:
+        return
+    if _SELF_PLAY_WORKER_PAYLOAD is None:
+        raise RuntimeError("self-play worker was not initialized")
+
+    payload = _SELF_PLAY_WORKER_PAYLOAD
+    if int(payload.generation) != generation:
+        raise RuntimeError(
+            f"self-play worker expected generation {generation}, "
+            f"got {payload.generation}"
+        )
+
+    net_kwargs = dict(cast(Mapping[str, object], payload.net_kwargs))
     net = AlphaZeroNet(
         int(net_kwargs["num_planes"]),
         cast(tuple[int, int], net_kwargs["board_shape"]),
@@ -594,8 +608,28 @@ def _self_play_worker(
         channels=int(net_kwargs["channels"]),
         num_res_blocks=int(net_kwargs["num_res_blocks"]),
     )
-    net.load_state_dict(state_dict)
+    net.load_state_dict(cast(dict[str, torch.Tensor], payload.state_dict))
     net.train(False)
+
+    _SELF_PLAY_WORKER_GENERATION = generation
+    _SELF_PLAY_WORKER_GAME = cast(Game, payload.game)
+    _SELF_PLAY_WORKER_MCTS_CFG = dict(
+        cast(Mapping[str, object], payload.self_play_mcts_cfg)
+    )
+    _SELF_PLAY_WORKER_NET = net
+
+
+def _self_play_one_game_worker(
+    task: tuple[int, int, int, bool],
+) -> tuple[int, list[SelfPlayExample], list[tuple[str, float]]]:
+    game_index, game_seed, generation, collect_timings = task
+    _load_self_play_worker_generation(generation)
+    if (
+        _SELF_PLAY_WORKER_NET is None
+        or _SELF_PLAY_WORKER_GAME is None
+        or _SELF_PLAY_WORKER_MCTS_CFG is None
+    ):
+        raise RuntimeError("self-play worker has no active payload")
 
     timing_events: list[tuple[str, float]] = []
 
@@ -603,32 +637,88 @@ def _self_play_worker(
         timing_events.append((name, seconds))
 
     timing_hook = record_timing if collect_timings else None
-    results: list[tuple[int, list[SelfPlayExample]]] = []
-    for game_index, game_seed in indexed_game_seeds:
-        results.append(
-            (
-                game_index,
-                play_game(
-                    net,
-                    game,
-                    _self_play_cfg(self_play_mcts_cfg, game_seed),
-                    temperature_schedule=opening_temperature_schedule,
-                    timing_hook=timing_hook,
-                ),
-            )
+    examples = play_game(
+        _SELF_PLAY_WORKER_NET,
+        _SELF_PLAY_WORKER_GAME,
+        _self_play_cfg(_SELF_PLAY_WORKER_MCTS_CFG, game_seed),
+        temperature_schedule=opening_temperature_schedule,
+        timing_hook=timing_hook,
+    )
+    return game_index, examples, timing_events
+
+
+class _SelfPlayWorkerPool:
+    def __init__(self, worker_count: int) -> None:
+        if worker_count <= 0:
+            raise ValueError("worker_count must be positive")
+
+        self.worker_count = worker_count
+        self._ctx = torch_mp.get_context("spawn")
+        self._manager = self._ctx.Manager()
+        self._payload = self._manager.Namespace()
+        self._payload.generation = 0
+        self._generation = 0
+        self._closed = False
+        self._pool = self._ctx.Pool(
+            processes=worker_count,
+            initializer=_init_self_play_worker,
+            initargs=(self._payload,),
         )
-    return results, timing_events
 
+    def __enter__(self) -> _SelfPlayWorkerPool:
+        return self
 
-def _chunk_indexed_seeds(
-    indexed_game_seeds: Sequence[tuple[int, int]],
-    worker_count: int,
-) -> list[list[tuple[int, int]]]:
-    chunk_size = max(1, math.ceil(len(indexed_game_seeds) / worker_count))
-    return [
-        list(indexed_game_seeds[start : start + chunk_size])
-        for start in range(0, len(indexed_game_seeds), chunk_size)
-    ]
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.close(terminate=exc_type is not None)
+        return False
+
+    def close(self, *, terminate: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if terminate:
+                self._pool.terminate()
+            else:
+                self._pool.close()
+            self._pool.join()
+        finally:
+            self._manager.shutdown()
+
+    def run_iteration(
+        self,
+        net: AlphaZeroNet,
+        game: Game,
+        self_play_mcts_cfg: Mapping[str, object] | None,
+        indexed_game_seeds: Sequence[tuple[int, int]],
+        *,
+        collect_timings: bool,
+    ) -> tuple[
+        dict[int, list[SelfPlayExample]],
+        dict[int, list[tuple[str, float]]],
+    ]:
+        self._generation += 1
+        self._payload.net_kwargs = _worker_net_kwargs(net)
+        self._payload.state_dict = _worker_state_dict(net)
+        self._payload.game = game
+        self._payload.self_play_mcts_cfg = dict(self_play_mcts_cfg or {})
+        self._payload.generation = self._generation
+
+        tasks = [
+            (game_index, game_seed, self._generation, collect_timings)
+            for game_index, game_seed in indexed_game_seeds
+        ]
+        by_game_index: dict[int, list[SelfPlayExample]] = {}
+        timings_by_game_index: dict[int, list[tuple[str, float]]] = {}
+        for game_index, game_examples, timing_events in self._pool.imap_unordered(
+            _self_play_one_game_worker,
+            tasks,
+            chunksize=1,
+        ):
+            by_game_index[game_index] = game_examples
+            timings_by_game_index[game_index] = timing_events
+
+        return by_game_index, timings_by_game_index
 
 
 def _self_play_examples_for_iteration(
@@ -639,6 +729,7 @@ def _self_play_examples_for_iteration(
     *,
     n_selfplay_workers: int,
     timing_hook: Callable[[str, float], None] | None = None,
+    worker_pool: _SelfPlayWorkerPool | None = None,
 ) -> list[SelfPlayExample]:
     if n_selfplay_workers <= 0:
         raise ValueError("n_selfplay_workers must be positive")
@@ -665,35 +756,36 @@ def _self_play_examples_for_iteration(
         return []
 
     worker_count = min(n_selfplay_workers, len(indexed_game_seeds))
-    chunks = _chunk_indexed_seeds(indexed_game_seeds, worker_count)
-    net_kwargs = _worker_net_kwargs(net)
-    state_dict = _worker_state_dict(net)
-    task_cfg = dict(self_play_mcts_cfg or {})
-    tasks = [
-        (
-            net_kwargs,
-            state_dict,
-            game,
-            task_cfg,
-            chunk,
-            timing_hook is not None,
+    owns_worker_pool = worker_pool is None
+    if worker_pool is None:
+        worker_pool = _SelfPlayWorkerPool(worker_count)
+    elif worker_pool.worker_count != worker_count:
+        raise ValueError(
+            "worker_pool worker_count must match the requested self-play workers"
         )
-        for chunk in chunks
-    ]
 
-    ctx = torch_mp.get_context("spawn")
-    by_game_index: dict[int, list[SelfPlayExample]] = {}
-    with ctx.Pool(processes=worker_count) as pool:
-        for worker_results, timing_events in pool.map(_self_play_worker, tasks):
-            for game_index, game_examples in worker_results:
-                by_game_index[game_index] = game_examples
-            if timing_hook is not None:
-                for name, seconds in timing_events:
-                    timing_hook(name, seconds)
+    try:
+        by_game_index, timings_by_game_index = worker_pool.run_iteration(
+            net,
+            game,
+            self_play_mcts_cfg,
+            indexed_game_seeds,
+            collect_timings=timing_hook is not None,
+        )
+    except BaseException:
+        if owns_worker_pool:
+            worker_pool.close(terminate=True)
+        raise
+    else:
+        if owns_worker_pool:
+            worker_pool.close()
 
     examples = []
     for game_index, _ in indexed_game_seeds:
         examples.extend(by_game_index[game_index])
+        if timing_hook is not None:
+            for name, seconds in timings_by_game_index[game_index]:
+                timing_hook(name, seconds)
     return examples
 
 
@@ -897,7 +989,14 @@ def train_agent(
         owns_wandb_run = active_wandb_run is not None
 
     metrics: dict[str, float | int | str] = {}
+    self_play_worker_pool: _SelfPlayWorkerPool | None = None
+    terminate_self_play_pool = False
     try:
+        if n_selfplay_workers > 1:
+            self_play_worker_pool = _SelfPlayWorkerPool(
+                min(n_selfplay_workers, self_play_games_per_iteration)
+            )
+
         for iteration in range(iterations):
             iteration_number = iteration + 1
             iteration_started = time.perf_counter()
@@ -912,6 +1011,7 @@ def train_agent(
                 game_seeds,
                 n_selfplay_workers=n_selfplay_workers,
                 timing_hook=timing_hook,
+                worker_pool=self_play_worker_pool,
             )
             loss_before, _ = compute_loss(net, examples, l2_reg=l2_reg)
             metrics = train_iteration(
@@ -1000,7 +1100,12 @@ def train_agent(
                     )
 
             _wandb_log(active_wandb_run, metrics, step=iteration + 1)
+    except BaseException:
+        terminate_self_play_pool = True
+        raise
     finally:
+        if self_play_worker_pool is not None:
+            self_play_worker_pool.close(terminate=terminate_self_play_pool)
         if owns_wandb_run:
             _wandb_finish(active_wandb_run)
 
