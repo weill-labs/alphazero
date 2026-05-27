@@ -17,7 +17,8 @@ _WIDTH = 7
 _STRIDE = _HEIGHT + 1
 _BOARD_CELLS = _HEIGHT * _WIDTH
 _CENTER_FIRST_COLS = (3, 2, 4, 1, 5, 0, 6)
-_DEFAULT_MAX_NODES = 5_000_000
+_OPENING_CENTER = 3
+_DEFAULT_MAX_NODES = 25_000_000
 _MAX_SCORE = (_BOARD_CELLS + 1) // 2
 
 _BOTTOM_MASKS = tuple(1 << (col * _STRIDE) for col in range(_WIDTH))
@@ -133,12 +134,15 @@ def solve(
     if not legal:
         return 0, []
 
+    opening_book_result = _opening_book(position, legal)
+    if opening_book_result is not None:
+        return opening_book_result
+
     solver = _Solver(max_nodes=max_nodes)
     best_value = -2
     optimal_moves: list[int] = []
     for col in legal:
         move = _move_bit(position.mask, col)
-        solver.table.clear()
         child_score = solver.score(
             position.opponent,
             position.current | move,
@@ -190,6 +194,22 @@ def _score_to_value(score: int) -> int:
     if score < 0:
         return -1
     return 0
+
+
+def _opening_book(
+    position: _Position,
+    legal: list[int],
+) -> tuple[int, list[int]] | None:
+    # Known solved result: Connect Four is a first-player win only when the
+    # first move is the center column (Victor Allis, 1988). These opening
+    # positions are too deep to certify live in a bounded pure-Python search.
+    # Keep this book to entries with exact optimal move sets; other opening
+    # outcome classes fall through to live search and may hit the node budget.
+    if position.moves_played == 0:
+        return 1, [_OPENING_CENTER]
+    if position.moves_played == 1 and position.mask == _BOTTOM_MASKS[_OPENING_CENTER]:
+        return -1, sorted(legal)
+    return None
 
 
 def _has_won(position: int) -> bool:
