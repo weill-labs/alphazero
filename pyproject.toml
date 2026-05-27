@@ -9,6 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
+alphazero-c4-certify = "alphazero.c4_certify:main"
 alphazero-elo-ladder = "alphazero.elo_ladder:main"
 
 [project.optional-dependencies]
