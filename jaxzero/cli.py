@@ -49,9 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--solver-eval-positions",
         type=int,
-        default=0,
-        help=">0: every --eval-interval iterations, certify the net against the "
-        "solver on this many positions and log eval/c4_blunder_rate (solver-anchored)",
+        default=64,
+        help="Every --eval-interval iterations, certify the net against the "
+        "solver on this many positions and log eval/c4_blunder_rate "
+        "(solver-anchored). Default 64 gives SE ~0.04 on rates near 0.1; "
+        "below ~32 the curve discretizes too coarsely to read. Set to 0 to "
+        "disable.",
     )
     parser.add_argument("--eval-sims", type=int, default=64)
     return parser
