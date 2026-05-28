@@ -260,6 +260,61 @@ Protocol:
 
 ---
 
+## C4 experimentation rules
+
+Learned during the alphago-jla goal session (2026-05-28), where blunder rate was
+driven from baseline 0.082 to 0.036 (z=+2.16) across 29 Modal A100 runs.
+
+- **Trust the offline 128-pos+ cert for verdict — not the inline metric.**
+  `eval/c4_blunder_rate` from `make_solver_evaluator` is computed at a fixed
+  seed on ~49 sampled positions (128 - opening_depth_skips). A trained net can
+  consistently fail on the *same* 1-2 of those 49 positions, producing a
+  spurious flat-line at e.g. 0.041 across multiple evals. The 128-pos offline
+  cert (or larger) uses a different sample and exposes the real rate. In one
+  session a model reading 0.041 inline certified at 0.124 on 128 positions.
+
+- **Use `setsid` for parallel `modal run --detach` from one shell.**
+  Modal's own warning ("only the last detached run survives parent death")
+  applies per parent process: 3 concurrent `--detach` calls from the same
+  shell will lose 2 of 3 when the parent dies. The fix gives each call its
+  own session:
+  ```bash
+  setsid bash -c '.venv/bin/modal run --detach ...' < /dev/null > /dev/null 2>&1 &
+  disown
+  ```
+  After `disown`, `ps -ef` should show PPID=1 for each modal client. The
+  Modal containers themselves are unaffected — this is purely a local-client
+  lifecycle fix.
+
+- **Replicate with ≥3 seeds before claiming a lever helps.** At blunder rates
+  below ~0.10, seed variance is dominant. Same config (128ch + mirror + jla,
+  200 iters) across seeds 82/91/92 produced blunder 0.042 / 0.073 / 0.177 —
+  a 4× spread. Combined cert gave a noise-level z. Single-seed wins below
+  0.10 should be treated as suggestive only until replicated and confirmed
+  with a high-resolution cert (1024+ positions).
+
+- **Policy quality, not value MAE, drives blunder rate at the C4 plateau.**
+  Prior bead trail diagnosed value MAE as the bottleneck. Phase 3 G achieved
+  value_mae 0.847 (better than baseline 0.947) but identical 0.082 blunder.
+  Phase 2 F achieved value_mae 0.674 (best ever) at 0.104 blunder.
+  `--mirror-augment` (2× policy training data via C4 horizontal symmetry)
+  combined with 128 channels broke the plateau. `--value-loss-weight 2.0`
+  *alone* destabilizes the policy gradient and hurt blunder rate (Phase 2 E:
+  0.134) — it only helps when composed with mirror.
+
+- **Warm-start from a checkpoint is broken until optimizer state is
+  persisted.** Adam state reset on a trained net regressed Phase 3 H from
+  F's 0.104 to 0.134. Either persist optimizer state in the checkpoint or
+  treat `--init-checkpoint` as a cold-start of the optimizer only.
+
+- **On hetzner-xl, invoke canonical bd via the absolute path
+  `/home/cweill/.local/bin/bd`.** The unqualified `bd` is aliased to a
+  different tool (`br` v0.2.11, a Rust port) that writes a slightly
+  different JSONL schema (drops `_type`, `*_count`, etc). Mixing the two
+  tools produces large format-noise diffs.
+
+---
+
 ## UBS Quick Reference
 
 **Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
