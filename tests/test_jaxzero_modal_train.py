@@ -261,6 +261,9 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
         num_res_blocks=1,
         learning_rate=0.02,
         solver_eval_positions=0,  # disable inline solver cert for this test
+        gating_interval=3,
+        gating_games=4,
+        gating_threshold=0.6,
         seed=9,
         requested_gpu="A100-40GB",
     )
@@ -270,6 +273,9 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert config.iterations == 2
     assert config.batch_size == 4
     assert config.num_simulations == 5
+    assert config.gating_interval == 3
+    assert config.gating_games == 4
+    assert config.gating_threshold == 0.6
     assert init_kwargs["project"] == "alphazero-connectfour"
     assert result["checkpoint_path"] == config.checkpoint_path
     assert result["checkpoint_dir"] == "/checkpoints/wandb123/connectfour"
