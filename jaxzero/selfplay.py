@@ -23,9 +23,6 @@ ENV_ID = "connect_four"
 # self-play (PUCT + Dirichlet 0.25/0.3).
 _DIRICHLET_FRACTION = 0.25
 _DIRICHLET_ALPHA = 0.3
-# Connect Four has at most 42 plies; normalize the remaining-ply target into
-# ~[0, 1] so the wdlp auxiliary ply MSE sits on the same scale as the WDL CE.
-_MAX_PLIES = 42.0
 
 
 @dataclass(frozen=True)
@@ -64,10 +61,6 @@ class SelfPlayData(NamedTuple):
     terminated: jax.Array
     value_target: jax.Array
     value_mask: jax.Array
-    # Remaining plies to episode end, normalized by _MAX_PLIES into ~[0, 1].
-    # Auxiliary target for the wdlp value head; ignored by the scalar head.
-    # Shares ``value_mask`` (only complete episodes contribute).
-    ply_target: jax.Array
 
 
 def make_env() -> pgx.Env:
@@ -123,27 +116,6 @@ def discounted_returns(
         (rewards[::-1], discounts[::-1], terminated[::-1]),
     )
     return targets_rev[::-1], valid_rev[::-1]
-
-
-def remaining_plies(discounts: jax.Array) -> jax.Array:
-    """Plies remaining until episode end for each position, shaped ``[time, batch]``.
-
-    ``discounts`` is the per-step discount: ``0`` marks the move that ended an
-    episode, ``-1`` mid-episode. Counting backward, the terminal move has 1 ply
-    remaining; earlier moves add one per step until the episode boundary (where
-    the count resets). Positions in an incomplete trailing episode get a count
-    too, but they are masked out by ``value_mask`` at loss time.
-    """
-
-    batch_size = discounts.shape[1]
-
-    def step(next_remaining, discount):
-        remaining = jnp.where(discount == 0.0, 1.0, 1.0 + next_remaining)
-        return remaining, remaining
-
-    init = jnp.zeros((batch_size,), dtype=jnp.float32)
-    _, remaining_rev = jax.lax.scan(step, init, discounts[::-1])
-    return remaining_rev[::-1]
 
 
 def make_selfplay(
@@ -228,7 +200,6 @@ def make_selfplay(
             transitions.discount,
             transitions.terminated,
         )
-        ply_target = remaining_plies(transitions.discount) / _MAX_PLIES
         return SelfPlayData(
             observation=transitions.observation,
             action_weights=transitions.action_weights,
@@ -237,7 +208,6 @@ def make_selfplay(
             terminated=transitions.terminated,
             value_target=value_target,
             value_mask=value_mask,
-            ply_target=ply_target,
         )
 
     return jax.jit(selfplay)
@@ -257,7 +227,6 @@ def flatten_selfplay_data(data: SelfPlayData) -> SelfPlayData:
         terminated=flatten(data.terminated),
         value_target=flatten(data.value_target),
         value_mask=flatten(data.value_mask),
-        ply_target=flatten(data.ply_target),
     )
 
 
@@ -274,8 +243,8 @@ def mirror_selfplay_data(data: SelfPlayData) -> SelfPlayData:
     Assumes the input is already flattened to ``[examples, ...]`` (post
     ``flatten_selfplay_data``). The observation axis layout is pgx's
     ``[batch, rows, cols, planes]``; ``action_weights`` is ``[batch, cols]``.
-    Reward/discount/terminated/value_target/value_mask/ply_target are scalar per
-    example and column-independent, so they're concatenated unchanged.
+    Reward/discount/terminated/value_target/value_mask are scalar per example
+    and column-independent, so they're concatenated unchanged.
     """
 
     mirrored_observation = data.observation[:, :, ::-1, :]
@@ -290,5 +259,4 @@ def mirror_selfplay_data(data: SelfPlayData) -> SelfPlayData:
         terminated=jnp.concatenate([data.terminated, data.terminated], axis=0),
         value_target=jnp.concatenate([data.value_target, data.value_target], axis=0),
         value_mask=jnp.concatenate([data.value_mask, data.value_mask], axis=0),
-        ply_target=jnp.concatenate([data.ply_target, data.ply_target], axis=0),
     )

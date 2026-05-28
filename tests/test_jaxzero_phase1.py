@@ -21,7 +21,6 @@ from jaxzero.selfplay import (
     make_env,
     make_selfplay,
     mirror_selfplay_data,
-    remaining_plies,
 )
 from jaxzero.train import (
     TrainingConfig,
@@ -374,27 +373,7 @@ def _example_data_for_mirror() -> SelfPlayData:
         terminated=jnp.array([True, True]),
         value_target=jnp.array([1.0, -1.0]),
         value_mask=jnp.ones((2,), dtype=jnp.bool_),
-        ply_target=jnp.array([1.0 / 42.0, 1.0 / 42.0]),
     )
-
-
-def test_remaining_plies_counts_to_episode_end() -> None:
-    """remaining_plies counts backward to each episode boundary (discount==0).
-
-    One batch lane, two episodes: a 3-move episode then a 2-move episode.
-    discount is -1 mid-episode and 0 on the move that ends each episode.
-    Expected remaining plies: [3,2,1, 2,1].
-    """
-    discount = jnp.array([[-1.0], [-1.0], [0.0], [-1.0], [0.0]])  # [time, batch=1]
-    rem = remaining_plies(discount)[:, 0]
-    assert rem.tolist() == [3.0, 2.0, 1.0, 2.0, 1.0]
-
-
-def test_remaining_plies_resets_each_episode() -> None:
-    """A terminal move always has exactly 1 ply remaining regardless of history."""
-    discount = jnp.array([[0.0], [0.0], [0.0]])  # three back-to-back 1-move episodes
-    rem = remaining_plies(discount)[:, 0]
-    assert rem.tolist() == [1.0, 1.0, 1.0]
 
 
 def test_mirror_selfplay_data_doubles_size() -> None:
@@ -516,7 +495,6 @@ def _dummy_selfplay_data(n: int, value: float) -> SelfPlayData:
         terminated=jnp.zeros((n,), dtype=jnp.bool_),
         value_target=jnp.full((n,), value),
         value_mask=jnp.ones((n,), dtype=jnp.bool_),
-        ply_target=jnp.full((n,), value),
     )
 
 

@@ -21,13 +21,6 @@ INPUT_EMBED_LINEAR = "linear"
 INPUT_EMBED_CONV3X3 = "conv3x3"
 _VALID_INPUT_EMBEDS = (INPUT_EMBED_LINEAR, INPUT_EMBED_CONV3X3)
 
-VALUE_HEAD_SCALAR = "scalar"
-VALUE_HEAD_WDLP = "wdlp"
-_VALID_VALUE_HEADS = (VALUE_HEAD_SCALAR, VALUE_HEAD_WDLP)
-# WDL class index convention: loss=0, draw=1, win=2 (i.e. sign(value)+1). The
-# scalar value MCTS/cert consume is recovered as E[outcome] = P(win) - P(loss).
-_WDL_OUTCOMES = (-1.0, 0.0, 1.0)
-
 
 @dataclass(frozen=True)
 class AlphaZeroNetConfig:
@@ -53,11 +46,6 @@ class AlphaZeroNetConfig:
     use_value_cls_token: bool = False
     policy_head_style: str = POLICY_HEAD_FLATTEN
     input_embed_style: str = INPUT_EMBED_LINEAR
-    # Tier 2 (transformer-only): 'scalar' (default, tanh regression head, MSE on
-    # the discounted return) or 'wdlp' (win/draw/loss classification head + an
-    # auxiliary remaining-ply head; the scalar value MCTS sees is recovered as
-    # P(win)-P(loss)). 'wdlp' targets the value-calibration gap to the ResNet.
-    value_head_style: str = VALUE_HEAD_SCALAR
 
     def __post_init__(self) -> None:
         obs_shape = tuple(int(dim) for dim in self.obs_shape)
@@ -119,20 +107,6 @@ class AlphaZeroNetConfig:
                         f"({self.action_size}) == width ({width})"
                     )
                     raise ValueError(msg)
-            if self.value_head_style not in _VALID_VALUE_HEADS:
-                msg = (
-                    f"value_head_style must be one of {_VALID_VALUE_HEADS}, "
-                    f"got {self.value_head_style!r}"
-                )
-                raise ValueError(msg)
-        elif self.value_head_style != VALUE_HEAD_SCALAR:
-            # wdlp is implemented only on the transformer tower; reject it on
-            # resnet rather than silently ignoring the flag.
-            msg = (
-                f"value_head_style={self.value_head_style!r} requires "
-                f"arch='transformer'; resnet supports only 'scalar'"
-            )
-            raise ValueError(msg)
         object.__setattr__(self, "obs_shape", obs_shape)
 
     def to_dict(self) -> dict[str, int | str | bool | list[int]]:
@@ -149,7 +123,6 @@ class AlphaZeroNetConfig:
             "use_value_cls_token": self.use_value_cls_token,
             "policy_head_style": self.policy_head_style,
             "input_embed_style": self.input_embed_style,
-            "value_head_style": self.value_head_style,
         }
 
     @classmethod
@@ -173,7 +146,6 @@ class AlphaZeroNetConfig:
             use_value_cls_token=bool(data.get("use_value_cls_token", False)),
             policy_head_style=str(data.get("policy_head_style", POLICY_HEAD_FLATTEN)),
             input_embed_style=str(data.get("input_embed_style", INPUT_EMBED_LINEAR)),
-            value_head_style=str(data.get("value_head_style", VALUE_HEAD_SCALAR)),
         )
 
 
@@ -386,25 +358,11 @@ class TransformerNet(nnx.Module):
                 height * width * d, config.action_size, rngs=rngs
             )
 
-        # --- Value head: MLP trunk shared by both styles ---
-        # scalar: value_out -> 1 logit -> tanh. wdlp: value_out -> 3 W/D/L
-        # logits (+ ply_out -> 1 remaining-ply scalar). Same attribute name
-        # ``value_out`` either way; its output width differs by config so a
-        # checkpoint only loads back into the matching value_head_style.
+        # --- Value head: always MLP -> tanh; source token differs by knob ---
         self.value_hidden = nnx.Linear(d, d, rngs=rngs)
-        if config.value_head_style == VALUE_HEAD_WDLP:
-            self.value_out = nnx.Linear(d, len(_WDL_OUTCOMES), rngs=rngs)
-            self.ply_out = nnx.Linear(d, 1, rngs=rngs)
-        else:
-            self.value_out = nnx.Linear(d, 1, rngs=rngs)
-            self.ply_out = None
+        self.value_out = nnx.Linear(d, 1, rngs=rngs)
 
-    def _encode(self, obs_batch: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Shared trunk: returns ``(policy_logits, value_src)``.
-
-        ``value_src`` is the (B, d_model) vector the value head reads — the cls
-        token when enabled, else the mean over board tokens.
-        """
+    def __call__(self, obs_batch: jax.Array) -> tuple[jax.Array, jax.Array]:
         x = obs_batch.astype(jnp.float32)
         batch, height, width, _ = x.shape
 
@@ -454,38 +412,11 @@ class TransformerNet(nnx.Module):
         else:
             policy_logits = self.policy_head(board.reshape((batch, -1)))
 
+        # --- Value head: read cls when available, else mean-pool board ---
         value_src = cls_out if cls_out is not None else jnp.mean(board, axis=1)
-        return policy_logits, value_src
-
-    def __call__(self, obs_batch: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Inference contract: ``(policy_logits, scalar_value)``.
-
-        For the wdlp head the scalar value MCTS/cert consume is recovered as
-        ``E[outcome] = P(win) - P(loss)`` from the W/D/L softmax.
-        """
-        policy_logits, value_src = self._encode(obs_batch)
-        hidden = jax.nn.relu(self.value_hidden(value_src))
-        if self.config.value_head_style == VALUE_HEAD_WDLP:
-            wdl_logits = self.value_out(hidden)
-            outcomes = jnp.asarray(_WDL_OUTCOMES, dtype=wdl_logits.dtype)
-            value = jnp.sum(jax.nn.softmax(wdl_logits, axis=-1) * outcomes, axis=-1)
-        else:
-            value = jnp.tanh(self.value_out(hidden)).reshape((-1,))
+        value = jax.nn.relu(self.value_hidden(value_src))
+        value = jnp.tanh(self.value_out(value)).reshape((-1,))
         return policy_logits, value
-
-    def forward_train(
-        self, obs_batch: jax.Array
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Training-only forward for the wdlp head.
-
-        Returns ``(policy_logits, wdl_logits, ply_pred)`` from a single trunk
-        pass. Only valid when ``value_head_style == 'wdlp'``.
-        """
-        policy_logits, value_src = self._encode(obs_batch)
-        hidden = jax.nn.relu(self.value_hidden(value_src))
-        wdl_logits = self.value_out(hidden)
-        ply_pred = self.ply_out(hidden).reshape((-1,))
-        return policy_logits, wdl_logits, ply_pred
 
 
 # Either tower satisfies the same forward contract; train.py uses this alias
@@ -507,28 +438,7 @@ def apply_model(
     params: nnx.State,
     obs_batch: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """Pure forward helper used inside JAX transforms.
-
-    Returns the inference contract ``(policy_logits, scalar_value)`` for either
-    arch and any value-head style (wdlp recovers the scalar from its W/D/L
-    softmax), so MCTS self-play, the evaluator, and the cert are style-agnostic.
-    """
+    """Pure forward helper used inside JAX transforms."""
 
     model = nnx.merge(graphdef, params)
     return model(obs_batch)
-
-
-def apply_model_train(
-    graphdef: nnx.GraphDef[Net],
-    params: nnx.State,
-    obs_batch: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Training forward for the wdlp value head.
-
-    Returns ``(policy_logits, wdl_logits, ply_pred)`` from one trunk pass. Only
-    valid for a ``TransformerNet`` with ``value_head_style='wdlp'`` (the loss
-    only calls this on that path).
-    """
-
-    model = nnx.merge(graphdef, params)
-    return model.forward_train(obs_batch)

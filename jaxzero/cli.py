@@ -160,22 +160,6 @@ def build_parser() -> argparse.ArgumentParser:
         "AlphaViT style). Conv gives each cell a local receptive field before "
         "self-attention sees the tokens.",
     )
-    parser.add_argument(
-        "--value-head-style",
-        choices=("scalar", "wdlp"),
-        default="scalar",
-        help="Transformer Tier 2: 'scalar' (v1: tanh value, MSE on the "
-        "discounted return) or 'wdlp' (win/draw/loss classification head + "
-        "auxiliary remaining-ply head; the scalar value MCTS sees is "
-        "P(win)-P(loss)). 'wdlp' targets value calibration. Transformer only.",
-    )
-    parser.add_argument(
-        "--ply-loss-weight",
-        type=float,
-        default=0.1,
-        help="Weight on the auxiliary remaining-ply MSE in the wdlp value loss. "
-        "Ignored unless --value-head-style wdlp.",
-    )
     return parser
 
 
@@ -211,8 +195,6 @@ def main(argv: list[str] | None = None) -> None:
         use_value_cls_token=args.use_value_cls_token,
         policy_head_style=args.policy_head_style,
         input_embed_style=args.input_embed_style,
-        value_head_style=args.value_head_style,
-        ply_loss_weight=args.ply_loss_weight,
     )
     extra_evaluator = None
     if args.solver_eval_positions > 0:
