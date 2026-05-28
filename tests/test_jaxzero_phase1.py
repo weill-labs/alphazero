@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -135,6 +136,21 @@ def test_same_seed_reproduces_params() -> None:
         _tree_leaves(first.params), _tree_leaves(second.params), strict=True
     ):
         assert jnp.array_equal(actual, expected)
+
+
+def test_init_checkpoint_warm_starts_from_saved_net(tmp_path) -> None:
+    checkpoint = tmp_path / "warm.msgpack"
+    # Save a net trained with the tiny config (channels=4).
+    run_training(_tiny_training_config(seed=1, checkpoint_path=str(checkpoint)))
+
+    # Warm-start with a config that would otherwise build a channels=8 net; the
+    # net must come from the checkpoint (channels=4), proving init_checkpoint wins.
+    warm = replace(
+        _tiny_training_config(seed=2), channels=8, init_checkpoint=str(checkpoint)
+    )
+    result = run_training(warm)
+
+    assert result.net_config.channels == 4
 
 
 def test_jaxzero_imports_do_not_load_torch() -> None:

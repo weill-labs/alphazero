@@ -154,6 +154,7 @@ else:
         num_res_blocks: int = 5,
         learning_rate: float = 1e-3,
         minibatch_size: int = 1024,
+        init_checkpoint: str | None = None,
         seed: int = 0,
         requested_gpu: str = _DEFAULT_GPU,
     ) -> dict[str, object]:
@@ -170,6 +171,7 @@ else:
             "num_res_blocks": num_res_blocks,
             "learning_rate": learning_rate,
             "minibatch_size": minibatch_size,
+            "init_checkpoint": init_checkpoint,
             "seed": seed,
             "requested_gpu": requested_gpu,
         }
@@ -200,6 +202,7 @@ else:
                     num_res_blocks=num_res_blocks,
                     learning_rate=learning_rate,
                     minibatch_size=minibatch_size,
+                    init_checkpoint=init_checkpoint,
                     seed=seed,
                     checkpoint_path=checkpoint_path,
                 ),
@@ -238,6 +241,7 @@ else:
         num_res_blocks: int = 5,
         learning_rate: float = 1e-3,
         minibatch_size: int = 1024,
+        init_checkpoint: str | None = None,
         seed: int = 0,
         gpu: str = _DEFAULT_GPU,
     ) -> None:
@@ -254,6 +258,7 @@ else:
             num_res_blocks=num_res_blocks,
             learning_rate=learning_rate,
             minibatch_size=minibatch_size,
+            init_checkpoint=init_checkpoint,
             seed=seed,
             requested_gpu=gpu,
         )

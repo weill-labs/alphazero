@@ -37,6 +37,7 @@ class TrainingConfig:
     minibatch_size: int = 1024
     seed: int = 0
     checkpoint_path: str | None = None
+    init_checkpoint: str | None = None
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -189,8 +190,15 @@ def run_training(
     per-iteration host metrics as they are produced, for live logging.
     """
 
-    net_config = build_net_config(config)
-    model = create_model(net_config, seed=config.seed)
+    if config.init_checkpoint is not None:
+        # Warm start: continue from a trained net (its stored config wins over
+        # config.channels/num_res_blocks) so e.g. a low-sims-bootstrapped net can
+        # be refined at high sims without the cold-start uniform-target problem.
+        model = load_checkpoint(config.init_checkpoint)
+        net_config = model.config
+    else:
+        net_config = build_net_config(config)
+        model = create_model(net_config, seed=config.seed)
     graphdef, params = nnx.split(model, nnx.Param)
 
     selfplay = make_selfplay(
