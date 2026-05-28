@@ -260,6 +260,7 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
         channels=7,
         num_res_blocks=1,
         learning_rate=0.02,
+        solver_eval_positions=0,  # disable inline solver cert for this test
         seed=9,
         requested_gpu="A100-40GB",
     )
