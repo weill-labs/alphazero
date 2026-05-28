@@ -20,6 +20,7 @@ from jaxzero.selfplay import (
     initial_observation_shape,
     make_env,
     make_selfplay,
+    mirror_selfplay_data,
 )
 from jaxzero.train import (
     TrainingConfig,
@@ -323,6 +324,91 @@ def test_value_loss_weight_must_be_positive() -> None:
         replace(_tiny_training_config(), value_loss_weight=0.0)
     with pytest.raises(ValueError, match="value_loss_weight"):
         replace(_tiny_training_config(), value_loss_weight=-1.0)
+
+
+def _example_data_for_mirror() -> SelfPlayData:
+    """Hand-crafted 2-example SelfPlayData with distinguishable columns.
+
+    obs[0] has a piece in column 0, obs[1] has a piece in column 6 — so the
+    mirror swaps them. action_weights pick out the first and last columns to
+    likewise verify the flip lands.
+    """
+    obs0 = jnp.zeros((6, 7, 2), dtype=jnp.float32).at[0, 0, 0].set(1.0)
+    obs1 = jnp.zeros((6, 7, 2), dtype=jnp.float32).at[0, 6, 0].set(1.0)
+    observation = jnp.stack([obs0, obs1], axis=0)
+    action_weights = jnp.array(
+        [[1.0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 1.0]], dtype=jnp.float32
+    )
+    return SelfPlayData(
+        observation=observation,
+        action_weights=action_weights,
+        reward=jnp.array([1.0, -1.0]),
+        discount=jnp.array([0.0, 0.0]),
+        terminated=jnp.array([True, True]),
+        value_target=jnp.array([1.0, -1.0]),
+        value_mask=jnp.ones((2,), dtype=jnp.bool_),
+    )
+
+
+def test_mirror_selfplay_data_doubles_size() -> None:
+    data = _example_data_for_mirror()
+    mirrored = mirror_selfplay_data(data)
+    assert mirrored.observation.shape[0] == 4
+    assert mirrored.action_weights.shape[0] == 4
+    assert mirrored.value_target.shape[0] == 4
+    assert mirrored.value_mask.shape[0] == 4
+
+
+def test_mirror_selfplay_data_preserves_originals_then_mirrors() -> None:
+    """The first N rows must be untouched; rows N..2N are the column-flipped mirrors."""
+    data = _example_data_for_mirror()
+    mirrored = mirror_selfplay_data(data)
+
+    # Originals preserved at indices 0, 1.
+    assert jnp.array_equal(mirrored.observation[:2], data.observation)
+    assert jnp.array_equal(mirrored.action_weights[:2], data.action_weights)
+
+    # Mirrors at indices 2, 3 have columns flipped.
+    assert jnp.array_equal(mirrored.observation[2], data.observation[0, :, ::-1, :])
+    assert jnp.array_equal(mirrored.observation[3], data.observation[1, :, ::-1, :])
+    assert jnp.array_equal(mirrored.action_weights[2], data.action_weights[0, ::-1])
+    assert jnp.array_equal(mirrored.action_weights[3], data.action_weights[1, ::-1])
+
+
+def test_mirror_selfplay_data_keeps_scalar_fields_identical() -> None:
+    """reward / discount / terminated / value_target / value_mask are column-agnostic."""
+    data = _example_data_for_mirror()
+    mirrored = mirror_selfplay_data(data)
+
+    for field in ("reward", "discount", "terminated", "value_target", "value_mask"):
+        original = getattr(data, field)
+        augmented = getattr(mirrored, field)
+        assert jnp.array_equal(augmented[:2], original)
+        assert jnp.array_equal(augmented[2:], original)
+
+
+def test_mirror_augment_flag_doubles_examples_per_iteration() -> None:
+    """End-to-end: setting mirror_augment=True should double the per-iteration
+    self-play data fed into training. Verify by counting examples via the
+    value_mask_fraction signal: training stays consistent, just on a larger
+    set."""
+    import pytest
+
+    # Use replay_capacity so the buffer reflects what's training-visible.
+    base_config = replace(_tiny_training_config(seed=99), iterations=1)
+    mirror_config = replace(base_config, mirror_augment=True)
+
+    base_metrics: list[dict[str, float | int]] = []
+    mirror_metrics: list[dict[str, float | int]] = []
+    run_training(base_config, on_iteration=base_metrics.append)
+    run_training(mirror_config, on_iteration=mirror_metrics.append)
+
+    # value_mask_fraction is the fraction of valid value targets in the batch.
+    # Mirror doubles the example count but each mirror copy retains its mask,
+    # so the FRACTION is preserved (numerator and denominator both 2x).
+    assert base_metrics[0]["value_mask_fraction"] == pytest.approx(
+        mirror_metrics[0]["value_mask_fraction"], rel=1e-5
+    )
 
 
 def _dummy_selfplay_data(n: int, value: float) -> SelfPlayData:

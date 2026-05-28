@@ -22,6 +22,7 @@ from jaxzero.selfplay import (
     initial_observation_shape,
     make_env,
     make_selfplay,
+    mirror_selfplay_data,
 )
 
 CHECKPOINT_VERSION = 1
@@ -48,6 +49,7 @@ class TrainingConfig:
     gating_games: int = 20
     gating_threshold: float = 0.55
     value_loss_weight: float = 1.0
+    mirror_augment: bool = False
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -322,6 +324,8 @@ def run_training(
         key, selfplay_key, shuffle_key = jax.random.split(key, 3)
         selfplay_params = best_params if gating_enabled else params
         new_data = flatten_selfplay_data(selfplay(selfplay_params, selfplay_key))
+        if config.mirror_augment:
+            new_data = mirror_selfplay_data(new_data)
         buffer = _append_to_buffer(buffer, new_data, config.replay_capacity)
         params, opt_state, metrics = _train_epoch(
             update_step, params, opt_state, buffer, config.minibatch_size, shuffle_key

@@ -77,6 +77,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(closed alphago-1kc trail: value head is the C4 bottleneck).",
     )
     parser.add_argument(
+        "--mirror-augment",
+        action="store_true",
+        help="Augment each self-play example with its horizontal mirror "
+        "(C4 has column symmetry). Doubles training-set size with zero "
+        "extra self-play cost; directly boosts value-signal density.",
+    )
+    parser.add_argument(
         "--solver-eval-positions",
         type=int,
         default=64,
@@ -112,6 +119,7 @@ def main(argv: list[str] | None = None) -> None:
         gating_games=args.gating_games,
         gating_threshold=args.gating_threshold,
         value_loss_weight=args.value_loss_weight,
+        mirror_augment=args.mirror_augment,
     )
     extra_evaluator = None
     if args.solver_eval_positions > 0:
