@@ -84,6 +84,15 @@ def build_parser() -> argparse.ArgumentParser:
         "extra self-play cost; directly boosts value-signal density.",
     )
     parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="When > 0, switch from Adam to AdamW (decoupled L2 reg) with "
+        "this weight_decay coefficient. Default 0 keeps Adam (no decay). "
+        "Useful if training overshoots and a regularization pull-back "
+        "helps the value head plateau.",
+    )
+    parser.add_argument(
         "--solver-eval-positions",
         type=int,
         default=64,
@@ -120,6 +129,7 @@ def main(argv: list[str] | None = None) -> None:
         gating_threshold=args.gating_threshold,
         value_loss_weight=args.value_loss_weight,
         mirror_augment=args.mirror_augment,
+        weight_decay=args.weight_decay,
     )
     extra_evaluator = None
     if args.solver_eval_positions > 0:

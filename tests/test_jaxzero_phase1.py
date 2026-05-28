@@ -282,6 +282,32 @@ def test_gating_config_rejects_threshold_out_of_range() -> None:
         )
 
 
+def test_weight_decay_default_is_zero() -> None:
+    """Default weight_decay = 0 keeps the existing optax.adam optimizer
+    (no decay). Setting weight_decay > 0 should switch to optax.adamw
+    (decoupled L2)."""
+    assert _tiny_training_config().weight_decay == 0.0
+
+
+def test_weight_decay_nonzero_runs_without_error(tmp_path) -> None:
+    """End-to-end: a tiny training run with weight_decay=0.01 finishes
+    successfully (uses AdamW under the hood)."""
+    config = replace(
+        _tiny_training_config(checkpoint_path=str(tmp_path / "wd.msgpack")),
+        weight_decay=0.01,
+    )
+    result = run_training(config)
+    assert result.checkpoint_path is not None
+    assert jnp.isfinite(result.metrics[0]["loss"])
+
+
+def test_weight_decay_must_be_nonneg() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="weight_decay"):
+        replace(_tiny_training_config(), weight_decay=-0.1)
+
+
 def test_value_loss_weight_default_is_one() -> None:
     assert _tiny_training_config().value_loss_weight == 1.0
 

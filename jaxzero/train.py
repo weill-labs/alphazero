@@ -50,6 +50,7 @@ class TrainingConfig:
     gating_threshold: float = 0.55
     value_loss_weight: float = 1.0
     mirror_augment: bool = False
+    weight_decay: float = 0.0
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -88,6 +89,9 @@ class TrainingConfig:
                 raise ValueError(msg)
         if self.value_loss_weight <= 0:
             msg = "value_loss_weight must be positive"
+            raise ValueError(msg)
+        if self.weight_decay < 0:
+            msg = "weight_decay must be non-negative"
             raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
@@ -286,7 +290,15 @@ def run_training(
         ),
         graphdef,
     )
-    tx = optax.adam(config.learning_rate)
+    # AdamW when weight_decay > 0 (decoupled L2 reg); standard Adam otherwise.
+    # The closed alphago-{ul3, 1q2, 1kc} trail never tried regularization;
+    # if the plateau is overfitting (mid-training peak then regression), AdamW
+    # at small weight_decay can pull params back toward a simpler hypothesis.
+    tx = (
+        optax.adamw(config.learning_rate, weight_decay=config.weight_decay)
+        if config.weight_decay > 0
+        else optax.adam(config.learning_rate)
+    )
     opt_state = tx.init(params)
     update_step = make_update_step(
         graphdef, tx, value_loss_weight=config.value_loss_weight
