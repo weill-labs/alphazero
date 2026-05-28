@@ -69,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
         "promoted to best.",
     )
     parser.add_argument(
+        "--value-loss-weight",
+        type=float,
+        default=1.0,
+        help="Scalar multiplier on the value-loss term in the combined loss. "
+        "Default 1.0 (no change). Set >1 to attack the value-MAE plateau "
+        "(closed alphago-1kc trail: value head is the C4 bottleneck).",
+    )
+    parser.add_argument(
         "--solver-eval-positions",
         type=int,
         default=64,
@@ -103,6 +111,7 @@ def main(argv: list[str] | None = None) -> None:
         gating_interval=args.gating_interval,
         gating_games=args.gating_games,
         gating_threshold=args.gating_threshold,
+        value_loss_weight=args.value_loss_weight,
     )
     extra_evaluator = None
     if args.solver_eval_positions > 0:

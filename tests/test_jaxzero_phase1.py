@@ -281,6 +281,50 @@ def test_gating_config_rejects_threshold_out_of_range() -> None:
         )
 
 
+def test_value_loss_weight_default_is_one() -> None:
+    assert _tiny_training_config().value_loss_weight == 1.0
+
+
+def test_value_loss_weight_changes_combined_loss_but_not_value_loss_metric() -> None:
+    """Increasing value_loss_weight scales the gradient-relevant `loss` but
+    leaves the reported `value_loss` (unweighted) untouched — so wandb curves
+    stay comparable across runs with different weights."""
+    import pytest
+
+    base_config = _tiny_training_config(seed=42)
+    weighted_config = replace(base_config, value_loss_weight=4.0)
+
+    base_logged: list[dict[str, float | int]] = []
+    weighted_logged: list[dict[str, float | int]] = []
+    run_training(base_config, on_iteration=base_logged.append)
+    run_training(weighted_config, on_iteration=weighted_logged.append)
+
+    # Unweighted per-head losses are deterministic given seed+config, and the
+    # value_loss_weight should not change which weights produce the first
+    # gradient step (it scales the gradient, which then changes future
+    # iterations — but on iter 0, value_loss is computed before any update).
+    assert base_logged[0]["value_loss"] == pytest.approx(
+        weighted_logged[0]["value_loss"], rel=1e-5
+    )
+    assert base_logged[0]["policy_loss"] == pytest.approx(
+        weighted_logged[0]["policy_loss"], rel=1e-5
+    )
+    # `loss` differs by exactly (weight-1) * value_loss at iter 0.
+    base_loss = base_logged[0]["loss"]
+    weighted_loss = weighted_logged[0]["loss"]
+    expected_delta = 3.0 * base_logged[0]["value_loss"]  # (4 - 1) * value_loss
+    assert weighted_loss == pytest.approx(base_loss + expected_delta, rel=1e-5)
+
+
+def test_value_loss_weight_must_be_positive() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="value_loss_weight"):
+        replace(_tiny_training_config(), value_loss_weight=0.0)
+    with pytest.raises(ValueError, match="value_loss_weight"):
+        replace(_tiny_training_config(), value_loss_weight=-1.0)
+
+
 def _dummy_selfplay_data(n: int, value: float) -> SelfPlayData:
     return SelfPlayData(
         observation=jnp.full((n, 1), value),

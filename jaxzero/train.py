@@ -47,6 +47,7 @@ class TrainingConfig:
     gating_interval: int | None = None
     gating_games: int = 20
     gating_threshold: float = 0.55
+    value_loss_weight: float = 1.0
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -83,6 +84,9 @@ class TrainingConfig:
             if not 0.0 <= self.gating_threshold <= 1.0:
                 msg = "gating_threshold must be in [0, 1]"
                 raise ValueError(msg)
+        if self.value_loss_weight <= 0:
+            msg = "value_loss_weight must be positive"
+            raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
             num_simulations=self.num_simulations,
@@ -119,6 +123,8 @@ def _loss(
     graphdef: nnx.GraphDef[AlphaZeroNet],
     params: nnx.State,
     batch: SelfPlayData,
+    *,
+    value_loss_weight: float,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     policy_logits, value = apply_model(graphdef, params, batch.observation)
     policy_loss_per_example = optax.softmax_cross_entropy(
@@ -133,7 +139,10 @@ def _loss(
         jnp.sum(jnp.square(value - batch.value_target) * value_mask) / value_denom
     )
 
-    loss = policy_loss + value_loss
+    # `loss` (the gradient signal) is weighted; `policy_loss` and `value_loss`
+    # are reported unweighted so wandb curves remain comparable across runs
+    # with different weights.
+    loss = policy_loss + value_loss_weight * value_loss
     metrics = {
         "loss": loss,
         "policy_loss": policy_loss,
@@ -146,9 +155,11 @@ def _loss(
 def make_update_step(
     graphdef: nnx.GraphDef[AlphaZeroNet],
     tx: optax.GradientTransformation,
+    *,
+    value_loss_weight: float = 1.0,
 ):
     def loss_fn(params: nnx.State, batch: SelfPlayData):
-        return _loss(graphdef, params, batch)
+        return _loss(graphdef, params, batch, value_loss_weight=value_loss_weight)
 
     @jax.jit
     def update_step(
@@ -275,7 +286,9 @@ def run_training(
     )
     tx = optax.adam(config.learning_rate)
     opt_state = tx.init(params)
-    update_step = make_update_step(graphdef, tx)
+    update_step = make_update_step(
+        graphdef, tx, value_loss_weight=config.value_loss_weight
+    )
     evaluator = (
         make_evaluator(
             graphdef, num_games=config.eval_games, max_steps=config.max_steps
