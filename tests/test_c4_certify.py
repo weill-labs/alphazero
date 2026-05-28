@@ -152,12 +152,12 @@ def test_jax_mcts_agent_loads_checkpoint_and_selects_legal_move(tmp_path) -> Non
     assert np.isfinite(value)
 
 
-def test_make_solver_evaluator_returns_blunder_policy_and_value_mae_keys(
+def test_make_solver_evaluator_returns_blunder_policy_value_and_regret_keys(
     tmp_path,
 ) -> None:
-    """The inline solver-anchored evaluator must surface all three signals
-    so wandb captures the headline (blunder rate) AND the diagnosed
-    bottleneck (value MAE) AND the policy-match metric per iteration."""
+    """The inline solver-anchored evaluator must surface the headline blunder
+    rate, the value-MAE bottleneck, policy match, AND the regret signals
+    (WDL + Pons-score) used for low-variance run-vs-run comparison."""
     from alphazero.c4_certify import make_solver_evaluator
     from jaxzero.train import load_checkpoint, save_checkpoint
 
@@ -175,10 +175,71 @@ def test_make_solver_evaluator_returns_blunder_policy_and_value_mae_keys(
         "eval/c4_blunder_rate",
         "eval/c4_policy_match",
         "eval/c4_value_mae",
+        "eval/c4_wdl_regret",
+        "eval/c4_score_regret",
+        "eval/c4_wdl_blunder_rate",
     }
     assert 0.0 <= metrics["eval/c4_blunder_rate"] <= 1.0
     assert 0.0 <= metrics["eval/c4_policy_match"] <= 1.0
     assert metrics["eval/c4_value_mae"] >= 0.0  # MAE is non-negative
+    # WDL regret is a mean over {0,1,2}; score regret and wdl-blunder-rate >= 0.
+    assert 0.0 <= metrics["eval/c4_wdl_regret"] <= 2.0
+    assert metrics["eval/c4_score_regret"] >= 0.0
+    assert 0.0 <= metrics["eval/c4_wdl_blunder_rate"] <= 1.0
+
+
+def test_perfect_agent_has_zero_regret() -> None:
+    """A solver-oracle agent must have zero regret of both kinds, and the
+    WDL-blunder rate must agree with the (score-based) blunder rate at zero."""
+    _, state = _play(_FORCED_BLOCK_DRAW)
+    report = certify_connect_four(SolverOracleAgent(), positions=[state])
+
+    assert report.mean_wdl_regret == 0.0
+    assert report.mean_score_regret == 0.0
+    assert report.wdl_blunders == 0
+    assert np.isclose(report.wdl_blunder_rate, 0.0)
+
+
+def test_regret_is_nonnegative_and_wdl_blunders_subset_of_blunders() -> None:
+    """WDL blunders are a subset of score blunders: changing the game-theoretic
+    outcome always trips the score-based blunder too, but not vice versa
+    (a same-tier slow win is a score blunder with wdl_regret == 0)."""
+    _, state = _play(_FORCED_BLOCK_DRAW)
+    report = certify_connect_four(FixedActionAgent(0), positions=[state])
+
+    for record in report.records:
+        assert record.score_regret >= 0
+        assert 0 <= record.wdl_regret <= 2
+    assert report.wdl_blunders <= report.blunders
+
+
+def test_eval_set_roundtrip_and_paired_certification(tmp_path) -> None:
+    """A saved eval set reloads to identical positions and yields an identical
+    report to certifying on the in-memory positions (paired comparison basis)."""
+    from alphazero.c4_certify import load_eval_set, save_eval_set
+
+    positions = sample_positions(sample_size=6, seed=7)
+    path = tmp_path / "eval_set.json"
+    save_eval_set(positions, path)
+    reloaded = load_eval_set(path)
+
+    assert reloaded == positions
+
+    agent = SolverOracleAgent()
+    from_disk = certify_connect_four(agent, positions=reloaded)
+    in_memory = certify_connect_four(agent, positions=positions)
+    assert from_disk.as_dict() == in_memory.as_dict()
+
+
+def test_build_eval_set_cli_creates_loadable_file(tmp_path) -> None:
+    """The --build-eval-set CLI path writes a file that load_eval_set accepts."""
+    from alphazero.c4_certify import load_eval_set, main
+
+    path = tmp_path / "set.json"
+    rc = main(["--build-eval-set", str(path), "--sample-size", "5", "--seed", "1"])
+    assert rc == 0
+    assert path.exists()
+    assert len(load_eval_set(path)) == 5
 
 
 def test_c4_certify_imports_do_not_load_torch() -> None:

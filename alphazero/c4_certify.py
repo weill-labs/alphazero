@@ -133,6 +133,15 @@ class PositionCertification:
     agent_outcome: int
     policy_match: bool
     blunder: bool
+    # Per-move regret against the exact solver, both >= 0 (optimal is the best
+    # achievable). ``score_regret`` is in raw Pons-score units (penalizes
+    # winning slower / losing faster, even within the same W/D/L tier).
+    # ``wdl_regret`` collapses to outcome tiers in {0, 1, 2}: 0 preserves the
+    # game-theoretic result, 1 downgrades one tier (win->draw or draw->loss),
+    # 2 is catastrophic (win->loss). WDL is the headline (severity that matters
+    # for "solving"); score is the finer secondary signal.
+    score_regret: int
+    wdl_regret: int
 
 
 @dataclass(frozen=True)
@@ -146,6 +155,15 @@ class CertificationReport:
     blunder_rate: float
     value_mae: float
     solved: bool
+    # Regret aggregates (the preferred run-vs-run comparison metrics: continuous
+    # and severity-aware, so far lower variance than the binary blunder rate).
+    # ``wdl_blunder_rate`` is the fraction of positions whose game-theoretic
+    # outcome was downgraded — strictly <= ``blunder_rate``, since the latter
+    # also flags same-tier slow wins / fast losses.
+    mean_wdl_regret: float
+    mean_score_regret: float
+    wdl_blunders: int
+    wdl_blunder_rate: float
     records: tuple[PositionCertification, ...]
 
     def as_dict(self) -> dict[str, bool | float | int]:
@@ -159,6 +177,10 @@ class CertificationReport:
             "blunder_rate": self.blunder_rate,
             "value_mae": self.value_mae,
             "solved": self.solved,
+            "mean_wdl_regret": self.mean_wdl_regret,
+            "mean_score_regret": self.mean_score_regret,
+            "wdl_blunders": self.wdl_blunders,
+            "wdl_blunder_rate": self.wdl_blunder_rate,
         }
 
 
@@ -222,6 +244,11 @@ def certify_connect_four(
         agent_value = agent.value(state)
         agent_outcome = -child_value
         policy_match = agent_move in optimal_moves
+        # Optimal is by definition the best achievable, so both regrets are >= 0.
+        score_regret = solver_value - agent_outcome
+        # sign() maps each value to its W/D/L tier in {-1, 0, +1}; since
+        # agent_outcome <= solver_value, the tier difference is in {0, 1, 2}.
+        wdl_regret = int(np.sign(solver_value)) - int(np.sign(agent_outcome))
         records.append(
             PositionCertification(
                 solver_value=solver_value,
@@ -231,6 +258,8 @@ def certify_connect_four(
                 agent_outcome=agent_outcome,
                 policy_match=policy_match,
                 blunder=agent_outcome < solver_value,
+                score_regret=score_regret,
+                wdl_regret=wdl_regret,
             )
         )
 
@@ -272,6 +301,10 @@ def make_solver_evaluator(
             "eval/c4_blunder_rate": float(report.blunder_rate),
             "eval/c4_policy_match": float(report.policy_match_percent) / 100.0,
             "eval/c4_value_mae": float(report.value_mae),
+            # Lower-variance, severity-aware signals for run-vs-run comparison.
+            "eval/c4_wdl_regret": float(report.mean_wdl_regret),
+            "eval/c4_score_regret": float(report.mean_score_regret),
+            "eval/c4_wdl_blunder_rate": float(report.wdl_blunder_rate),
         }
 
     return run
@@ -508,6 +541,7 @@ def _report(
     evaluated_positions = len(records)
     policy_matches = sum(1 for record in records if record.policy_match)
     blunders = sum(1 for record in records if record.blunder)
+    wdl_blunders = sum(1 for record in records if record.wdl_regret > 0)
     value_errors = [
         abs(float(record.agent_value) - float(record.solver_value))
         for record in records
@@ -517,6 +551,15 @@ def _report(
         100.0 * policy_matches / evaluated_positions if evaluated_positions else 0.0
     )
     blunder_rate = blunders / evaluated_positions if evaluated_positions else 0.0
+    mean_wdl_regret = (
+        float(np.mean([record.wdl_regret for record in records])) if records else 0.0
+    )
+    mean_score_regret = (
+        float(np.mean([record.score_regret for record in records])) if records else 0.0
+    )
+    wdl_blunder_rate = (
+        wdl_blunders / evaluated_positions if evaluated_positions else 0.0
+    )
     return CertificationReport(
         sampled_positions=sampled_positions,
         evaluated_positions=evaluated_positions,
@@ -527,6 +570,10 @@ def _report(
         blunder_rate=blunder_rate,
         value_mae=value_mae,
         solved=evaluated_positions > 0 and blunder_rate == 0.0,
+        mean_wdl_regret=mean_wdl_regret,
+        mean_score_regret=mean_score_regret,
+        wdl_blunders=wdl_blunders,
+        wdl_blunder_rate=wdl_blunder_rate,
         records=tuple(records),
     )
 
@@ -591,11 +638,42 @@ def _validate_positive(name: str, value: int) -> None:
         raise ValueError(f"{name} must be positive")
 
 
+def save_eval_set(positions: Sequence[ConnectFourState], path: str | Path) -> None:
+    """Serialize a fixed position set to JSON for paired run-vs-run comparison.
+
+    Using one frozen set across every run makes comparisons paired (the position
+    draw is no longer a between-run variable), which is far more statistically
+    powerful than each run sampling its own positions.
+    """
+    payload = {
+        "version": 1,
+        "positions": [
+            {"board": [list(row) for row in state.board], "player": int(state.player)}
+            for state in positions
+        ],
+    }
+    Path(path).write_text(json.dumps(payload))
+
+
+def load_eval_set(path: str | Path) -> list[ConnectFourState]:
+    """Load a fixed position set saved by :func:`save_eval_set`."""
+    payload = json.loads(Path(path).read_text())
+    if int(payload.get("version", 0)) != 1:
+        raise ValueError(f"unsupported eval-set version {payload.get('version')!r}")
+    return [
+        ConnectFourState(
+            board=tuple(tuple(int(cell) for cell in row) for row in entry["board"]),
+            player=int(entry["player"]),
+        )
+        for entry in payload["positions"]
+    ]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Certify a Connect Four checkpoint against exact solver labels."
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
     parser.add_argument("--sims", type=int, default=DEFAULT_SIMS)
     parser.add_argument("--seed", type=int, default=0)
@@ -603,8 +681,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--solver-max-nodes", type=int, default=DEFAULT_SOLVER_MAX_NODES
     )
     parser.add_argument("--opening-depth", type=int, default=DEFAULT_OPENING_DEPTH)
+    parser.add_argument(
+        "--eval-set",
+        type=Path,
+        help="Cert on a fixed position set saved by --build-eval-set instead of "
+        "sampling. Makes run-vs-run comparison paired (same positions every run).",
+    )
+    parser.add_argument(
+        "--build-eval-set",
+        type=Path,
+        help="Build a fixed position set from --sample-size/--seed, save to this "
+        "path, and exit (no checkpoint needed).",
+    )
     args = parser.parse_args(argv)
 
+    if args.build_eval_set is not None:
+        positions = sample_positions(
+            sample_size=args.sample_size,
+            seed=args.seed,
+            opening_depth=args.opening_depth,
+        )
+        save_eval_set(positions, args.build_eval_set)
+        print(
+            json.dumps(
+                {
+                    "built_eval_set": str(args.build_eval_set),
+                    "positions": len(positions),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.checkpoint is None:
+        parser.error("--checkpoint is required unless --build-eval-set is given")
+
+    positions = load_eval_set(args.eval_set) if args.eval_set is not None else None
     agent = JaxMCTSAgent.from_checkpoint(
         args.checkpoint,
         sims=args.sims,
@@ -616,6 +728,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         solver_max_nodes=args.solver_max_nodes,
         opening_depth=args.opening_depth,
+        positions=positions,
     )
     print(json.dumps(report.as_dict(), sort_keys=True))
     return 0
