@@ -46,6 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="reuse the most recent N self-play examples across iterations "
         "(default: buffer-free, train only on the current iteration's data)",
     )
+    parser.add_argument(
+        "--solver-eval-positions",
+        type=int,
+        default=0,
+        help=">0: every --eval-interval iterations, certify the net against the "
+        "solver on this many positions and log eval/c4_blunder_rate (solver-anchored)",
+    )
+    parser.add_argument("--eval-sims", type=int, default=64)
     return parser
 
 
@@ -68,7 +76,16 @@ def main(argv: list[str] | None = None) -> None:
         eval_games=args.eval_games,
         replay_capacity=args.replay_capacity,
     )
-    result = run_training(config)
+    extra_evaluator = None
+    if args.solver_eval_positions > 0:
+        from alphazero.c4_certify import make_solver_evaluator
+
+        extra_evaluator = make_solver_evaluator(
+            sample_size=args.solver_eval_positions,
+            sims=args.eval_sims,
+            seed=args.seed,
+        )
+    result = run_training(config, extra_evaluator=extra_evaluator)
     for metrics in result.metrics:
         print(json.dumps(metrics, sort_keys=True))
     if result.checkpoint_path is not None:

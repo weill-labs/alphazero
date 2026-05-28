@@ -120,7 +120,7 @@ def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
         "optax>=0.2.8",
         "wandb>=0.27.0",
     )
-    assert module.image.modules == ("jaxzero",)
+    assert module.image.modules == ("jaxzero", "alphazero")
     assert module.app.functions
     options = module.app.functions[0].options
     assert options["image"] is module.image
@@ -229,8 +229,11 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
 
     captured: dict[str, object] = {}
 
-    def fake_run_training(config, *, on_iteration=None, on_checkpoint=None):
+    def fake_run_training(
+        config, *, on_iteration=None, on_checkpoint=None, extra_evaluator=None
+    ):
         captured["config"] = config
+        captured["extra_evaluator"] = extra_evaluator
         metrics = [
             {"iteration": 0, "loss": 1.25},
             {"iteration": 1, "loss": 0.5},
@@ -278,3 +281,4 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert fake_run.logs[2][1] == 2
     assert fake_run.finished
     assert module.checkpoint_volume.committed
+    assert captured["extra_evaluator"] is None  # default off when positions == 0

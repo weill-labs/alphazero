@@ -134,7 +134,7 @@ else:
             "optax>=0.2.8",
             "wandb>=0.27.0",
         )
-        .add_local_python_source("jaxzero")
+        .add_local_python_source("jaxzero", "alphazero")
     )
 
     @app.function(
@@ -159,6 +159,8 @@ else:
         eval_interval: int | None = None,
         eval_games: int = 64,
         replay_capacity: int | None = None,
+        solver_eval_positions: int = 0,
+        eval_sims: int = 64,
         seed: int = 0,
         requested_gpu: str = _DEFAULT_GPU,
     ) -> dict[str, object]:
@@ -180,6 +182,8 @@ else:
             "eval_interval": eval_interval,
             "eval_games": eval_games,
             "replay_capacity": replay_capacity,
+            "solver_eval_positions": solver_eval_positions,
+            "eval_sims": eval_sims,
             "seed": seed,
             "requested_gpu": requested_gpu,
         }
@@ -205,6 +209,14 @@ else:
                 # and downloadable mid-run (certifiable before the run finishes).
                 checkpoint_volume.commit()
 
+            extra_evaluator = None
+            if solver_eval_positions > 0:
+                from alphazero.c4_certify import make_solver_evaluator
+
+                extra_evaluator = make_solver_evaluator(
+                    sample_size=solver_eval_positions, sims=eval_sims, seed=seed
+                )
+
             result = run_training(
                 TrainingConfig(
                     iterations=iterations,
@@ -225,6 +237,7 @@ else:
                 ),
                 on_iteration=_log_iteration,
                 on_checkpoint=_commit_on_checkpoint,
+                extra_evaluator=extra_evaluator,
             )
             training_seconds = max(time.perf_counter() - training_started, 1e-12)
 
@@ -264,6 +277,8 @@ else:
         eval_interval: int | None = None,
         eval_games: int = 64,
         replay_capacity: int | None = None,
+        solver_eval_positions: int = 0,
+        eval_sims: int = 64,
         seed: int = 0,
         gpu: str = _DEFAULT_GPU,
     ) -> None:
@@ -285,6 +300,8 @@ else:
             eval_interval=eval_interval,
             eval_games=eval_games,
             replay_capacity=replay_capacity,
+            solver_eval_positions=solver_eval_positions,
+            eval_sims=eval_sims,
             seed=seed,
             requested_gpu=gpu,
         )

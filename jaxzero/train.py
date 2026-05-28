@@ -225,6 +225,7 @@ def run_training(
     *,
     on_iteration: Callable[[dict[str, float | int]], None] | None = None,
     on_checkpoint: Callable[[str], None] | None = None,
+    extra_evaluator: Callable[[AlphaZeroNet], dict[str, float]] | None = None,
 ) -> TrainingResult:
     """Run buffer-free self-play/training for ``config.iterations``.
 
@@ -277,9 +278,15 @@ def run_training(
             update_step, params, opt_state, buffer, config.minibatch_size, shuffle_key
         )
         host_metrics = _host_metrics(metrics, iteration=iteration)
-        if evaluator is not None and (iteration + 1) % config.eval_interval == 0:
-            key, eval_key = jax.random.split(key)
-            host_metrics.update(vs_random_metrics(evaluator(params, eval_key)))
+        if (
+            config.eval_interval is not None
+            and (iteration + 1) % config.eval_interval == 0
+        ):
+            if evaluator is not None:
+                key, eval_key = jax.random.split(key)
+                host_metrics.update(vs_random_metrics(evaluator(params, eval_key)))
+            if extra_evaluator is not None:
+                host_metrics.update(extra_evaluator(nnx.merge(graphdef, params)))
         history.append(host_metrics)
         if on_iteration is not None:
             on_iteration(host_metrics)
