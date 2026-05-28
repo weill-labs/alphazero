@@ -17,6 +17,8 @@ from jaxzero.evaluate import make_evaluator, vs_random_metrics
 from jaxzero.net import (
     ARCH_RESNET,
     ARCH_TRANSFORMER,
+    INPUT_EMBED_LINEAR,
+    POLICY_HEAD_FLATTEN,
     AlphaZeroNetConfig,
     Net,
     apply_model,
@@ -63,6 +65,9 @@ class TrainingConfig:
     num_layers: int = 6
     num_heads: int = 4
     mlp_dim: int = 512
+    use_value_cls_token: bool = False
+    policy_head_style: str = POLICY_HEAD_FLATTEN
+    input_embed_style: str = INPUT_EMBED_LINEAR
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -120,6 +125,9 @@ class TrainingConfig:
             num_layers=self.num_layers,
             num_heads=self.num_heads,
             mlp_dim=self.mlp_dim,
+            use_value_cls_token=self.use_value_cls_token,
+            policy_head_style=self.policy_head_style,
+            input_embed_style=self.input_embed_style,
         )
 
 
@@ -144,6 +152,9 @@ def build_net_config(config: TrainingConfig) -> AlphaZeroNetConfig:
         num_layers=config.num_layers,
         num_heads=config.num_heads,
         mlp_dim=config.mlp_dim,
+        use_value_cls_token=config.use_value_cls_token,
+        policy_head_style=config.policy_head_style,
+        input_embed_style=config.input_embed_style,
     )
 
 

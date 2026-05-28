@@ -13,6 +13,14 @@ ARCH_RESNET = "resnet"
 ARCH_TRANSFORMER = "transformer"
 _VALID_ARCHS = (ARCH_RESNET, ARCH_TRANSFORMER)
 
+POLICY_HEAD_FLATTEN = "flatten"
+POLICY_HEAD_PER_COLUMN = "per_column"
+_VALID_POLICY_HEADS = (POLICY_HEAD_FLATTEN, POLICY_HEAD_PER_COLUMN)
+
+INPUT_EMBED_LINEAR = "linear"
+INPUT_EMBED_CONV3X3 = "conv3x3"
+_VALID_INPUT_EMBEDS = (INPUT_EMBED_LINEAR, INPUT_EMBED_CONV3X3)
+
 
 @dataclass(frozen=True)
 class AlphaZeroNetConfig:
@@ -32,6 +40,12 @@ class AlphaZeroNetConfig:
     num_layers: int = 6
     num_heads: int = 4
     mlp_dim: int = 512
+    # Tier 1 transformer-only knobs (defaults preserve the v1 "naive" transformer
+    # so old checkpoints load unchanged). The v2 board-aware design flips all
+    # three: cls token + per-column policy + conv patch embedding (AlphaViT style).
+    use_value_cls_token: bool = False
+    policy_head_style: str = POLICY_HEAD_FLATTEN
+    input_embed_style: str = INPUT_EMBED_LINEAR
 
     def __post_init__(self) -> None:
         obs_shape = tuple(int(dim) for dim in self.obs_shape)
@@ -68,9 +82,34 @@ class AlphaZeroNetConfig:
                     f"num_heads ({self.num_heads})"
                 )
                 raise ValueError(msg)
+            if self.policy_head_style not in _VALID_POLICY_HEADS:
+                msg = (
+                    f"policy_head_style must be one of {_VALID_POLICY_HEADS}, "
+                    f"got {self.policy_head_style!r}"
+                )
+                raise ValueError(msg)
+            if self.input_embed_style not in _VALID_INPUT_EMBEDS:
+                msg = (
+                    f"input_embed_style must be one of {_VALID_INPUT_EMBEDS}, "
+                    f"got {self.input_embed_style!r}"
+                )
+                raise ValueError(msg)
+            if (
+                self.policy_head_style == POLICY_HEAD_PER_COLUMN
+                and obs_shape[0] * obs_shape[1] % self.action_size != 0
+            ):
+                # Per-column policy assumes action_size == width, with the height
+                # cells in each column aggregated to one logit.
+                width = obs_shape[1]
+                if self.action_size != width:
+                    msg = (
+                        f"policy_head_style='per_column' requires action_size "
+                        f"({self.action_size}) == width ({width})"
+                    )
+                    raise ValueError(msg)
         object.__setattr__(self, "obs_shape", obs_shape)
 
-    def to_dict(self) -> dict[str, int | str | list[int]]:
+    def to_dict(self) -> dict[str, int | str | bool | list[int]]:
         return {
             "obs_shape": list(self.obs_shape),
             "action_size": self.action_size,
@@ -81,6 +120,9 @@ class AlphaZeroNetConfig:
             "num_layers": self.num_layers,
             "num_heads": self.num_heads,
             "mlp_dim": self.mlp_dim,
+            "use_value_cls_token": self.use_value_cls_token,
+            "policy_head_style": self.policy_head_style,
+            "input_embed_style": self.input_embed_style,
         }
 
     @classmethod
@@ -89,8 +131,8 @@ class AlphaZeroNetConfig:
         if not isinstance(obs_shape, Sequence):
             msg = f"obs_shape must be a sequence, got {type(obs_shape).__name__}"
             raise ValueError(msg)
-        # Legacy checkpoints (pre-transformer) lack arch/d_model/etc keys; the
-        # defaults below reproduce the original resnet path.
+        # Legacy checkpoints (pre-Tier-1) lack the v2 keys; defaults below
+        # reproduce the v1 ("naive") transformer / original resnet path.
         return cls(
             obs_shape=tuple(int(dim) for dim in obs_shape),
             action_size=int(data["action_size"]),
@@ -101,6 +143,9 @@ class AlphaZeroNetConfig:
             num_layers=int(data.get("num_layers", 6)),
             num_heads=int(data.get("num_heads", 4)),
             mlp_dim=int(data.get("mlp_dim", 512)),
+            use_value_cls_token=bool(data.get("use_value_cls_token", False)),
+            policy_head_style=str(data.get("policy_head_style", POLICY_HEAD_FLATTEN)),
+            input_embed_style=str(data.get("input_embed_style", INPUT_EMBED_LINEAR)),
         )
 
 
@@ -245,65 +290,129 @@ class TransformerBlock(nnx.Module):
 
 
 class TransformerNet(nnx.Module):
-    """Pure self-attention AlphaZero network.
+    """Self-attention AlphaZero network with three opt-in Tier 1 knobs.
 
-    Each board cell is one token (no convolutions), with separate learned row
-    and column positional embeddings summed to give the model 2D geometry.
-    Same forward contract as :class:`AlphaZeroNet`: ``(policy_logits, value)``.
+    Default ("v1") config matches the original naive transformer: pure linear
+    input projection, mean-pool value head, flatten policy head. Flipping the
+    three Tier 1 knobs in ``config`` enables the AlphaViT-style design:
+
+    - ``input_embed_style='conv3x3'``: 3x3 conv as patch embedding (local
+      pattern detection before tokenization).
+    - ``use_value_cls_token=True``: prepend a learnable cls token; value head
+      reads the cls token only (fixes the mean-pool value bottleneck).
+    - ``policy_head_style='per_column'``: aggregate the height cells of each
+      column with a shared linear, giving column-equivariant action logits
+      with a strong inductive bias for the C4 action structure.
+
+    Forward contract is unchanged: ``(policy_logits, value)``.
     """
 
     def __init__(self, config: AlphaZeroNetConfig, *, rngs: nnx.Rngs) -> None:
         self.config = config
         height, width, planes = config.obs_shape
-        self.input_proj = nnx.Linear(planes, config.d_model, rngs=rngs)
-        # Learned 2D positional embedding factored as row + col. Cheaper than a
-        # full (H*W, d_model) table and respects the natural board axes.
-        self.row_emb = nnx.Embed(height, config.d_model, rngs=rngs)
-        self.col_emb = nnx.Embed(width, config.d_model, rngs=rngs)
+        d = config.d_model
+
+        # --- Input embedding (Tier 1: conv3x3 vs linear) ---
+        if config.input_embed_style == INPUT_EMBED_CONV3X3:
+            # 3x3 conv with same padding: gives each cell a receptive field of
+            # 3x3 before any attention layer sees the tokens.
+            self.input_proj_conv = nnx.Conv(
+                planes, d, kernel_size=(3, 3), padding="SAME", rngs=rngs
+            )
+            self.input_proj_linear = None
+        else:
+            self.input_proj_linear = nnx.Linear(planes, d, rngs=rngs)
+            self.input_proj_conv = None
+
+        # --- Positional + cls token ---
+        self.row_emb = nnx.Embed(height, d, rngs=rngs)
+        self.col_emb = nnx.Embed(width, d, rngs=rngs)
+        if config.use_value_cls_token:
+            # nnx.Param wraps a (1, d_model) learnable vector that is broadcast
+            # across the batch and prepended to the board-token sequence.
+            self.cls_token = nnx.Param(jax.random.normal(rngs.params(), (1, d)) * 0.02)
+        else:
+            self.cls_token = None
+
+        # --- Transformer stack ---
         self.layers = nnx.List(
             [
-                TransformerBlock(
-                    config.d_model,
-                    config.num_heads,
-                    config.mlp_dim,
-                    rngs=rngs,
-                )
+                TransformerBlock(d, config.num_heads, config.mlp_dim, rngs=rngs)
                 for _ in range(config.num_layers)
             ]
         )
-        self.norm_out = nnx.LayerNorm(config.d_model, rngs=rngs)
-        # Policy: flatten all token features -> one linear to action logits.
-        # Mirror-augment compatibility note: this head is column-position-aware
-        # (it has independent weights per cell), so mirror_augment still
-        # contributes useful gradient signal even though the policy head is not
-        # mirror-equivariant by construction.
-        self.policy_head = nnx.Linear(
-            height * width * config.d_model,
-            config.action_size,
-            rngs=rngs,
-        )
-        # Value: mean-pool over tokens -> MLP -> tanh.
-        self.value_hidden = nnx.Linear(config.d_model, config.d_model, rngs=rngs)
-        self.value_out = nnx.Linear(config.d_model, 1, rngs=rngs)
+        self.norm_out = nnx.LayerNorm(d, rngs=rngs)
+
+        # --- Policy head (Tier 1: per_column vs flatten) ---
+        if config.policy_head_style == POLICY_HEAD_PER_COLUMN:
+            # Per-column shared head: flatten 6 cells of each column to a
+            # (6*d_model)-vector, then a shared linear -> 1 logit per column.
+            # ``action_size`` == ``width`` is enforced by config validation.
+            self.policy_head_flat = None
+            self.policy_head_col = nnx.Linear(height * d, 1, rngs=rngs)
+        else:
+            self.policy_head_flat = nnx.Linear(
+                height * width * d, config.action_size, rngs=rngs
+            )
+            self.policy_head_col = None
+
+        # --- Value head: always MLP -> tanh; source token differs by knob ---
+        self.value_hidden = nnx.Linear(d, d, rngs=rngs)
+        self.value_out = nnx.Linear(d, 1, rngs=rngs)
 
     def __call__(self, obs_batch: jax.Array) -> tuple[jax.Array, jax.Array]:
         x = obs_batch.astype(jnp.float32)
         batch, height, width, _ = x.shape
-        # Cells -> tokens.
-        x = x.reshape((batch, height * width, -1))
-        x = self.input_proj(x)
-        # 2D positional embedding: row_emb[r] + col_emb[c] for cell (r, c).
+
+        # --- Input embedding -> tokens ---
+        if self.input_proj_conv is not None:
+            # Conv keeps spatial layout; tokenize after.
+            x = self.input_proj_conv(x)  # (B, H, W, d_model)
+            x = x.reshape((batch, height * width, -1))
+        else:
+            # Linear projection per cell.
+            x = x.reshape((batch, height * width, -1))
+            x = self.input_proj_linear(x)
+
+        # Position embedding for the 42 board tokens.
         row_e = self.row_emb(jnp.arange(height))  # (H, d_model)
         col_e = self.col_emb(jnp.arange(width))  # (W, d_model)
         pos = (row_e[:, None, :] + col_e[None, :, :]).reshape((height * width, -1))
         x = x + pos
+
+        # Prepend cls token if enabled. The cls gets no positional embedding,
+        # so it relies on attention to gather positional info from the board
+        # tokens (matches the BERT/ViT convention).
+        if self.cls_token is not None:
+            cls = jnp.broadcast_to(self.cls_token[...], (batch, 1, x.shape[-1]))
+            x = jnp.concatenate([cls, x], axis=1)  # (B, 1+H*W, d_model)
+
         for layer in self.layers:
             x = layer(x)
         x = self.norm_out(x)
 
-        policy_logits = self.policy_head(x.reshape((batch, -1)))
-        pooled = jnp.mean(x, axis=1)
-        value = jax.nn.relu(self.value_hidden(pooled))
+        # --- Split cls (if present) from board tokens ---
+        if self.cls_token is not None:
+            cls_out = x[:, 0, :]  # (B, d_model)
+            board = x[:, 1:, :]  # (B, H*W, d_model)
+        else:
+            cls_out = None
+            board = x
+
+        # --- Policy head ---
+        if self.policy_head_col is not None:
+            # board: (B, H*W, d_model) -> (B, H, W, d_model)
+            board_grid = board.reshape((batch, height, width, -1))
+            # Reorder to (B, W, H, d_model) so each column's H cells are flat.
+            per_col = jnp.transpose(board_grid, (0, 2, 1, 3))
+            per_col = per_col.reshape((batch, width, height * board_grid.shape[-1]))
+            policy_logits = self.policy_head_col(per_col).reshape((batch, width))
+        else:
+            policy_logits = self.policy_head_flat(board.reshape((batch, -1)))
+
+        # --- Value head: read cls when available, else mean-pool board ---
+        value_src = cls_out if cls_out is not None else jnp.mean(board, axis=1)
+        value = jax.nn.relu(self.value_hidden(value_src))
         value = jnp.tanh(self.value_out(value)).reshape((-1,))
         return policy_logits, value
 
