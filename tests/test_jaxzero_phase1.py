@@ -387,6 +387,55 @@ def test_mirror_selfplay_data_keeps_scalar_fields_identical() -> None:
         assert jnp.array_equal(augmented[2:], original)
 
 
+def test_gating_persists_best_params_not_live(tmp_path) -> None:
+    """When gating is enabled, the saved checkpoint must equal best_params,
+    not the live (possibly-regressed) candidate. With threshold=1.0 and tiny
+    games the candidate can never promote (no decisive 100%-win match is
+    achievable in 2 games at max_steps=2), so best_params stays at iter-0
+    init while the live params get trained. The saved checkpoint must match
+    the init, not the trained params."""
+    checkpoint = tmp_path / "gated.msgpack"
+    config = replace(
+        _tiny_training_config(seed=7, checkpoint_path=str(checkpoint)),
+        iterations=2,
+        gating_interval=1,
+        gating_games=2,
+        gating_threshold=1.0,  # impossible to hit -> no promotion
+    )
+    result = run_training(config)
+
+    loaded = load_checkpoint(checkpoint)
+    loaded_leaves = _tree_leaves(nnx.state(loaded, nnx.Param))
+    live_leaves = _tree_leaves(result.params)
+
+    # If we wrongly saved live params, every leaf would match. Since training
+    # advanced and best_params stayed at init, the saved (init) leaves must
+    # differ from the live (trained) leaves on at least one parameter array.
+    matching = sum(
+        bool(jnp.array_equal(a, b))
+        for a, b in zip(loaded_leaves, live_leaves, strict=True)
+    )
+    assert matching < len(loaded_leaves), (
+        f"saved checkpoint equals live params ({matching}/{len(loaded_leaves)} "
+        "leaves match) -- expected save to use best_params (init), which "
+        "differs from live."
+    )
+
+
+def test_no_gating_persists_live_params(tmp_path) -> None:
+    """With gating off, save semantics are unchanged: saved == live (backward
+    compat with all pre-jla runs)."""
+    checkpoint = tmp_path / "ungated.msgpack"
+    config = replace(_tiny_training_config(seed=7, checkpoint_path=str(checkpoint)))
+    result = run_training(config)
+
+    loaded = load_checkpoint(checkpoint)
+    loaded_leaves = _tree_leaves(nnx.state(loaded, nnx.Param))
+    live_leaves = _tree_leaves(result.params)
+    for actual, expected in zip(loaded_leaves, live_leaves, strict=True):
+        assert jnp.array_equal(actual, expected)
+
+
 def test_mirror_augment_flag_doubles_examples_per_iteration() -> None:
     """End-to-end: setting mirror_augment=True should double the per-iteration
     self-play data fed into training. Verify by counting examples via the

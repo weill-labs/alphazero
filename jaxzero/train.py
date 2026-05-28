@@ -375,12 +375,18 @@ def run_training(
                 Path(config.checkpoint_path).parent
                 / f"iter_{iteration + 1:04d}.msgpack"
             )
-            save_checkpoint(nnx.merge(graphdef, params), periodic_path)
+            # When gating is on, persist the best (verified-strongest) net,
+            # not the live candidate. Otherwise solver-anchored certs of these
+            # checkpoints read a net that gating itself flagged as not-better.
+            persist_params = best_params if gating_enabled else params
+            save_checkpoint(nnx.merge(graphdef, persist_params), periodic_path)
             if on_checkpoint is not None:
                 on_checkpoint(periodic_path)
 
     if config.checkpoint_path is not None:
-        save_checkpoint(nnx.merge(graphdef, params), config.checkpoint_path)
+        # Same rationale as periodic save: persist best when gating is on.
+        persist_params = best_params if gating_enabled else params
+        save_checkpoint(nnx.merge(graphdef, persist_params), config.checkpoint_path)
 
     return TrainingResult(
         config=config,
