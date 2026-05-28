@@ -40,6 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="log vs-random win/draw/loss rates every N iterations",
     )
     parser.add_argument("--eval-games", type=int, default=64)
+    parser.add_argument(
+        "--replay-capacity",
+        type=int,
+        help="reuse the most recent N self-play examples across iterations "
+        "(default: buffer-free, train only on the current iteration's data)",
+    )
     return parser
 
 
@@ -60,6 +66,7 @@ def main(argv: list[str] | None = None) -> None:
         init_checkpoint=args.init_checkpoint,
         eval_interval=args.eval_interval,
         eval_games=args.eval_games,
+        replay_capacity=args.replay_capacity,
     )
     result = run_training(config)
     for metrics in result.metrics:

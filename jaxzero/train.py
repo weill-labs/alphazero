@@ -42,6 +42,7 @@ class TrainingConfig:
     init_checkpoint: str | None = None
     eval_interval: int | None = None
     eval_games: int = 64
+    replay_capacity: int | None = None
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -61,6 +62,9 @@ class TrainingConfig:
             raise ValueError(msg)
         if self.eval_games <= 0:
             msg = "eval_games must be positive"
+            raise ValueError(msg)
+        if self.replay_capacity is not None and self.replay_capacity <= 0:
+            msg = "replay_capacity must be positive when set"
             raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
@@ -191,6 +195,31 @@ def _train_epoch(
     return params, opt_state, mean_metrics
 
 
+def _append_to_buffer(
+    buffer: SelfPlayData | None, new_data: SelfPlayData, capacity: int | None
+) -> SelfPlayData:
+    """Return the examples to train on this iteration.
+
+    Buffer-free (``capacity`` is None): just ``new_data``. Otherwise keep the
+    most recent ``capacity`` examples across iterations and train on those — the
+    reused data gives the value head far more signal to calibrate on than a
+    single iteration's fresh self-play.
+    """
+    if capacity is None:
+        return new_data
+    combined = (
+        new_data
+        if buffer is None
+        else jax.tree.map(
+            lambda b, n: jnp.concatenate([b, n], axis=0), buffer, new_data
+        )
+    )
+    n = int(combined.observation.shape[0])
+    if n > capacity:
+        combined = jax.tree.map(lambda x: x[n - capacity :], combined)
+    return combined
+
+
 def run_training(
     config: TrainingConfig,
     *,
@@ -239,11 +268,13 @@ def run_training(
 
     key = jax.random.PRNGKey(config.seed)
     history: list[dict[str, float | int]] = []
+    buffer: SelfPlayData | None = None
     for iteration in range(config.iterations):
         key, selfplay_key, shuffle_key = jax.random.split(key, 3)
-        data = flatten_selfplay_data(selfplay(params, selfplay_key))
+        new_data = flatten_selfplay_data(selfplay(params, selfplay_key))
+        buffer = _append_to_buffer(buffer, new_data, config.replay_capacity)
         params, opt_state, metrics = _train_epoch(
-            update_step, params, opt_state, data, config.minibatch_size, shuffle_key
+            update_step, params, opt_state, buffer, config.minibatch_size, shuffle_key
         )
         host_metrics = _host_metrics(metrics, iteration=iteration)
         if evaluator is not None and (iteration + 1) % config.eval_interval == 0:

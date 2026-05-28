@@ -13,13 +13,20 @@ from flax import nnx
 from jaxzero.net import AlphaZeroNetConfig, create_model
 from jaxzero.selfplay import (
     SelfPlayConfig,
+    SelfPlayData,
     discounted_returns,
     flatten_selfplay_data,
     initial_observation_shape,
     make_env,
     make_selfplay,
 )
-from jaxzero.train import TrainingConfig, load_checkpoint, run_training, save_checkpoint
+from jaxzero.train import (
+    TrainingConfig,
+    _append_to_buffer,
+    load_checkpoint,
+    run_training,
+    save_checkpoint,
+)
 
 
 def _tiny_training_config(
@@ -189,6 +196,37 @@ def test_eval_interval_logs_vs_random_metrics() -> None:
         )
         assert all(0.0 <= r <= 1.0 for r in rates)
         assert abs(sum(rates) - 1.0) < 1e-6
+
+
+def _dummy_selfplay_data(n: int, value: float) -> SelfPlayData:
+    return SelfPlayData(
+        observation=jnp.full((n, 1), value),
+        action_weights=jnp.full((n, 1), value),
+        reward=jnp.full((n,), value),
+        discount=jnp.full((n,), value),
+        terminated=jnp.zeros((n,), dtype=jnp.bool_),
+        value_target=jnp.full((n,), value),
+        value_mask=jnp.ones((n,), dtype=jnp.bool_),
+    )
+
+
+def test_append_to_buffer_accumulates_and_caps() -> None:
+    # Buffer-free: returns only the new data.
+    out = _append_to_buffer(None, _dummy_selfplay_data(3, 1.0), None)
+    assert out.observation.shape[0] == 3
+
+    # With capacity: accumulate 3 + 4 = 7, cap to the most recent 5.
+    buf = _append_to_buffer(None, _dummy_selfplay_data(3, 1.0), 5)
+    buf = _append_to_buffer(buf, _dummy_selfplay_data(4, 2.0), 5)
+    assert buf.observation.shape[0] == 5
+    assert jnp.array_equal(buf.observation[:, 0], jnp.array([1.0, 2.0, 2.0, 2.0, 2.0]))
+
+
+def test_run_training_with_replay_buffer_runs() -> None:
+    config = replace(_tiny_training_config(), iterations=3, replay_capacity=8)
+    result = run_training(config)
+    assert len(result.metrics) == 3
+    assert all(jnp.isfinite(m["loss"]) for m in result.metrics)
 
 
 def test_jaxzero_imports_do_not_load_torch() -> None:

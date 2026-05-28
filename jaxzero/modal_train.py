@@ -158,6 +158,7 @@ else:
         checkpoint_every: int | None = None,
         eval_interval: int | None = None,
         eval_games: int = 64,
+        replay_capacity: int | None = None,
         seed: int = 0,
         requested_gpu: str = _DEFAULT_GPU,
     ) -> dict[str, object]:
@@ -178,6 +179,7 @@ else:
             "checkpoint_every": checkpoint_every,
             "eval_interval": eval_interval,
             "eval_games": eval_games,
+            "replay_capacity": replay_capacity,
             "seed": seed,
             "requested_gpu": requested_gpu,
         }
@@ -217,6 +219,7 @@ else:
                     checkpoint_every=checkpoint_every,
                     eval_interval=eval_interval,
                     eval_games=eval_games,
+                    replay_capacity=replay_capacity,
                     seed=seed,
                     checkpoint_path=checkpoint_path,
                 ),
@@ -260,6 +263,7 @@ else:
         checkpoint_every: int | None = None,
         eval_interval: int | None = None,
         eval_games: int = 64,
+        replay_capacity: int | None = None,
         seed: int = 0,
         gpu: str = _DEFAULT_GPU,
     ) -> None:
@@ -280,6 +284,7 @@ else:
             checkpoint_every=checkpoint_every,
             eval_interval=eval_interval,
             eval_games=eval_games,
+            replay_capacity=replay_capacity,
             seed=seed,
             requested_gpu=gpu,
         )
