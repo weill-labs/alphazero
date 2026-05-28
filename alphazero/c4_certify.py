@@ -25,7 +25,7 @@ from flax import nnx
 from pgx.connect_four import GameState as PgxGameState
 from pgx.connect_four import State as PgxConnectFourState
 
-from alphazero.c4_solver import NodeBudgetExceeded, solve
+from alphazero.c4_solver import NodeBudgetExceeded, solve, solve_with_score
 from alphazero.games.connectfour import ConnectFour, ConnectFourState
 from jaxzero.net import AlphaZeroNet, apply_model
 from jaxzero.train import load_checkpoint as load_jax_checkpoint
@@ -132,14 +132,18 @@ class PositionCertification:
     agent_value: float
     agent_outcome: int
     policy_match: bool
+    # ``blunder`` is the weak/outcome definition: the agent's move changed the
+    # game-theoretic W/D/L result. ``score_blunder`` is the strong definition:
+    # the agent's move was not score-optimal (includes winning slower than the
+    # fastest forced win). strong >= weak always. This mirrors the two modes in
+    # the AlphaZero.jl / Prasad benchmarks (weak ~0.24% err, strong ~3% err).
     blunder: bool
-    # Per-move regret against the exact solver, both >= 0 (optimal is the best
-    # achievable). ``score_regret`` is in raw Pons-score units (penalizes
-    # winning slower / losing faster, even within the same W/D/L tier).
-    # ``wdl_regret`` collapses to outcome tiers in {0, 1, 2}: 0 preserves the
-    # game-theoretic result, 1 downgrades one tier (win->draw or draw->loss),
-    # 2 is catastrophic (win->loss). WDL is the headline (severity that matters
-    # for "solving"); score is the finer secondary signal.
+    score_blunder: bool
+    # Per-move regret against the exact solver, both >= 0 (optimal is best).
+    # ``score_regret`` is in raw Pons-score units (penalizes slower wins / faster
+    # losses, even within the same W/D/L tier). ``wdl_regret`` collapses to
+    # outcome tiers {0,1,2}: 0 preserves the result, 1 downgrades one tier
+    # (win->draw or draw->loss), 2 is catastrophic (win->loss).
     score_regret: int
     wdl_regret: int
 
@@ -155,15 +159,16 @@ class CertificationReport:
     blunder_rate: float
     value_mae: float
     solved: bool
-    # Regret aggregates (the preferred run-vs-run comparison metrics: continuous
-    # and severity-aware, so far lower variance than the binary blunder rate).
-    # ``wdl_blunder_rate`` is the fraction of positions whose game-theoretic
-    # outcome was downgraded — strictly <= ``blunder_rate``, since the latter
-    # also flags same-tier slow wins / fast losses.
+    # ``blunder_rate`` is the weak/outcome rate (fraction whose W/D/L result
+    # changed). ``score_blunder_rate`` is the strong rate (fraction that were
+    # not score-optimal, including slower-than-fastest wins) and is always
+    # >= blunder_rate. The mean-regret aggregates are the preferred run-vs-run
+    # comparison metrics: continuous and severity-aware, so far lower variance
+    # than either binary rate.
+    score_blunders: int
+    score_blunder_rate: float
     mean_wdl_regret: float
     mean_score_regret: float
-    wdl_blunders: int
-    wdl_blunder_rate: float
     records: tuple[PositionCertification, ...]
 
     def as_dict(self) -> dict[str, bool | float | int]:
@@ -177,10 +182,10 @@ class CertificationReport:
             "blunder_rate": self.blunder_rate,
             "value_mae": self.value_mae,
             "solved": self.solved,
+            "score_blunders": self.score_blunders,
+            "score_blunder_rate": self.score_blunder_rate,
             "mean_wdl_regret": self.mean_wdl_regret,
             "mean_score_regret": self.mean_score_regret,
-            "wdl_blunders": self.wdl_blunders,
-            "wdl_blunder_rate": self.wdl_blunder_rate,
         }
 
 
@@ -220,7 +225,9 @@ def certify_connect_four(
             continue
 
         try:
-            solver_value, optimal_moves = solve(state, max_nodes=solver_max_nodes)
+            solver_value, optimal_moves, solver_score = solve_with_score(
+                state, max_nodes=solver_max_nodes
+            )
         except NodeBudgetExceeded:
             skipped_positions += 1
             continue
@@ -233,7 +240,7 @@ def certify_connect_four(
             raise ValueError(f"agent selected illegal action {agent_move}")
 
         try:
-            child_value, _ = solve(
+            child_value, _, child_score = solve_with_score(
                 c4.apply_move(state, agent_move),
                 max_nodes=solver_max_nodes,
             )
@@ -242,10 +249,13 @@ def certify_connect_four(
             continue
 
         agent_value = agent.value(state)
+        # Negamax: the agent's outcome (mover perspective) is the negation of
+        # the resulting child position's value/score (opponent perspective).
         agent_outcome = -child_value
+        agent_score = -child_score
         policy_match = agent_move in optimal_moves
         # Optimal is by definition the best achievable, so both regrets are >= 0.
-        score_regret = solver_value - agent_outcome
+        score_regret = solver_score - agent_score
         # sign() maps each value to its W/D/L tier in {-1, 0, +1}; since
         # agent_outcome <= solver_value, the tier difference is in {0, 1, 2}.
         wdl_regret = int(np.sign(solver_value)) - int(np.sign(agent_outcome))
@@ -258,6 +268,7 @@ def certify_connect_four(
                 agent_outcome=agent_outcome,
                 policy_match=policy_match,
                 blunder=agent_outcome < solver_value,
+                score_blunder=score_regret > 0,
                 score_regret=score_regret,
                 wdl_regret=wdl_regret,
             )
@@ -304,7 +315,8 @@ def make_solver_evaluator(
             # Lower-variance, severity-aware signals for run-vs-run comparison.
             "eval/c4_wdl_regret": float(report.mean_wdl_regret),
             "eval/c4_score_regret": float(report.mean_score_regret),
-            "eval/c4_wdl_blunder_rate": float(report.wdl_blunder_rate),
+            # Strong-mode rate (non-score-optimal, incl. slower wins) >= weak.
+            "eval/c4_score_blunder_rate": float(report.score_blunder_rate),
         }
 
     return run
@@ -541,7 +553,7 @@ def _report(
     evaluated_positions = len(records)
     policy_matches = sum(1 for record in records if record.policy_match)
     blunders = sum(1 for record in records if record.blunder)
-    wdl_blunders = sum(1 for record in records if record.wdl_regret > 0)
+    score_blunders = sum(1 for record in records if record.score_blunder)
     value_errors = [
         abs(float(record.agent_value) - float(record.solver_value))
         for record in records
@@ -551,14 +563,14 @@ def _report(
         100.0 * policy_matches / evaluated_positions if evaluated_positions else 0.0
     )
     blunder_rate = blunders / evaluated_positions if evaluated_positions else 0.0
+    score_blunder_rate = (
+        score_blunders / evaluated_positions if evaluated_positions else 0.0
+    )
     mean_wdl_regret = (
         float(np.mean([record.wdl_regret for record in records])) if records else 0.0
     )
     mean_score_regret = (
         float(np.mean([record.score_regret for record in records])) if records else 0.0
-    )
-    wdl_blunder_rate = (
-        wdl_blunders / evaluated_positions if evaluated_positions else 0.0
     )
     return CertificationReport(
         sampled_positions=sampled_positions,
@@ -570,10 +582,10 @@ def _report(
         blunder_rate=blunder_rate,
         value_mae=value_mae,
         solved=evaluated_positions > 0 and blunder_rate == 0.0,
+        score_blunders=score_blunders,
+        score_blunder_rate=score_blunder_rate,
         mean_wdl_regret=mean_wdl_regret,
         mean_score_regret=mean_score_regret,
-        wdl_blunders=wdl_blunders,
-        wdl_blunder_rate=wdl_blunder_rate,
         records=tuple(records),
     )
 

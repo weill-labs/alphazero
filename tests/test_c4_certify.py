@@ -177,40 +177,90 @@ def test_make_solver_evaluator_returns_blunder_policy_value_and_regret_keys(
         "eval/c4_value_mae",
         "eval/c4_wdl_regret",
         "eval/c4_score_regret",
-        "eval/c4_wdl_blunder_rate",
+        "eval/c4_score_blunder_rate",
     }
     assert 0.0 <= metrics["eval/c4_blunder_rate"] <= 1.0
     assert 0.0 <= metrics["eval/c4_policy_match"] <= 1.0
     assert metrics["eval/c4_value_mae"] >= 0.0  # MAE is non-negative
-    # WDL regret is a mean over {0,1,2}; score regret and wdl-blunder-rate >= 0.
+    # WDL regret is a mean over {0,1,2}; score regret and strong rate >= 0.
     assert 0.0 <= metrics["eval/c4_wdl_regret"] <= 2.0
     assert metrics["eval/c4_score_regret"] >= 0.0
-    assert 0.0 <= metrics["eval/c4_wdl_blunder_rate"] <= 1.0
+    assert 0.0 <= metrics["eval/c4_score_blunder_rate"] <= 1.0
+    # Strong mode (any non-optimal-score move) is at least as strict as weak.
+    assert metrics["eval/c4_score_blunder_rate"] >= metrics["eval/c4_blunder_rate"]
 
 
 def test_perfect_agent_has_zero_regret() -> None:
-    """A solver-oracle agent must have zero regret of both kinds, and the
-    WDL-blunder rate must agree with the (score-based) blunder rate at zero."""
+    """A solver-oracle agent (picks the first WDL-optimal move) never changes
+    the game outcome, so weak blunders and WDL regret are zero."""
     _, state = _play(_FORCED_BLOCK_DRAW)
     report = certify_connect_four(SolverOracleAgent(), positions=[state])
 
     assert report.mean_wdl_regret == 0.0
-    assert report.mean_score_regret == 0.0
-    assert report.wdl_blunders == 0
-    assert np.isclose(report.wdl_blunder_rate, 0.0)
+    assert report.blunders == 0
+    assert np.isclose(report.blunder_rate, 0.0)
 
 
-def test_regret_is_nonnegative_and_wdl_blunders_subset_of_blunders() -> None:
-    """WDL blunders are a subset of score blunders: changing the game-theoretic
-    outcome always trips the score-based blunder too, but not vice versa
-    (a same-tier slow win is a score blunder with wdl_regret == 0)."""
+def test_regret_is_nonnegative_and_weak_blunders_subset_of_strong() -> None:
+    """Weak (outcome) blunders are a subset of strong (score) blunders: changing
+    the W/D/L result always trips the score blunder too, but not vice versa (a
+    slower-than-fastest win is a strong blunder with wdl_regret == 0)."""
     _, state = _play(_FORCED_BLOCK_DRAW)
     report = certify_connect_four(FixedActionAgent(0), positions=[state])
 
     for record in report.records:
         assert record.score_regret >= 0
         assert 0 <= record.wdl_regret <= 2
-    assert report.wdl_blunders <= report.blunders
+        # A weak blunder implies a strong blunder.
+        if record.blunder:
+            assert record.score_blunder
+    assert report.blunders <= report.score_blunders
+
+
+def test_score_regret_distinguishes_slower_wins_from_optimal() -> None:
+    """With distance-aware solver scores, score-regret must be able to exceed
+    WDL-regret: a move that still wins but slower than the fastest win is a
+    strong blunder (score_regret > 0) with no WDL change (wdl_regret == 0).
+
+    Build a position by scanning legal moves for one where the agent's move
+    keeps the win but is not score-optimal; assert the metric separates them.
+    """
+    from alphazero.c4_solver import solve_with_score
+
+    game = ConnectFour()
+    # Find any winning position with >1 legal move and a non-fastest winning
+    # move, by random search seeded deterministically.
+    rng = np.random.default_rng(0)
+    found = False
+    for _ in range(400):
+        state = game.initial_state()
+        for _ in range(int(rng.integers(4, 20))):
+            if game.is_terminal(state):
+                break
+            legal = game.legal_moves(state)
+            if not legal:
+                break
+            state = game.apply_move(state, int(rng.choice(legal)))
+        if game.is_terminal(state) or not game.legal_moves(state):
+            continue
+        value, _, score = solve_with_score(state)
+        if value <= 0:
+            continue  # only winning positions have faster/slower win choices
+        # Look for a still-winning move whose score is below the optimum.
+        for move in game.legal_moves(state):
+            child_v, _, child_s = solve_with_score(game.apply_move(state, move))
+            if -child_v == 1 and -child_s < score:  # still a win, but slower
+                report = certify_connect_four(FixedActionAgent(move), positions=[state])
+                rec = report.records[0]
+                assert rec.wdl_regret == 0  # outcome preserved (still a win)
+                assert rec.score_regret > 0  # but slower than optimal
+                assert rec.score_blunder and not rec.blunder
+                found = True
+                break
+        if found:
+            break
+
+    assert found, "no slower-win position found in search budget"
 
 
 def test_eval_set_roundtrip_and_paired_certification(tmp_path) -> None:

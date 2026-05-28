@@ -119,6 +119,28 @@ def solve(
     win, ``0`` means a draw, and ``-1`` means a forced loss.
     """
 
+    value, optimal_moves, _ = solve_with_score(state, max_nodes=max_nodes)
+    return value, optimal_moves
+
+
+def solve_with_score(
+    state: ConnectFourState,
+    *,
+    max_nodes: int = _DEFAULT_MAX_NODES,
+) -> tuple[int, list[int], int]:
+    """Like :func:`solve` but also return the distance-aware Pons score.
+
+    The third element is the raw negamax score from the player-to-move
+    perspective: positive = forced win (larger = wins in fewer moves), 0 =
+    draw, negative = forced loss (more negative = loses sooner). The exact
+    solver already computes this per child move, so returning it is free.
+
+    Two move-quality notions follow from this: the ternary ``value`` collapses
+    the score to W/D/L (the "weak"/outcome blunder definition), while the raw
+    score additionally distinguishes faster vs slower wins (the "strong"
+    blunder definition that flags any non-optimal-score move).
+    """
+
     if max_nodes <= 0:
         raise ValueError("max_nodes must be positive")
 
@@ -126,20 +148,25 @@ def solve(
     winner = game.winner(state)
     if winner is not None:
         if winner == 0:
-            return 0, []
-        return (1 if winner == state.player else -1), []
+            return 0, [], 0
+        value = 1 if winner == state.player else -1
+        return value, [], value
 
     position = _from_state(state)
     legal = [col for col in _CENTER_FIRST_COLS if position.mask & _TOP_MASKS[col] == 0]
     if not legal:
-        return 0, []
+        return 0, [], 0
 
     opening_book_result = _opening_book(position, legal)
     if opening_book_result is not None:
-        return opening_book_result
+        # The book stores only the ternary outcome; use it as the raw score too
+        # (book entries are openings, where exact distance is not enumerated).
+        book_value, book_moves = opening_book_result
+        return book_value, book_moves, book_value
 
     solver = _Solver(max_nodes=max_nodes)
     best_value = -2
+    best_score = -_MAX_SCORE - 1
     optimal_moves: list[int] = []
     for col in legal:
         move = _move_bit(position.mask, col)
@@ -151,6 +178,10 @@ def solve(
             -_MAX_SCORE,
             _MAX_SCORE,
         )
+        # Negamax: the mover's raw score for this move is the negation of the
+        # child position's score (evaluated from the opponent's perspective).
+        move_score = -child_score
+        best_score = max(best_score, move_score)
         value = -_score_to_value(child_score)
         if value > best_value:
             best_value = value
@@ -158,7 +189,7 @@ def solve(
         elif value == best_value:
             optimal_moves.append(col)
 
-    return best_value, sorted(optimal_moves)
+    return best_value, sorted(optimal_moves), best_score
 
 
 def _from_state(state: ConnectFourState) -> _Position:
