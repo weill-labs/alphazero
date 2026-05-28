@@ -103,6 +103,38 @@ def build_parser() -> argparse.ArgumentParser:
         "disable.",
     )
     parser.add_argument("--eval-sims", type=int, default=64)
+    parser.add_argument(
+        "--arch",
+        choices=("resnet", "transformer"),
+        default="resnet",
+        help="Network tower: 'resnet' (default, uses --channels/--num-res-blocks) "
+        "or 'transformer' (uses --d-model/--num-layers/--num-heads/--mlp-dim).",
+    )
+    parser.add_argument(
+        "--d-model",
+        type=int,
+        default=128,
+        help="Transformer embedding/token dimension. Ignored when --arch resnet.",
+    )
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=6,
+        help="Number of transformer blocks. Ignored when --arch resnet.",
+    )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads (must divide --d-model). "
+        "Ignored when --arch resnet.",
+    )
+    parser.add_argument(
+        "--mlp-dim",
+        type=int,
+        default=512,
+        help="Transformer per-block MLP hidden dim. Ignored when --arch resnet.",
+    )
     return parser
 
 
@@ -130,6 +162,11 @@ def main(argv: list[str] | None = None) -> None:
         value_loss_weight=args.value_loss_weight,
         mirror_augment=args.mirror_augment,
         weight_decay=args.weight_decay,
+        arch=args.arch,
+        d_model=args.d_model,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        mlp_dim=args.mlp_dim,
     )
     extra_evaluator = None
     if args.solver_eval_positions > 0:
