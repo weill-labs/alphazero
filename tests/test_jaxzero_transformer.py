@@ -270,13 +270,16 @@ def test_per_column_requires_action_size_equals_width() -> None:
 
 
 def test_conv3x3_input_embed_uses_conv_not_linear() -> None:
-    """conv3x3 must instantiate the Conv path and leave the Linear path None."""
+    """conv3x3 must instantiate a nnx.Conv; linear must instantiate nnx.Linear.
+
+    Same attribute name (``input_proj``) for both modes so legacy checkpoints
+    load — the *type* of the module is what differs, dispatch happens at
+    forward time using ``config.input_embed_style``.
+    """
     conv = create_model(_transformer_cfg(input_embed_style="conv3x3"), seed=0)
     linear = create_model(_transformer_cfg(input_embed_style="linear"), seed=0)
-    assert conv.input_proj_conv is not None
-    assert conv.input_proj_linear is None
-    assert linear.input_proj_conv is None
-    assert linear.input_proj_linear is not None
+    assert isinstance(conv.input_proj, nnx.Conv)
+    assert isinstance(linear.input_proj, nnx.Linear)
 
 
 def test_invalid_policy_head_style_rejected() -> None:

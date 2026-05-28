@@ -313,16 +313,17 @@ class TransformerNet(nnx.Module):
         d = config.d_model
 
         # --- Input embedding (Tier 1: conv3x3 vs linear) ---
+        # Same attribute name for both modes so legacy checkpoints (pre-Tier-1)
+        # load without a key-rename. The dispatch happens at forward time using
+        # ``config.input_embed_style``.
         if config.input_embed_style == INPUT_EMBED_CONV3X3:
             # 3x3 conv with same padding: gives each cell a receptive field of
             # 3x3 before any attention layer sees the tokens.
-            self.input_proj_conv = nnx.Conv(
+            self.input_proj = nnx.Conv(
                 planes, d, kernel_size=(3, 3), padding="SAME", rngs=rngs
             )
-            self.input_proj_linear = None
         else:
-            self.input_proj_linear = nnx.Linear(planes, d, rngs=rngs)
-            self.input_proj_conv = None
+            self.input_proj = nnx.Linear(planes, d, rngs=rngs)
 
         # --- Positional + cls token ---
         self.row_emb = nnx.Embed(height, d, rngs=rngs)
@@ -344,17 +345,18 @@ class TransformerNet(nnx.Module):
         self.norm_out = nnx.LayerNorm(d, rngs=rngs)
 
         # --- Policy head (Tier 1: per_column vs flatten) ---
+        # Same attribute name for both modes so legacy checkpoints load. The
+        # two modes use different input/output shapes; forward dispatches on
+        # ``config.policy_head_style``.
         if config.policy_head_style == POLICY_HEAD_PER_COLUMN:
             # Per-column shared head: flatten 6 cells of each column to a
             # (6*d_model)-vector, then a shared linear -> 1 logit per column.
             # ``action_size`` == ``width`` is enforced by config validation.
-            self.policy_head_flat = None
-            self.policy_head_col = nnx.Linear(height * d, 1, rngs=rngs)
+            self.policy_head = nnx.Linear(height * d, 1, rngs=rngs)
         else:
-            self.policy_head_flat = nnx.Linear(
+            self.policy_head = nnx.Linear(
                 height * width * d, config.action_size, rngs=rngs
             )
-            self.policy_head_col = None
 
         # --- Value head: always MLP -> tanh; source token differs by knob ---
         self.value_hidden = nnx.Linear(d, d, rngs=rngs)
@@ -365,14 +367,14 @@ class TransformerNet(nnx.Module):
         batch, height, width, _ = x.shape
 
         # --- Input embedding -> tokens ---
-        if self.input_proj_conv is not None:
+        if self.config.input_embed_style == INPUT_EMBED_CONV3X3:
             # Conv keeps spatial layout; tokenize after.
-            x = self.input_proj_conv(x)  # (B, H, W, d_model)
+            x = self.input_proj(x)  # (B, H, W, d_model)
             x = x.reshape((batch, height * width, -1))
         else:
             # Linear projection per cell.
             x = x.reshape((batch, height * width, -1))
-            x = self.input_proj_linear(x)
+            x = self.input_proj(x)
 
         # Position embedding for the 42 board tokens.
         row_e = self.row_emb(jnp.arange(height))  # (H, d_model)
@@ -400,15 +402,15 @@ class TransformerNet(nnx.Module):
             board = x
 
         # --- Policy head ---
-        if self.policy_head_col is not None:
+        if self.config.policy_head_style == POLICY_HEAD_PER_COLUMN:
             # board: (B, H*W, d_model) -> (B, H, W, d_model)
             board_grid = board.reshape((batch, height, width, -1))
             # Reorder to (B, W, H, d_model) so each column's H cells are flat.
             per_col = jnp.transpose(board_grid, (0, 2, 1, 3))
             per_col = per_col.reshape((batch, width, height * board_grid.shape[-1]))
-            policy_logits = self.policy_head_col(per_col).reshape((batch, width))
+            policy_logits = self.policy_head(per_col).reshape((batch, width))
         else:
-            policy_logits = self.policy_head_flat(board.reshape((batch, -1)))
+            policy_logits = self.policy_head(board.reshape((batch, -1)))
 
         # --- Value head: read cls when available, else mean-pool board ---
         value_src = cls_out if cls_out is not None else jnp.mean(board, axis=1)
