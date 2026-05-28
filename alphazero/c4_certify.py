@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 from collections.abc import Callable, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -681,6 +683,86 @@ def load_eval_set(path: str | Path) -> list[ConnectFourState]:
     ]
 
 
+def _certify_chunk_worker(
+    payload: tuple[str, int, int, int, list[ConnectFourState]],
+) -> tuple[int, int, list[PositionCertification]]:
+    """Worker entrypoint: build an agent and certify one chunk of positions.
+
+    Runs in a spawned subprocess (JAX/XLA does not survive ``fork``), so each
+    worker initializes JAX and loads the checkpoint independently. Returns the
+    raw counts + records so the parent can merge and aggregate once.
+    """
+    checkpoint, sims, seed, solver_max_nodes, chunk = payload
+    agent = JaxMCTSAgent.from_checkpoint(checkpoint, sims=sims, seed=seed)
+    report = certify_connect_four(
+        agent,
+        positions=chunk,
+        seed=seed,
+        solver_max_nodes=solver_max_nodes,
+    )
+    return report.sampled_positions, report.skipped_positions, list(report.records)
+
+
+def certify_checkpoint(
+    checkpoint: str | Path,
+    positions: Sequence[ConnectFourState],
+    *,
+    sims: int = DEFAULT_SIMS,
+    seed: int = 0,
+    solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
+    workers: int = 1,
+) -> CertificationReport:
+    """Certify ``checkpoint`` on a fixed ``positions`` list, optionally parallel.
+
+    The certifier is solver-bound (pure-Python alpha-beta, GIL-locked) and loops
+    positions sequentially, so a single process pins ~1 core. With ``workers>1``
+    the positions are split into contiguous chunks across a spawned process pool
+    for near-linear speedup on many-core hosts. Per-position MCTS RNG is seeded
+    from the board state, so the merged result is identical to ``workers=1``.
+    """
+    if workers <= 1:
+        agent = JaxMCTSAgent.from_checkpoint(checkpoint, sims=sims, seed=seed)
+        return certify_connect_four(
+            agent,
+            positions=positions,
+            seed=seed,
+            solver_max_nodes=solver_max_nodes,
+        )
+
+    positions = list(positions)
+    n_workers = min(workers, len(positions)) or 1
+    # Round-robin (strided) chunks load-balance solve difficulty across workers
+    # (openings vs deep midgame positions get spread out rather than piled into
+    # one chunk). Record order in the merge differs from serial, but every
+    # aggregate metric is order-independent so as_dict() is identical.
+    chunks: list[list[ConnectFourState]] = [
+        positions[i::n_workers] for i in range(n_workers)
+    ]
+    payloads = [
+        (str(checkpoint), sims, seed, solver_max_nodes, chunk)
+        for chunk in chunks
+        if chunk
+    ]
+
+    sampled_total = 0
+    skipped_total = 0
+    records: list[PositionCertification] = []
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as pool:
+        for sampled, skipped, chunk_records in pool.map(
+            _certify_chunk_worker, payloads
+        ):
+            sampled_total += sampled
+            skipped_total += skipped
+            records.extend(chunk_records)
+
+    return _report(
+        sampled_positions=sampled_total,
+        skipped_positions=skipped_total,
+        records=records,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Certify a Connect Four checkpoint against exact solver labels."
@@ -705,6 +787,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Build a fixed position set from --sample-size/--seed, save to this "
         "path, and exit (no checkpoint needed).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Certify positions across this many spawned worker processes. The "
+        "solver is single-threaded per process, so >1 gives near-linear speedup "
+        "on many-core hosts. Results are identical to --workers 1.",
+    )
     args = parser.parse_args(argv)
 
     if args.build_eval_set is not None:
@@ -728,19 +818,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.checkpoint is None:
         parser.error("--checkpoint is required unless --build-eval-set is given")
 
-    positions = load_eval_set(args.eval_set) if args.eval_set is not None else None
-    agent = JaxMCTSAgent.from_checkpoint(
+    # Resolve a concrete position list up front (so it can be split across
+    # workers and is identical across runs / worker counts).
+    if args.eval_set is not None:
+        positions = load_eval_set(args.eval_set)
+    else:
+        positions = sample_positions(
+            sample_size=args.sample_size,
+            seed=args.seed,
+            opening_depth=args.opening_depth,
+        )
+    report = certify_checkpoint(
         args.checkpoint,
+        positions,
         sims=args.sims,
         seed=args.seed,
-    )
-    report = certify_connect_four(
-        agent,
-        sample_size=args.sample_size,
-        seed=args.seed,
         solver_max_nodes=args.solver_max_nodes,
-        opening_depth=args.opening_depth,
-        positions=positions,
+        workers=args.workers,
     )
     print(json.dumps(report.as_dict(), sort_keys=True))
     return 0

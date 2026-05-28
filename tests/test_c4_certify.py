@@ -292,6 +292,28 @@ def test_build_eval_set_cli_creates_loadable_file(tmp_path) -> None:
     assert len(load_eval_set(path)) == 5
 
 
+def test_parallel_certify_matches_serial(tmp_path) -> None:
+    """certify_checkpoint(workers>1) must yield identical aggregates to serial.
+
+    Per-position MCTS RNG is seeded from the board state, so splitting positions
+    across workers cannot change any per-position result — only wall-clock. The
+    merged report's as_dict() (all order-independent aggregates) must match.
+    """
+    from alphazero.c4_certify import certify_checkpoint
+
+    config = AlphaZeroNetConfig(
+        obs_shape=(6, 7, 2), action_size=7, channels=4, num_res_blocks=0
+    )
+    checkpoint = tmp_path / "jaxzero.msgpack"
+    save_checkpoint(create_model(config, seed=0), checkpoint)
+    positions = sample_positions(sample_size=12, seed=3)
+
+    serial = certify_checkpoint(checkpoint, positions, sims=1, seed=0, workers=1)
+    parallel = certify_checkpoint(checkpoint, positions, sims=1, seed=0, workers=4)
+
+    assert parallel.as_dict() == serial.as_dict()
+
+
 def test_c4_certify_imports_do_not_load_torch() -> None:
     code = "import sys, alphazero.c4_certify; raise SystemExit('torch' in sys.modules)"
     completed = subprocess.run(
