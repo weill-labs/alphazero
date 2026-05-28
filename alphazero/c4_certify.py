@@ -241,6 +241,37 @@ def certify_connect_four(
     )
 
 
+def make_solver_evaluator(
+    *,
+    sample_size: int = 8,
+    sims: int = 64,
+    seed: int = 0,
+    solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
+) -> Callable[[AlphaZeroNet], dict[str, float]]:
+    """Return a callback that certifies a JAX model against the solver inline.
+
+    Used by training loops to log live ``eval/c4_blunder_rate`` + ``eval/c4_policy_match``
+    alongside loss — the solver-anchored strength signal (cf. vs-random which
+    saturates). The seed is fixed so the position sample is identical across
+    iterations, making the curve comparable across training.
+    """
+
+    def run(model: AlphaZeroNet) -> dict[str, float]:
+        agent = JaxMCTSAgent(model, sims=sims, seed=seed)
+        report = certify_connect_four(
+            agent,
+            sample_size=sample_size,
+            seed=seed,
+            solver_max_nodes=solver_max_nodes,
+        )
+        return {
+            "eval/c4_blunder_rate": float(report.blunder_rate),
+            "eval/c4_policy_match": float(report.policy_match_percent) / 100.0,
+        }
+
+    return run
+
+
 def solver_state_to_pgx_state(state: ConnectFourState) -> PgxConnectFourState:
     """Convert the solver's immutable board state to a pgx Connect Four state."""
 

@@ -229,6 +229,25 @@ def test_run_training_with_replay_buffer_runs() -> None:
     assert all(jnp.isfinite(m["loss"]) for m in result.metrics)
 
 
+def test_run_training_extra_evaluator_merges_metrics() -> None:
+    config = replace(
+        _tiny_training_config(), iterations=2, eval_interval=1, eval_games=4
+    )
+    logged: list[dict[str, float | int]] = []
+    call_count = [0]
+
+    def fake_extra(model) -> dict[str, float]:
+        call_count[0] += 1
+        return {"eval/c4_blunder_rate": 0.123, "eval/c4_policy_match": 0.877}
+
+    run_training(config, on_iteration=logged.append, extra_evaluator=fake_extra)
+
+    assert call_count[0] == 2  # called every eval_interval=1 iteration
+    for metrics in logged:
+        assert metrics["eval/c4_blunder_rate"] == 0.123
+        assert metrics["eval/c4_policy_match"] == 0.877
+
+
 def test_jaxzero_imports_do_not_load_torch() -> None:
     code = (
         "import sys, jaxzero, jaxzero.train; raise SystemExit('torch' in sys.modules)"
