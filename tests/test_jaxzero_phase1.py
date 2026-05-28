@@ -49,6 +49,26 @@ def _tree_leaves(params):
     return jax.tree.leaves(nnx.to_pure_dict(params))
 
 
+def test_residual_block_has_layernorm() -> None:
+    """ResidualBlock uses pre-LN so the tower is stable at higher learning rates.
+
+    Removing LN destabilizes lr 5e-3 (the unnormalized tower collapses to uniform
+    output); guard against accidental removal.
+    """
+    env = make_env()
+    config = AlphaZeroNetConfig(
+        obs_shape=initial_observation_shape(),
+        action_size=env.num_actions,
+        channels=4,
+        num_res_blocks=2,
+    )
+    model = create_model(config, seed=0)
+
+    for block in model.blocks:
+        assert isinstance(block.norm1, nnx.LayerNorm)
+        assert isinstance(block.norm2, nnx.LayerNorm)
+
+
 def test_nnx_net_forward_matches_contract() -> None:
     env = make_env()
     config = AlphaZeroNetConfig(

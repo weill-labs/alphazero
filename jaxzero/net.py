@@ -61,9 +61,15 @@ class AlphaZeroNetConfig:
 
 
 class ResidualBlock(nnx.Module):
-    """Two-convolution residual block with ReLU activations."""
+    """Pre-LN residual block: LN -> conv -> ReLU -> LN -> conv -> (+residual) -> ReLU.
+
+    LayerNorm is applied per-spatial-cell over the channel axis (NHWC, last axis),
+    so there is no train/eval batch-statistic skew (unlike BatchNorm). Pre-LN
+    placement is what makes higher learning rates and deeper towers stable.
+    """
 
     def __init__(self, channels: int, *, rngs: nnx.Rngs) -> None:
+        self.norm1 = nnx.LayerNorm(channels, rngs=rngs)
         self.conv1 = nnx.Conv(
             channels,
             channels,
@@ -71,6 +77,7 @@ class ResidualBlock(nnx.Module):
             padding="SAME",
             rngs=rngs,
         )
+        self.norm2 = nnx.LayerNorm(channels, rngs=rngs)
         self.conv2 = nnx.Conv(
             channels,
             channels,
@@ -81,8 +88,8 @@ class ResidualBlock(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         residual = x
-        x = jax.nn.relu(self.conv1(x))
-        x = self.conv2(x)
+        x = jax.nn.relu(self.conv1(self.norm1(x)))
+        x = self.conv2(self.norm2(x))
         return jax.nn.relu(x + residual)
 
 
