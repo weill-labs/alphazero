@@ -172,6 +172,25 @@ def test_checkpoint_every_writes_loadable_periodic_checkpoints(tmp_path) -> None
     load_checkpoint(str(tmp_path / "iter_0002.msgpack"))  # mid-run checkpoint loads
 
 
+def test_eval_interval_logs_vs_random_metrics() -> None:
+    config = replace(
+        _tiny_training_config(), iterations=2, eval_interval=1, eval_games=4
+    )
+    logged: list[dict[str, float | int]] = []
+    run_training(config, on_iteration=logged.append)
+
+    assert len(logged) == 2
+    for metrics in logged:
+        assert "eval/vs_random_win_rate" in metrics
+        rates = (
+            metrics["eval/vs_random_win_rate"],
+            metrics["eval/vs_random_draw_rate"],
+            metrics["eval/vs_random_loss_rate"],
+        )
+        assert all(0.0 <= r <= 1.0 for r in rates)
+        assert abs(sum(rates) - 1.0) < 1e-6
+
+
 def test_jaxzero_imports_do_not_load_torch() -> None:
     code = (
         "import sys, jaxzero, jaxzero.train; raise SystemExit('torch' in sys.modules)"

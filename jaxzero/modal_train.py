@@ -156,6 +156,8 @@ else:
         minibatch_size: int = 1024,
         init_checkpoint: str | None = None,
         checkpoint_every: int | None = None,
+        eval_interval: int | None = None,
+        eval_games: int = 64,
         seed: int = 0,
         requested_gpu: str = _DEFAULT_GPU,
     ) -> dict[str, object]:
@@ -174,6 +176,8 @@ else:
             "minibatch_size": minibatch_size,
             "init_checkpoint": init_checkpoint,
             "checkpoint_every": checkpoint_every,
+            "eval_interval": eval_interval,
+            "eval_games": eval_games,
             "seed": seed,
             "requested_gpu": requested_gpu,
         }
@@ -211,6 +215,8 @@ else:
                     minibatch_size=minibatch_size,
                     init_checkpoint=init_checkpoint,
                     checkpoint_every=checkpoint_every,
+                    eval_interval=eval_interval,
+                    eval_games=eval_games,
                     seed=seed,
                     checkpoint_path=checkpoint_path,
                 ),
@@ -252,6 +258,8 @@ else:
         minibatch_size: int = 1024,
         init_checkpoint: str | None = None,
         checkpoint_every: int | None = None,
+        eval_interval: int | None = None,
+        eval_games: int = 64,
         seed: int = 0,
         gpu: str = _DEFAULT_GPU,
     ) -> None:
@@ -270,6 +278,8 @@ else:
             minibatch_size=minibatch_size,
             init_checkpoint=init_checkpoint,
             checkpoint_every=checkpoint_every,
+            eval_interval=eval_interval,
+            eval_games=eval_games,
             seed=seed,
             requested_gpu=gpu,
         )

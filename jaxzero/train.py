@@ -12,6 +12,7 @@ import msgpack
 import optax
 from flax import nnx, serialization
 
+from jaxzero.evaluate import make_evaluator, vs_random_metrics
 from jaxzero.net import AlphaZeroNet, AlphaZeroNetConfig, apply_model, create_model
 from jaxzero.selfplay import (
     SelfPlayConfig,
@@ -39,6 +40,8 @@ class TrainingConfig:
     checkpoint_path: str | None = None
     checkpoint_every: int | None = None
     init_checkpoint: str | None = None
+    eval_interval: int | None = None
+    eval_games: int = 64
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -52,6 +55,12 @@ class TrainingConfig:
             raise ValueError(msg)
         if self.checkpoint_every is not None and self.checkpoint_every <= 0:
             msg = "checkpoint_every must be positive when set"
+            raise ValueError(msg)
+        if self.eval_interval is not None and self.eval_interval <= 0:
+            msg = "eval_interval must be positive when set"
+            raise ValueError(msg)
+        if self.eval_games <= 0:
+            msg = "eval_games must be positive"
             raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
@@ -220,6 +229,13 @@ def run_training(
     tx = optax.adam(config.learning_rate)
     opt_state = tx.init(params)
     update_step = make_update_step(graphdef, tx)
+    evaluator = (
+        make_evaluator(
+            graphdef, num_games=config.eval_games, max_steps=config.max_steps
+        )
+        if config.eval_interval is not None
+        else None
+    )
 
     key = jax.random.PRNGKey(config.seed)
     history: list[dict[str, float | int]] = []
@@ -230,6 +246,9 @@ def run_training(
             update_step, params, opt_state, data, config.minibatch_size, shuffle_key
         )
         host_metrics = _host_metrics(metrics, iteration=iteration)
+        if evaluator is not None and (iteration + 1) % config.eval_interval == 0:
+            key, eval_key = jax.random.split(key)
+            host_metrics.update(vs_random_metrics(evaluator(params, eval_key)))
         history.append(host_metrics)
         if on_iteration is not None:
             on_iteration(host_metrics)

@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="init_checkpoint",
         help="warm-start training from this checkpoint instead of random init",
     )
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        help="log vs-random win/draw/loss rates every N iterations",
+    )
+    parser.add_argument("--eval-games", type=int, default=64)
     return parser
 
 
@@ -52,6 +58,8 @@ def main(argv: list[str] | None = None) -> None:
         checkpoint_path=args.checkpoint_path,
         checkpoint_every=args.checkpoint_every,
         init_checkpoint=args.init_checkpoint,
+        eval_interval=args.eval_interval,
+        eval_games=args.eval_games,
     )
     result = run_training(config)
     for metrics in result.metrics:
