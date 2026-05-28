@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 from collections.abc import Callable, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -25,7 +27,7 @@ from flax import nnx
 from pgx.connect_four import GameState as PgxGameState
 from pgx.connect_four import State as PgxConnectFourState
 
-from alphazero.c4_solver import NodeBudgetExceeded, solve
+from alphazero.c4_solver import NodeBudgetExceeded, solve, solve_with_score
 from alphazero.games.connectfour import ConnectFour, ConnectFourState
 from jaxzero.net import AlphaZeroNet, apply_model
 from jaxzero.train import load_checkpoint as load_jax_checkpoint
@@ -132,7 +134,20 @@ class PositionCertification:
     agent_value: float
     agent_outcome: int
     policy_match: bool
+    # ``blunder`` is the weak/outcome definition: the agent's move changed the
+    # game-theoretic W/D/L result. ``score_blunder`` is the strong definition:
+    # the agent's move was not score-optimal (includes winning slower than the
+    # fastest forced win). strong >= weak always. This mirrors the two modes in
+    # the AlphaZero.jl / Prasad benchmarks (weak ~0.24% err, strong ~3% err).
     blunder: bool
+    score_blunder: bool
+    # Per-move regret against the exact solver, both >= 0 (optimal is best).
+    # ``score_regret`` is in raw Pons-score units (penalizes slower wins / faster
+    # losses, even within the same W/D/L tier). ``wdl_regret`` collapses to
+    # outcome tiers {0,1,2}: 0 preserves the result, 1 downgrades one tier
+    # (win->draw or draw->loss), 2 is catastrophic (win->loss).
+    score_regret: int
+    wdl_regret: int
 
 
 @dataclass(frozen=True)
@@ -146,6 +161,16 @@ class CertificationReport:
     blunder_rate: float
     value_mae: float
     solved: bool
+    # ``blunder_rate`` is the weak/outcome rate (fraction whose W/D/L result
+    # changed). ``score_blunder_rate`` is the strong rate (fraction that were
+    # not score-optimal, including slower-than-fastest wins) and is always
+    # >= blunder_rate. The mean-regret aggregates are the preferred run-vs-run
+    # comparison metrics: continuous and severity-aware, so far lower variance
+    # than either binary rate.
+    score_blunders: int
+    score_blunder_rate: float
+    mean_wdl_regret: float
+    mean_score_regret: float
     records: tuple[PositionCertification, ...]
 
     def as_dict(self) -> dict[str, bool | float | int]:
@@ -159,6 +184,10 @@ class CertificationReport:
             "blunder_rate": self.blunder_rate,
             "value_mae": self.value_mae,
             "solved": self.solved,
+            "score_blunders": self.score_blunders,
+            "score_blunder_rate": self.score_blunder_rate,
+            "mean_wdl_regret": self.mean_wdl_regret,
+            "mean_score_regret": self.mean_score_regret,
         }
 
 
@@ -198,7 +227,9 @@ def certify_connect_four(
             continue
 
         try:
-            solver_value, optimal_moves = solve(state, max_nodes=solver_max_nodes)
+            solver_value, optimal_moves, solver_score = solve_with_score(
+                state, max_nodes=solver_max_nodes
+            )
         except NodeBudgetExceeded:
             skipped_positions += 1
             continue
@@ -211,7 +242,7 @@ def certify_connect_four(
             raise ValueError(f"agent selected illegal action {agent_move}")
 
         try:
-            child_value, _ = solve(
+            child_value, _, child_score = solve_with_score(
                 c4.apply_move(state, agent_move),
                 max_nodes=solver_max_nodes,
             )
@@ -220,8 +251,16 @@ def certify_connect_four(
             continue
 
         agent_value = agent.value(state)
+        # Negamax: the agent's outcome (mover perspective) is the negation of
+        # the resulting child position's value/score (opponent perspective).
         agent_outcome = -child_value
+        agent_score = -child_score
         policy_match = agent_move in optimal_moves
+        # Optimal is by definition the best achievable, so both regrets are >= 0.
+        score_regret = solver_score - agent_score
+        # sign() maps each value to its W/D/L tier in {-1, 0, +1}; since
+        # agent_outcome <= solver_value, the tier difference is in {0, 1, 2}.
+        wdl_regret = int(np.sign(solver_value)) - int(np.sign(agent_outcome))
         records.append(
             PositionCertification(
                 solver_value=solver_value,
@@ -231,6 +270,9 @@ def certify_connect_four(
                 agent_outcome=agent_outcome,
                 policy_match=policy_match,
                 blunder=agent_outcome < solver_value,
+                score_blunder=score_regret > 0,
+                score_regret=score_regret,
+                wdl_regret=wdl_regret,
             )
         )
 
@@ -272,6 +314,11 @@ def make_solver_evaluator(
             "eval/c4_blunder_rate": float(report.blunder_rate),
             "eval/c4_policy_match": float(report.policy_match_percent) / 100.0,
             "eval/c4_value_mae": float(report.value_mae),
+            # Lower-variance, severity-aware signals for run-vs-run comparison.
+            "eval/c4_wdl_regret": float(report.mean_wdl_regret),
+            "eval/c4_score_regret": float(report.mean_score_regret),
+            # Strong-mode rate (non-score-optimal, incl. slower wins) >= weak.
+            "eval/c4_score_blunder_rate": float(report.score_blunder_rate),
         }
 
     return run
@@ -508,6 +555,7 @@ def _report(
     evaluated_positions = len(records)
     policy_matches = sum(1 for record in records if record.policy_match)
     blunders = sum(1 for record in records if record.blunder)
+    score_blunders = sum(1 for record in records if record.score_blunder)
     value_errors = [
         abs(float(record.agent_value) - float(record.solver_value))
         for record in records
@@ -517,6 +565,15 @@ def _report(
         100.0 * policy_matches / evaluated_positions if evaluated_positions else 0.0
     )
     blunder_rate = blunders / evaluated_positions if evaluated_positions else 0.0
+    score_blunder_rate = (
+        score_blunders / evaluated_positions if evaluated_positions else 0.0
+    )
+    mean_wdl_regret = (
+        float(np.mean([record.wdl_regret for record in records])) if records else 0.0
+    )
+    mean_score_regret = (
+        float(np.mean([record.score_regret for record in records])) if records else 0.0
+    )
     return CertificationReport(
         sampled_positions=sampled_positions,
         evaluated_positions=evaluated_positions,
@@ -527,6 +584,10 @@ def _report(
         blunder_rate=blunder_rate,
         value_mae=value_mae,
         solved=evaluated_positions > 0 and blunder_rate == 0.0,
+        score_blunders=score_blunders,
+        score_blunder_rate=score_blunder_rate,
+        mean_wdl_regret=mean_wdl_regret,
+        mean_score_regret=mean_score_regret,
         records=tuple(records),
     )
 
@@ -591,11 +652,122 @@ def _validate_positive(name: str, value: int) -> None:
         raise ValueError(f"{name} must be positive")
 
 
+def save_eval_set(positions: Sequence[ConnectFourState], path: str | Path) -> None:
+    """Serialize a fixed position set to JSON for paired run-vs-run comparison.
+
+    Using one frozen set across every run makes comparisons paired (the position
+    draw is no longer a between-run variable), which is far more statistically
+    powerful than each run sampling its own positions.
+    """
+    payload = {
+        "version": 1,
+        "positions": [
+            {"board": [list(row) for row in state.board], "player": int(state.player)}
+            for state in positions
+        ],
+    }
+    Path(path).write_text(json.dumps(payload))
+
+
+def load_eval_set(path: str | Path) -> list[ConnectFourState]:
+    """Load a fixed position set saved by :func:`save_eval_set`."""
+    payload = json.loads(Path(path).read_text())
+    if int(payload.get("version", 0)) != 1:
+        raise ValueError(f"unsupported eval-set version {payload.get('version')!r}")
+    return [
+        ConnectFourState(
+            board=tuple(tuple(int(cell) for cell in row) for row in entry["board"]),
+            player=int(entry["player"]),
+        )
+        for entry in payload["positions"]
+    ]
+
+
+def _certify_chunk_worker(
+    payload: tuple[str, int, int, int, list[ConnectFourState]],
+) -> tuple[int, int, list[PositionCertification]]:
+    """Worker entrypoint: build an agent and certify one chunk of positions.
+
+    Runs in a spawned subprocess (JAX/XLA does not survive ``fork``), so each
+    worker initializes JAX and loads the checkpoint independently. Returns the
+    raw counts + records so the parent can merge and aggregate once.
+    """
+    checkpoint, sims, seed, solver_max_nodes, chunk = payload
+    agent = JaxMCTSAgent.from_checkpoint(checkpoint, sims=sims, seed=seed)
+    report = certify_connect_four(
+        agent,
+        positions=chunk,
+        seed=seed,
+        solver_max_nodes=solver_max_nodes,
+    )
+    return report.sampled_positions, report.skipped_positions, list(report.records)
+
+
+def certify_checkpoint(
+    checkpoint: str | Path,
+    positions: Sequence[ConnectFourState],
+    *,
+    sims: int = DEFAULT_SIMS,
+    seed: int = 0,
+    solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
+    workers: int = 1,
+) -> CertificationReport:
+    """Certify ``checkpoint`` on a fixed ``positions`` list, optionally parallel.
+
+    The certifier is solver-bound (pure-Python alpha-beta, GIL-locked) and loops
+    positions sequentially, so a single process pins ~1 core. With ``workers>1``
+    the positions are split into contiguous chunks across a spawned process pool
+    for near-linear speedup on many-core hosts. Per-position MCTS RNG is seeded
+    from the board state, so the merged result is identical to ``workers=1``.
+    """
+    if workers <= 1:
+        agent = JaxMCTSAgent.from_checkpoint(checkpoint, sims=sims, seed=seed)
+        return certify_connect_four(
+            agent,
+            positions=positions,
+            seed=seed,
+            solver_max_nodes=solver_max_nodes,
+        )
+
+    positions = list(positions)
+    n_workers = min(workers, len(positions)) or 1
+    # Round-robin (strided) chunks load-balance solve difficulty across workers
+    # (openings vs deep midgame positions get spread out rather than piled into
+    # one chunk). Record order in the merge differs from serial, but every
+    # aggregate metric is order-independent so as_dict() is identical.
+    chunks: list[list[ConnectFourState]] = [
+        positions[i::n_workers] for i in range(n_workers)
+    ]
+    payloads = [
+        (str(checkpoint), sims, seed, solver_max_nodes, chunk)
+        for chunk in chunks
+        if chunk
+    ]
+
+    sampled_total = 0
+    skipped_total = 0
+    records: list[PositionCertification] = []
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as pool:
+        for sampled, skipped, chunk_records in pool.map(
+            _certify_chunk_worker, payloads
+        ):
+            sampled_total += sampled
+            skipped_total += skipped
+            records.extend(chunk_records)
+
+    return _report(
+        sampled_positions=sampled_total,
+        skipped_positions=skipped_total,
+        records=records,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Certify a Connect Four checkpoint against exact solver labels."
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
     parser.add_argument("--sims", type=int, default=DEFAULT_SIMS)
     parser.add_argument("--seed", type=int, default=0)
@@ -603,19 +775,66 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--solver-max-nodes", type=int, default=DEFAULT_SOLVER_MAX_NODES
     )
     parser.add_argument("--opening-depth", type=int, default=DEFAULT_OPENING_DEPTH)
+    parser.add_argument(
+        "--eval-set",
+        type=Path,
+        help="Cert on a fixed position set saved by --build-eval-set instead of "
+        "sampling. Makes run-vs-run comparison paired (same positions every run).",
+    )
+    parser.add_argument(
+        "--build-eval-set",
+        type=Path,
+        help="Build a fixed position set from --sample-size/--seed, save to this "
+        "path, and exit (no checkpoint needed).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Certify positions across this many spawned worker processes. The "
+        "solver is single-threaded per process, so >1 gives near-linear speedup "
+        "on many-core hosts. Results are identical to --workers 1.",
+    )
     args = parser.parse_args(argv)
 
-    agent = JaxMCTSAgent.from_checkpoint(
+    if args.build_eval_set is not None:
+        positions = sample_positions(
+            sample_size=args.sample_size,
+            seed=args.seed,
+            opening_depth=args.opening_depth,
+        )
+        save_eval_set(positions, args.build_eval_set)
+        print(
+            json.dumps(
+                {
+                    "built_eval_set": str(args.build_eval_set),
+                    "positions": len(positions),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.checkpoint is None:
+        parser.error("--checkpoint is required unless --build-eval-set is given")
+
+    # Resolve a concrete position list up front (so it can be split across
+    # workers and is identical across runs / worker counts).
+    if args.eval_set is not None:
+        positions = load_eval_set(args.eval_set)
+    else:
+        positions = sample_positions(
+            sample_size=args.sample_size,
+            seed=args.seed,
+            opening_depth=args.opening_depth,
+        )
+    report = certify_checkpoint(
         args.checkpoint,
+        positions,
         sims=args.sims,
         seed=args.seed,
-    )
-    report = certify_connect_four(
-        agent,
-        sample_size=args.sample_size,
-        seed=args.seed,
         solver_max_nodes=args.solver_max_nodes,
-        opening_depth=args.opening_depth,
+        workers=args.workers,
     )
     print(json.dumps(report.as_dict(), sort_keys=True))
     return 0

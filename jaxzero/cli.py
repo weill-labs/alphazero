@@ -103,6 +103,63 @@ def build_parser() -> argparse.ArgumentParser:
         "disable.",
     )
     parser.add_argument("--eval-sims", type=int, default=64)
+    parser.add_argument(
+        "--arch",
+        choices=("resnet", "transformer"),
+        default="resnet",
+        help="Network tower: 'resnet' (default, uses --channels/--num-res-blocks) "
+        "or 'transformer' (uses --d-model/--num-layers/--num-heads/--mlp-dim).",
+    )
+    parser.add_argument(
+        "--d-model",
+        type=int,
+        default=128,
+        help="Transformer embedding/token dimension. Ignored when --arch resnet.",
+    )
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=6,
+        help="Number of transformer blocks. Ignored when --arch resnet.",
+    )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads (must divide --d-model). "
+        "Ignored when --arch resnet.",
+    )
+    parser.add_argument(
+        "--mlp-dim",
+        type=int,
+        default=512,
+        help="Transformer per-block MLP hidden dim. Ignored when --arch resnet.",
+    )
+    parser.add_argument(
+        "--use-value-cls-token",
+        action="store_true",
+        help="Transformer Tier 1: prepend a learnable cls token to the board "
+        "sequence; value head reads the cls token only (vs the v1 mean-pool "
+        "value head). Fixes the value_mae plateau observed in alphago-6xn.",
+    )
+    parser.add_argument(
+        "--policy-head-style",
+        choices=("flatten", "per_column"),
+        default="flatten",
+        help="Transformer Tier 1: 'flatten' (v1: Linear(H*W*d_model -> action)) "
+        "or 'per_column' (shared Linear over each column's H cells -> 1 logit "
+        "per column, requires action_size == width). Per-column has stronger "
+        "C4 inductive bias and fewer params.",
+    )
+    parser.add_argument(
+        "--input-embed-style",
+        choices=("linear", "conv3x3"),
+        default="linear",
+        help="Transformer Tier 1: 'linear' (v1: Linear(planes -> d_model) per "
+        "cell) or 'conv3x3' (3x3 conv patch embedding before tokenization, "
+        "AlphaViT style). Conv gives each cell a local receptive field before "
+        "self-attention sees the tokens.",
+    )
     return parser
 
 
@@ -130,6 +187,14 @@ def main(argv: list[str] | None = None) -> None:
         value_loss_weight=args.value_loss_weight,
         mirror_augment=args.mirror_augment,
         weight_decay=args.weight_decay,
+        arch=args.arch,
+        d_model=args.d_model,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        mlp_dim=args.mlp_dim,
+        use_value_cls_token=args.use_value_cls_token,
+        policy_head_style=args.policy_head_style,
+        input_embed_style=args.input_embed_style,
     )
     extra_evaluator = None
     if args.solver_eval_positions > 0:

@@ -313,21 +313,3 @@ driven from baseline 0.082 to 0.036 (z=+2.16) across 29 Modal A100 runs.
   different JSONL schema (drops `_type`, `*_count`, etc). Mixing the two
   tools produces large format-noise diffs.
 
----
-
-## UBS Quick Reference
-
-**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
-
-```bash
-ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
-ubs $(git diff --name-only --cached)    # Staged files — before commit
-ubs .                                   # Whole project
-```
-
-**Speed Critical:** Scope to changed files. `ubs src/file.ts` (< 1s) vs `ubs .` (30s).
-
-**Bug Severity:**
-- **Critical** (always fix): Null safety, XSS/injection, async/await, memory leaks
-- **Important** (production): Type narrowing, division-by-zero, resource leaks
-- **Contextual** (judgment): TODO/FIXME, console logs

@@ -14,7 +14,16 @@ from flax import nnx, serialization
 
 from jaxzero.arena import gating_summary, make_gating_match, update_elo
 from jaxzero.evaluate import make_evaluator, vs_random_metrics
-from jaxzero.net import AlphaZeroNet, AlphaZeroNetConfig, apply_model, create_model
+from jaxzero.net import (
+    ARCH_RESNET,
+    ARCH_TRANSFORMER,
+    INPUT_EMBED_LINEAR,
+    POLICY_HEAD_FLATTEN,
+    AlphaZeroNetConfig,
+    Net,
+    apply_model,
+    create_model,
+)
 from jaxzero.selfplay import (
     SelfPlayConfig,
     SelfPlayData,
@@ -51,6 +60,14 @@ class TrainingConfig:
     value_loss_weight: float = 1.0
     mirror_augment: bool = False
     weight_decay: float = 0.0
+    arch: str = ARCH_RESNET
+    d_model: int = 128
+    num_layers: int = 6
+    num_heads: int = 4
+    mlp_dim: int = 512
+    use_value_cls_token: bool = False
+    policy_head_style: str = POLICY_HEAD_FLATTEN
+    input_embed_style: str = INPUT_EMBED_LINEAR
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -103,6 +120,14 @@ class TrainingConfig:
             action_size=make_env().num_actions,
             channels=self.channels,
             num_res_blocks=self.num_res_blocks,
+            arch=self.arch,
+            d_model=self.d_model,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            mlp_dim=self.mlp_dim,
+            use_value_cls_token=self.use_value_cls_token,
+            policy_head_style=self.policy_head_style,
+            input_embed_style=self.input_embed_style,
         )
 
 
@@ -122,11 +147,19 @@ def build_net_config(config: TrainingConfig) -> AlphaZeroNetConfig:
         action_size=env.num_actions,
         channels=config.channels,
         num_res_blocks=config.num_res_blocks,
+        arch=config.arch,
+        d_model=config.d_model,
+        num_layers=config.num_layers,
+        num_heads=config.num_heads,
+        mlp_dim=config.mlp_dim,
+        use_value_cls_token=config.use_value_cls_token,
+        policy_head_style=config.policy_head_style,
+        input_embed_style=config.input_embed_style,
     )
 
 
 def _loss(
-    graphdef: nnx.GraphDef[AlphaZeroNet],
+    graphdef: nnx.GraphDef[Net],
     params: nnx.State,
     batch: SelfPlayData,
     *,
@@ -159,7 +192,7 @@ def _loss(
 
 
 def make_update_step(
-    graphdef: nnx.GraphDef[AlphaZeroNet],
+    graphdef: nnx.GraphDef[Net],
     tx: optax.GradientTransformation,
     *,
     value_loss_weight: float = 1.0,
@@ -259,7 +292,7 @@ def run_training(
     *,
     on_iteration: Callable[[dict[str, float | int]], None] | None = None,
     on_checkpoint: Callable[[str], None] | None = None,
-    extra_evaluator: Callable[[AlphaZeroNet], dict[str, float]] | None = None,
+    extra_evaluator: Callable[[Net], dict[str, float]] | None = None,
 ) -> TrainingResult:
     """Run buffer-free self-play/training for ``config.iterations``.
 
@@ -409,7 +442,7 @@ def run_training(
     )
 
 
-def save_checkpoint(model: AlphaZeroNet, path: str | Path) -> None:
+def save_checkpoint(model: Net, path: str | Path) -> None:
     """Save a single-file checkpoint containing config and NNX params."""
 
     checkpoint_path = Path(path)
@@ -422,7 +455,7 @@ def save_checkpoint(model: AlphaZeroNet, path: str | Path) -> None:
     checkpoint_path.write_bytes(msgpack.packb(payload, use_bin_type=True))
 
 
-def load_checkpoint(path: str | Path) -> AlphaZeroNet:
+def load_checkpoint(path: str | Path) -> Net:
     """Load a model from a checkpoint created by :func:`save_checkpoint`."""
 
     payload = msgpack.unpackb(Path(path).read_bytes(), raw=False)
