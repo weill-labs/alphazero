@@ -152,6 +152,35 @@ def test_jax_mcts_agent_loads_checkpoint_and_selects_legal_move(tmp_path) -> Non
     assert np.isfinite(value)
 
 
+def test_make_solver_evaluator_returns_blunder_policy_and_value_mae_keys(
+    tmp_path,
+) -> None:
+    """The inline solver-anchored evaluator must surface all three signals
+    so wandb captures the headline (blunder rate) AND the diagnosed
+    bottleneck (value MAE) AND the policy-match metric per iteration."""
+    from alphazero.c4_certify import make_solver_evaluator
+    from jaxzero.train import load_checkpoint, save_checkpoint
+
+    config = AlphaZeroNetConfig(
+        obs_shape=(6, 7, 2), action_size=7, channels=4, num_res_blocks=0
+    )
+    checkpoint = tmp_path / "jaxzero.msgpack"
+    save_checkpoint(create_model(config, seed=0), checkpoint)
+    model = load_checkpoint(checkpoint)
+
+    evaluator = make_solver_evaluator(sample_size=4, sims=1, seed=0)
+    metrics = evaluator(model)
+
+    assert set(metrics) == {
+        "eval/c4_blunder_rate",
+        "eval/c4_policy_match",
+        "eval/c4_value_mae",
+    }
+    assert 0.0 <= metrics["eval/c4_blunder_rate"] <= 1.0
+    assert 0.0 <= metrics["eval/c4_policy_match"] <= 1.0
+    assert metrics["eval/c4_value_mae"] >= 0.0  # MAE is non-negative
+
+
 def test_c4_certify_imports_do_not_load_torch() -> None:
     code = "import sys, alphazero.c4_certify; raise SystemExit('torch' in sys.modules)"
     completed = subprocess.run(
