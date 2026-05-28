@@ -153,6 +153,25 @@ def test_init_checkpoint_warm_starts_from_saved_net(tmp_path) -> None:
     assert result.net_config.channels == 4
 
 
+def test_checkpoint_every_writes_loadable_periodic_checkpoints(tmp_path) -> None:
+    final = tmp_path / "final.msgpack"
+    config = replace(
+        _tiny_training_config(checkpoint_path=str(final)),
+        iterations=4,
+        checkpoint_every=2,
+    )
+    saved: list[str] = []
+    run_training(config, on_checkpoint=saved.append)
+
+    # Periodic saves at iterations 2 and 4, each invoking on_checkpoint.
+    assert saved == [
+        str(tmp_path / "iter_0002.msgpack"),
+        str(tmp_path / "iter_0004.msgpack"),
+    ]
+    assert (tmp_path / "iter_0002.msgpack").exists()
+    load_checkpoint(str(tmp_path / "iter_0002.msgpack"))  # mid-run checkpoint loads
+
+
 def test_jaxzero_imports_do_not_load_torch() -> None:
     code = (
         "import sys, jaxzero, jaxzero.train; raise SystemExit('torch' in sys.modules)"

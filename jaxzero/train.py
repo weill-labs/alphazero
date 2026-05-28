@@ -37,6 +37,7 @@ class TrainingConfig:
     minibatch_size: int = 1024
     seed: int = 0
     checkpoint_path: str | None = None
+    checkpoint_every: int | None = None
     init_checkpoint: str | None = None
 
     def __post_init__(self) -> None:
@@ -48,6 +49,9 @@ class TrainingConfig:
             raise ValueError(msg)
         if self.minibatch_size <= 0:
             msg = "minibatch_size must be positive"
+            raise ValueError(msg)
+        if self.checkpoint_every is not None and self.checkpoint_every <= 0:
+            msg = "checkpoint_every must be positive when set"
             raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
@@ -182,12 +186,16 @@ def run_training(
     config: TrainingConfig,
     *,
     on_iteration: Callable[[dict[str, float | int]], None] | None = None,
+    on_checkpoint: Callable[[str], None] | None = None,
 ) -> TrainingResult:
     """Run buffer-free self-play/training for ``config.iterations``.
 
     Each iteration generates fresh self-play data and takes one pass of
     minibatched gradient steps over it. ``on_iteration`` (if given) receives the
-    per-iteration host metrics as they are produced, for live logging.
+    per-iteration host metrics as they are produced, for live logging. With
+    ``config.checkpoint_every`` set, a periodic ``iter_NNNN.msgpack`` is written
+    next to ``checkpoint_path`` every N iterations and ``on_checkpoint`` (if
+    given) is called with its path — letting a long run be certified mid-flight.
     """
 
     if config.init_checkpoint is not None:
@@ -225,6 +233,19 @@ def run_training(
         history.append(host_metrics)
         if on_iteration is not None:
             on_iteration(host_metrics)
+
+        if (
+            config.checkpoint_every is not None
+            and config.checkpoint_path is not None
+            and (iteration + 1) % config.checkpoint_every == 0
+        ):
+            periodic_path = str(
+                Path(config.checkpoint_path).parent
+                / f"iter_{iteration + 1:04d}.msgpack"
+            )
+            save_checkpoint(nnx.merge(graphdef, params), periodic_path)
+            if on_checkpoint is not None:
+                on_checkpoint(periodic_path)
 
     if config.checkpoint_path is not None:
         save_checkpoint(nnx.merge(graphdef, params), config.checkpoint_path)

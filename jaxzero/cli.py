@@ -25,6 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", dest="checkpoint_path")
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        help="save iter_NNNN.msgpack next to --checkpoint every N iterations",
+    )
+    parser.add_argument(
         "--init-checkpoint",
         dest="init_checkpoint",
         help="warm-start training from this checkpoint instead of random init",
@@ -45,6 +50,7 @@ def main(argv: list[str] | None = None) -> None:
         minibatch_size=args.minibatch_size,
         seed=args.seed,
         checkpoint_path=args.checkpoint_path,
+        checkpoint_every=args.checkpoint_every,
         init_checkpoint=args.init_checkpoint,
     )
     result = run_training(config)
