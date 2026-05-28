@@ -22,6 +22,7 @@ from jaxzero.selfplay import (
     initial_observation_shape,
     make_env,
     make_selfplay,
+    mirror_selfplay_data,
 )
 
 CHECKPOINT_VERSION = 1
@@ -47,6 +48,9 @@ class TrainingConfig:
     gating_interval: int | None = None
     gating_games: int = 20
     gating_threshold: float = 0.55
+    value_loss_weight: float = 1.0
+    mirror_augment: bool = False
+    weight_decay: float = 0.0
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -83,6 +87,12 @@ class TrainingConfig:
             if not 0.0 <= self.gating_threshold <= 1.0:
                 msg = "gating_threshold must be in [0, 1]"
                 raise ValueError(msg)
+        if self.value_loss_weight <= 0:
+            msg = "value_loss_weight must be positive"
+            raise ValueError(msg)
+        if self.weight_decay < 0:
+            msg = "weight_decay must be non-negative"
+            raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
             num_simulations=self.num_simulations,
@@ -119,6 +129,8 @@ def _loss(
     graphdef: nnx.GraphDef[AlphaZeroNet],
     params: nnx.State,
     batch: SelfPlayData,
+    *,
+    value_loss_weight: float,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     policy_logits, value = apply_model(graphdef, params, batch.observation)
     policy_loss_per_example = optax.softmax_cross_entropy(
@@ -133,7 +145,10 @@ def _loss(
         jnp.sum(jnp.square(value - batch.value_target) * value_mask) / value_denom
     )
 
-    loss = policy_loss + value_loss
+    # `loss` (the gradient signal) is weighted; `policy_loss` and `value_loss`
+    # are reported unweighted so wandb curves remain comparable across runs
+    # with different weights.
+    loss = policy_loss + value_loss_weight * value_loss
     metrics = {
         "loss": loss,
         "policy_loss": policy_loss,
@@ -146,9 +161,11 @@ def _loss(
 def make_update_step(
     graphdef: nnx.GraphDef[AlphaZeroNet],
     tx: optax.GradientTransformation,
+    *,
+    value_loss_weight: float = 1.0,
 ):
     def loss_fn(params: nnx.State, batch: SelfPlayData):
-        return _loss(graphdef, params, batch)
+        return _loss(graphdef, params, batch, value_loss_weight=value_loss_weight)
 
     @jax.jit
     def update_step(
@@ -273,9 +290,19 @@ def run_training(
         ),
         graphdef,
     )
-    tx = optax.adam(config.learning_rate)
+    # AdamW when weight_decay > 0 (decoupled L2 reg); standard Adam otherwise.
+    # The closed alphago-{ul3, 1q2, 1kc} trail never tried regularization;
+    # if the plateau is overfitting (mid-training peak then regression), AdamW
+    # at small weight_decay can pull params back toward a simpler hypothesis.
+    tx = (
+        optax.adamw(config.learning_rate, weight_decay=config.weight_decay)
+        if config.weight_decay > 0
+        else optax.adam(config.learning_rate)
+    )
     opt_state = tx.init(params)
-    update_step = make_update_step(graphdef, tx)
+    update_step = make_update_step(
+        graphdef, tx, value_loss_weight=config.value_loss_weight
+    )
     evaluator = (
         make_evaluator(
             graphdef, num_games=config.eval_games, max_steps=config.max_steps
@@ -309,6 +336,8 @@ def run_training(
         key, selfplay_key, shuffle_key = jax.random.split(key, 3)
         selfplay_params = best_params if gating_enabled else params
         new_data = flatten_selfplay_data(selfplay(selfplay_params, selfplay_key))
+        if config.mirror_augment:
+            new_data = mirror_selfplay_data(new_data)
         buffer = _append_to_buffer(buffer, new_data, config.replay_capacity)
         params, opt_state, metrics = _train_epoch(
             update_step, params, opt_state, buffer, config.minibatch_size, shuffle_key
@@ -358,12 +387,18 @@ def run_training(
                 Path(config.checkpoint_path).parent
                 / f"iter_{iteration + 1:04d}.msgpack"
             )
-            save_checkpoint(nnx.merge(graphdef, params), periodic_path)
+            # When gating is on, persist the best (verified-strongest) net,
+            # not the live candidate. Otherwise solver-anchored certs of these
+            # checkpoints read a net that gating itself flagged as not-better.
+            persist_params = best_params if gating_enabled else params
+            save_checkpoint(nnx.merge(graphdef, persist_params), periodic_path)
             if on_checkpoint is not None:
                 on_checkpoint(periodic_path)
 
     if config.checkpoint_path is not None:
-        save_checkpoint(nnx.merge(graphdef, params), config.checkpoint_path)
+        # Same rationale as periodic save: persist best when gating is on.
+        persist_params = best_params if gating_enabled else params
+        save_checkpoint(nnx.merge(graphdef, persist_params), config.checkpoint_path)
 
     return TrainingResult(
         config=config,

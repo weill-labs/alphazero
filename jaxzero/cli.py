@@ -69,6 +69,30 @@ def build_parser() -> argparse.ArgumentParser:
         "promoted to best.",
     )
     parser.add_argument(
+        "--value-loss-weight",
+        type=float,
+        default=1.0,
+        help="Scalar multiplier on the value-loss term in the combined loss. "
+        "Default 1.0 (no change). Set >1 to attack the value-MAE plateau "
+        "(closed alphago-1kc trail: value head is the C4 bottleneck).",
+    )
+    parser.add_argument(
+        "--mirror-augment",
+        action="store_true",
+        help="Augment each self-play example with its horizontal mirror "
+        "(C4 has column symmetry). Doubles training-set size with zero "
+        "extra self-play cost; directly boosts value-signal density.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="When > 0, switch from Adam to AdamW (decoupled L2 reg) with "
+        "this weight_decay coefficient. Default 0 keeps Adam (no decay). "
+        "Useful if training overshoots and a regularization pull-back "
+        "helps the value head plateau.",
+    )
+    parser.add_argument(
         "--solver-eval-positions",
         type=int,
         default=64,
@@ -103,6 +127,9 @@ def main(argv: list[str] | None = None) -> None:
         gating_interval=args.gating_interval,
         gating_games=args.gating_games,
         gating_threshold=args.gating_threshold,
+        value_loss_weight=args.value_loss_weight,
+        mirror_augment=args.mirror_augment,
+        weight_decay=args.weight_decay,
     )
     extra_evaluator = None
     if args.solver_eval_positions > 0:

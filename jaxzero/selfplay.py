@@ -228,3 +228,35 @@ def flatten_selfplay_data(data: SelfPlayData) -> SelfPlayData:
         value_target=flatten(data.value_target),
         value_mask=flatten(data.value_mask),
     )
+
+
+def mirror_selfplay_data(data: SelfPlayData) -> SelfPlayData:
+    """Augment flattened Connect Four self-play data with its horizontal mirror.
+
+    Returns a SelfPlayData with twice as many examples: the originals, then
+    each example's column-flipped counterpart. Connect Four has horizontal
+    symmetry across the centre column, so the mirrored position has the same
+    game-theoretic value and the same optimal move distribution (just with
+    mirrored column indices). This doubles the effective training set with
+    zero extra self-play cost — directly attacks value-signal quality.
+
+    Assumes the input is already flattened to ``[examples, ...]`` (post
+    ``flatten_selfplay_data``). The observation axis layout is pgx's
+    ``[batch, rows, cols, planes]``; ``action_weights`` is ``[batch, cols]``.
+    Reward/discount/terminated/value_target/value_mask are scalar per example
+    and column-independent, so they're concatenated unchanged.
+    """
+
+    mirrored_observation = data.observation[:, :, ::-1, :]
+    mirrored_action_weights = data.action_weights[:, ::-1]
+    return SelfPlayData(
+        observation=jnp.concatenate([data.observation, mirrored_observation], axis=0),
+        action_weights=jnp.concatenate(
+            [data.action_weights, mirrored_action_weights], axis=0
+        ),
+        reward=jnp.concatenate([data.reward, data.reward], axis=0),
+        discount=jnp.concatenate([data.discount, data.discount], axis=0),
+        terminated=jnp.concatenate([data.terminated, data.terminated], axis=0),
+        value_target=jnp.concatenate([data.value_target, data.value_target], axis=0),
+        value_mask=jnp.concatenate([data.value_mask, data.value_mask], axis=0),
+    )

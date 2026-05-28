@@ -250,10 +250,14 @@ def make_solver_evaluator(
 ) -> Callable[[AlphaZeroNet], dict[str, float]]:
     """Return a callback that certifies a JAX model against the solver inline.
 
-    Used by training loops to log live ``eval/c4_blunder_rate`` + ``eval/c4_policy_match``
-    alongside loss — the solver-anchored strength signal (cf. vs-random which
-    saturates). The seed is fixed so the position sample is identical across
-    iterations, making the curve comparable across training.
+    Logs live ``eval/c4_blunder_rate`` (the headline strength signal — what
+    fraction of MCTS moves were blunders against the exact solver),
+    ``eval/c4_policy_match`` (fraction of MCTS moves that matched a solver-
+    optimal choice), and ``eval/c4_value_mae`` (the value-head calibration
+    error against solver labels — the *actual* C4 plateau bottleneck per the
+    closed alphago-{ul3,1q2,1kc} bead trail). All three share the same fixed
+    seed so positions are identical across iterations, making each curve
+    comparable across training.
     """
 
     def run(model: AlphaZeroNet) -> dict[str, float]:
@@ -267,6 +271,7 @@ def make_solver_evaluator(
         return {
             "eval/c4_blunder_rate": float(report.blunder_rate),
             "eval/c4_policy_match": float(report.policy_match_percent) / 100.0,
+            "eval/c4_value_mae": float(report.value_mae),
         }
 
     return run

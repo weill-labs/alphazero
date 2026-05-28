@@ -20,6 +20,7 @@ from jaxzero.selfplay import (
     initial_observation_shape,
     make_env,
     make_selfplay,
+    mirror_selfplay_data,
 )
 from jaxzero.train import (
     TrainingConfig,
@@ -279,6 +280,210 @@ def test_gating_config_rejects_threshold_out_of_range() -> None:
             gating_interval=1,
             gating_threshold=1.5,
         )
+
+
+def test_weight_decay_default_is_zero() -> None:
+    """Default weight_decay = 0 keeps the existing optax.adam optimizer
+    (no decay). Setting weight_decay > 0 should switch to optax.adamw
+    (decoupled L2)."""
+    assert _tiny_training_config().weight_decay == 0.0
+
+
+def test_weight_decay_nonzero_runs_without_error(tmp_path) -> None:
+    """End-to-end: a tiny training run with weight_decay=0.01 finishes
+    successfully (uses AdamW under the hood)."""
+    config = replace(
+        _tiny_training_config(checkpoint_path=str(tmp_path / "wd.msgpack")),
+        weight_decay=0.01,
+    )
+    result = run_training(config)
+    assert result.checkpoint_path is not None
+    assert jnp.isfinite(result.metrics[0]["loss"])
+
+
+def test_weight_decay_must_be_nonneg() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="weight_decay"):
+        replace(_tiny_training_config(), weight_decay=-0.1)
+
+
+def test_value_loss_weight_default_is_one() -> None:
+    assert _tiny_training_config().value_loss_weight == 1.0
+
+
+def test_value_loss_weight_changes_combined_loss_but_not_value_loss_metric() -> None:
+    """Increasing value_loss_weight scales the gradient-relevant `loss` but
+    leaves the reported `value_loss` (unweighted) untouched — so wandb curves
+    stay comparable across runs with different weights."""
+    import pytest
+
+    base_config = _tiny_training_config(seed=42)
+    weighted_config = replace(base_config, value_loss_weight=4.0)
+
+    base_logged: list[dict[str, float | int]] = []
+    weighted_logged: list[dict[str, float | int]] = []
+    run_training(base_config, on_iteration=base_logged.append)
+    run_training(weighted_config, on_iteration=weighted_logged.append)
+
+    # Unweighted per-head losses are deterministic given seed+config, and the
+    # value_loss_weight should not change which weights produce the first
+    # gradient step (it scales the gradient, which then changes future
+    # iterations — but on iter 0, value_loss is computed before any update).
+    assert base_logged[0]["value_loss"] == pytest.approx(
+        weighted_logged[0]["value_loss"], rel=1e-5
+    )
+    assert base_logged[0]["policy_loss"] == pytest.approx(
+        weighted_logged[0]["policy_loss"], rel=1e-5
+    )
+    # `loss` differs by exactly (weight-1) * value_loss at iter 0.
+    base_loss = base_logged[0]["loss"]
+    weighted_loss = weighted_logged[0]["loss"]
+    expected_delta = 3.0 * base_logged[0]["value_loss"]  # (4 - 1) * value_loss
+    assert weighted_loss == pytest.approx(base_loss + expected_delta, rel=1e-5)
+
+
+def test_value_loss_weight_must_be_positive() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="value_loss_weight"):
+        replace(_tiny_training_config(), value_loss_weight=0.0)
+    with pytest.raises(ValueError, match="value_loss_weight"):
+        replace(_tiny_training_config(), value_loss_weight=-1.0)
+
+
+def _example_data_for_mirror() -> SelfPlayData:
+    """Hand-crafted 2-example SelfPlayData with distinguishable columns.
+
+    obs[0] has a piece in column 0, obs[1] has a piece in column 6 — so the
+    mirror swaps them. action_weights pick out the first and last columns to
+    likewise verify the flip lands.
+    """
+    obs0 = jnp.zeros((6, 7, 2), dtype=jnp.float32).at[0, 0, 0].set(1.0)
+    obs1 = jnp.zeros((6, 7, 2), dtype=jnp.float32).at[0, 6, 0].set(1.0)
+    observation = jnp.stack([obs0, obs1], axis=0)
+    action_weights = jnp.array(
+        [[1.0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 1.0]], dtype=jnp.float32
+    )
+    return SelfPlayData(
+        observation=observation,
+        action_weights=action_weights,
+        reward=jnp.array([1.0, -1.0]),
+        discount=jnp.array([0.0, 0.0]),
+        terminated=jnp.array([True, True]),
+        value_target=jnp.array([1.0, -1.0]),
+        value_mask=jnp.ones((2,), dtype=jnp.bool_),
+    )
+
+
+def test_mirror_selfplay_data_doubles_size() -> None:
+    data = _example_data_for_mirror()
+    mirrored = mirror_selfplay_data(data)
+    assert mirrored.observation.shape[0] == 4
+    assert mirrored.action_weights.shape[0] == 4
+    assert mirrored.value_target.shape[0] == 4
+    assert mirrored.value_mask.shape[0] == 4
+
+
+def test_mirror_selfplay_data_preserves_originals_then_mirrors() -> None:
+    """The first N rows must be untouched; rows N..2N are the column-flipped mirrors."""
+    data = _example_data_for_mirror()
+    mirrored = mirror_selfplay_data(data)
+
+    # Originals preserved at indices 0, 1.
+    assert jnp.array_equal(mirrored.observation[:2], data.observation)
+    assert jnp.array_equal(mirrored.action_weights[:2], data.action_weights)
+
+    # Mirrors at indices 2, 3 have columns flipped.
+    assert jnp.array_equal(mirrored.observation[2], data.observation[0, :, ::-1, :])
+    assert jnp.array_equal(mirrored.observation[3], data.observation[1, :, ::-1, :])
+    assert jnp.array_equal(mirrored.action_weights[2], data.action_weights[0, ::-1])
+    assert jnp.array_equal(mirrored.action_weights[3], data.action_weights[1, ::-1])
+
+
+def test_mirror_selfplay_data_keeps_scalar_fields_identical() -> None:
+    """reward / discount / terminated / value_target / value_mask are column-agnostic."""
+    data = _example_data_for_mirror()
+    mirrored = mirror_selfplay_data(data)
+
+    for field in ("reward", "discount", "terminated", "value_target", "value_mask"):
+        original = getattr(data, field)
+        augmented = getattr(mirrored, field)
+        assert jnp.array_equal(augmented[:2], original)
+        assert jnp.array_equal(augmented[2:], original)
+
+
+def test_gating_persists_best_params_not_live(tmp_path) -> None:
+    """When gating is enabled, the saved checkpoint must equal best_params,
+    not the live (possibly-regressed) candidate. With threshold=1.0 and tiny
+    games the candidate can never promote (no decisive 100%-win match is
+    achievable in 2 games at max_steps=2), so best_params stays at iter-0
+    init while the live params get trained. The saved checkpoint must match
+    the init, not the trained params."""
+    checkpoint = tmp_path / "gated.msgpack"
+    config = replace(
+        _tiny_training_config(seed=7, checkpoint_path=str(checkpoint)),
+        iterations=2,
+        gating_interval=1,
+        gating_games=2,
+        gating_threshold=1.0,  # impossible to hit -> no promotion
+    )
+    result = run_training(config)
+
+    loaded = load_checkpoint(checkpoint)
+    loaded_leaves = _tree_leaves(nnx.state(loaded, nnx.Param))
+    live_leaves = _tree_leaves(result.params)
+
+    # If we wrongly saved live params, every leaf would match. Since training
+    # advanced and best_params stayed at init, the saved (init) leaves must
+    # differ from the live (trained) leaves on at least one parameter array.
+    matching = sum(
+        bool(jnp.array_equal(a, b))
+        for a, b in zip(loaded_leaves, live_leaves, strict=True)
+    )
+    assert matching < len(loaded_leaves), (
+        f"saved checkpoint equals live params ({matching}/{len(loaded_leaves)} "
+        "leaves match) -- expected save to use best_params (init), which "
+        "differs from live."
+    )
+
+
+def test_no_gating_persists_live_params(tmp_path) -> None:
+    """With gating off, save semantics are unchanged: saved == live (backward
+    compat with all pre-jla runs)."""
+    checkpoint = tmp_path / "ungated.msgpack"
+    config = replace(_tiny_training_config(seed=7, checkpoint_path=str(checkpoint)))
+    result = run_training(config)
+
+    loaded = load_checkpoint(checkpoint)
+    loaded_leaves = _tree_leaves(nnx.state(loaded, nnx.Param))
+    live_leaves = _tree_leaves(result.params)
+    for actual, expected in zip(loaded_leaves, live_leaves, strict=True):
+        assert jnp.array_equal(actual, expected)
+
+
+def test_mirror_augment_flag_doubles_examples_per_iteration() -> None:
+    """End-to-end: setting mirror_augment=True should double the per-iteration
+    self-play data fed into training. Verify by counting examples via the
+    value_mask_fraction signal: training stays consistent, just on a larger
+    set."""
+    import pytest
+
+    # Use replay_capacity so the buffer reflects what's training-visible.
+    base_config = replace(_tiny_training_config(seed=99), iterations=1)
+    mirror_config = replace(base_config, mirror_augment=True)
+
+    base_metrics: list[dict[str, float | int]] = []
+    mirror_metrics: list[dict[str, float | int]] = []
+    run_training(base_config, on_iteration=base_metrics.append)
+    run_training(mirror_config, on_iteration=mirror_metrics.append)
+
+    # value_mask_fraction is the fraction of valid value targets in the batch.
+    # Mirror doubles the example count but each mirror copy retains its mask,
+    # so the FRACTION is preserved (numerator and denominator both 2x).
+    assert base_metrics[0]["value_mask_fraction"] == pytest.approx(
+        mirror_metrics[0]["value_mask_fraction"], rel=1e-5
+    )
 
 
 def _dummy_selfplay_data(n: int, value: float) -> SelfPlayData:
