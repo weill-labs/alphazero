@@ -19,9 +19,12 @@ from jaxzero.net import (
     ARCH_TRANSFORMER,
     INPUT_EMBED_LINEAR,
     POLICY_HEAD_FLATTEN,
+    VALUE_HEAD_SCALAR,
+    VALUE_HEAD_WDLP,
     AlphaZeroNetConfig,
     Net,
     apply_model,
+    apply_model_train,
     create_model,
 )
 from jaxzero.selfplay import (
@@ -68,6 +71,8 @@ class TrainingConfig:
     use_value_cls_token: bool = False
     policy_head_style: str = POLICY_HEAD_FLATTEN
     input_embed_style: str = INPUT_EMBED_LINEAR
+    value_head_style: str = VALUE_HEAD_SCALAR
+    ply_loss_weight: float = 0.1
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -128,7 +133,11 @@ class TrainingConfig:
             use_value_cls_token=self.use_value_cls_token,
             policy_head_style=self.policy_head_style,
             input_embed_style=self.input_embed_style,
+            value_head_style=self.value_head_style,
         )
+        if self.ply_loss_weight < 0:
+            msg = "ply_loss_weight must be non-negative"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -155,7 +164,49 @@ def build_net_config(config: TrainingConfig) -> AlphaZeroNetConfig:
         use_value_cls_token=config.use_value_cls_token,
         policy_head_style=config.policy_head_style,
         input_embed_style=config.input_embed_style,
+        value_head_style=config.value_head_style,
     )
+
+
+def _scalar_value_loss(
+    graphdef: nnx.GraphDef[Net],
+    params: nnx.State,
+    batch: SelfPlayData,
+    value_mask: jax.Array,
+    value_denom: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Scalar head: masked MSE of the tanh value against the discounted return."""
+    policy_logits, value = apply_model(graphdef, params, batch.observation)
+    value_loss = (
+        jnp.sum(jnp.square(value - batch.value_target) * value_mask) / value_denom
+    )
+    return policy_logits, value_loss
+
+
+def _wdlp_value_loss(
+    graphdef: nnx.GraphDef[Net],
+    params: nnx.State,
+    batch: SelfPlayData,
+    value_mask: jax.Array,
+    value_denom: jax.Array,
+    ply_loss_weight: float,
+) -> tuple[jax.Array, jax.Array]:
+    """WDLP head: masked W/D/L cross-entropy + auxiliary masked ply MSE.
+
+    The W/D/L class is ``sign(value_target) + 1`` (loss=0, draw=1, win=2). The
+    reported value_loss combines CE + ply_loss_weight * ply MSE so the wandb
+    curve stays a single comparable scalar.
+    """
+    policy_logits, wdl_logits, ply_pred = apply_model_train(
+        graphdef, params, batch.observation
+    )
+    wdl_target = (jnp.sign(batch.value_target) + 1).astype(jnp.int32)  # {0,1,2}
+    wdl_ce = optax.softmax_cross_entropy_with_integer_labels(wdl_logits, wdl_target)
+    wdl_loss = jnp.sum(wdl_ce * value_mask) / value_denom
+    ply_loss = (
+        jnp.sum(jnp.square(ply_pred - batch.ply_target) * value_mask) / value_denom
+    )
+    return policy_logits, wdl_loss + ply_loss_weight * ply_loss
 
 
 def _loss(
@@ -164,19 +215,26 @@ def _loss(
     batch: SelfPlayData,
     *,
     value_loss_weight: float,
+    value_head_style: str = VALUE_HEAD_SCALAR,
+    ply_loss_weight: float = 0.1,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    policy_logits, value = apply_model(graphdef, params, batch.observation)
+    value_mask = batch.value_mask.astype(jnp.float32)
+    value_denom = jnp.maximum(jnp.sum(value_mask), 1.0)
+
+    if value_head_style == VALUE_HEAD_WDLP:
+        policy_logits, value_loss = _wdlp_value_loss(
+            graphdef, params, batch, value_mask, value_denom, ply_loss_weight
+        )
+    else:
+        policy_logits, value_loss = _scalar_value_loss(
+            graphdef, params, batch, value_mask, value_denom
+        )
+
     policy_loss_per_example = optax.softmax_cross_entropy(
         policy_logits,
         batch.action_weights,
     )
     policy_loss = jnp.mean(policy_loss_per_example)
-
-    value_mask = batch.value_mask.astype(jnp.float32)
-    value_denom = jnp.maximum(jnp.sum(value_mask), 1.0)
-    value_loss = (
-        jnp.sum(jnp.square(value - batch.value_target) * value_mask) / value_denom
-    )
 
     # `loss` (the gradient signal) is weighted; `policy_loss` and `value_loss`
     # are reported unweighted so wandb curves remain comparable across runs
@@ -196,9 +254,18 @@ def make_update_step(
     tx: optax.GradientTransformation,
     *,
     value_loss_weight: float = 1.0,
+    value_head_style: str = VALUE_HEAD_SCALAR,
+    ply_loss_weight: float = 0.1,
 ):
     def loss_fn(params: nnx.State, batch: SelfPlayData):
-        return _loss(graphdef, params, batch, value_loss_weight=value_loss_weight)
+        return _loss(
+            graphdef,
+            params,
+            batch,
+            value_loss_weight=value_loss_weight,
+            value_head_style=value_head_style,
+            ply_loss_weight=ply_loss_weight,
+        )
 
     @jax.jit
     def update_step(
@@ -334,7 +401,11 @@ def run_training(
     )
     opt_state = tx.init(params)
     update_step = make_update_step(
-        graphdef, tx, value_loss_weight=config.value_loss_weight
+        graphdef,
+        tx,
+        value_loss_weight=config.value_loss_weight,
+        value_head_style=net_config.value_head_style,
+        ply_loss_weight=config.ply_loss_weight,
     )
     evaluator = (
         make_evaluator(
