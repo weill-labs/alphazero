@@ -12,6 +12,7 @@ import msgpack
 import optax
 from flax import nnx, serialization
 
+from jaxzero.arena import gating_summary, make_gating_match, update_elo
 from jaxzero.evaluate import make_evaluator, vs_random_metrics
 from jaxzero.net import AlphaZeroNet, AlphaZeroNetConfig, apply_model, create_model
 from jaxzero.selfplay import (
@@ -43,6 +44,9 @@ class TrainingConfig:
     eval_interval: int | None = None
     eval_games: int = 64
     replay_capacity: int | None = None
+    gating_interval: int | None = None
+    gating_games: int = 20
+    gating_threshold: float = 0.55
 
     def __post_init__(self) -> None:
         if self.iterations <= 0:
@@ -66,6 +70,19 @@ class TrainingConfig:
         if self.replay_capacity is not None and self.replay_capacity <= 0:
             msg = "replay_capacity must be positive when set"
             raise ValueError(msg)
+        if self.gating_interval is not None:
+            if self.gating_interval <= 0:
+                msg = "gating_interval must be positive when set"
+                raise ValueError(msg)
+            if self.gating_games <= 0:
+                msg = "gating_games must be positive"
+                raise ValueError(msg)
+            if self.gating_games % 2 != 0:
+                msg = "gating_games must be even (to balance seatings)"
+                raise ValueError(msg)
+            if not 0.0 <= self.gating_threshold <= 1.0:
+                msg = "gating_threshold must be in [0, 1]"
+                raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
             num_simulations=self.num_simulations,
@@ -266,18 +283,59 @@ def run_training(
         if config.eval_interval is not None
         else None
     )
+    gating_enabled = config.gating_interval is not None
+    gating_match = (
+        make_gating_match(
+            graphdef,
+            num_games=config.gating_games,
+            max_steps=config.max_steps,
+        )
+        if gating_enabled
+        else None
+    )
+    # When gating is on, ``best_params`` is the source for self-play data; when
+    # off, self-play uses the live ``params`` (legacy behavior). The closed
+    # alphago-{ul3,1q2,1kc} bead trail showed value-MAE plateauing across every
+    # config — pinning the data source to a vetted best net is the active lever.
+    best_params = jax.tree.map(jnp.copy, params) if gating_enabled else None
+    best_elo = 0.0
+    last_gating_winrate = 0.0
+    last_promoted = 0
 
     key = jax.random.PRNGKey(config.seed)
     history: list[dict[str, float | int]] = []
     buffer: SelfPlayData | None = None
     for iteration in range(config.iterations):
         key, selfplay_key, shuffle_key = jax.random.split(key, 3)
-        new_data = flatten_selfplay_data(selfplay(params, selfplay_key))
+        selfplay_params = best_params if gating_enabled else params
+        new_data = flatten_selfplay_data(selfplay(selfplay_params, selfplay_key))
         buffer = _append_to_buffer(buffer, new_data, config.replay_capacity)
         params, opt_state, metrics = _train_epoch(
             update_step, params, opt_state, buffer, config.minibatch_size, shuffle_key
         )
         host_metrics = _host_metrics(metrics, iteration=iteration)
+        if gating_enabled:
+            iteration_number = iteration + 1
+            if iteration_number % config.gating_interval == 0:
+                key, gating_key = jax.random.split(key)
+                counts = gating_match(params, best_params, gating_key)
+                result = gating_summary(
+                    counts,
+                    num_games=config.gating_games,
+                    threshold=config.gating_threshold,
+                )
+                last_gating_winrate = result.winrate
+                last_promoted = result.promoted
+                host_metrics["eval/gating_wins"] = result.wins
+                host_metrics["eval/gating_draws"] = result.draws
+                host_metrics["eval/gating_losses"] = result.losses
+                host_metrics["eval/gating_score"] = result.score
+                if result.promoted:
+                    best_elo = update_elo(best_elo, best_elo, result.score)
+                    best_params = jax.tree.map(jnp.copy, params)
+            host_metrics["eval/gating_winrate"] = last_gating_winrate
+            host_metrics["eval/promoted"] = last_promoted
+            host_metrics["eval/elo"] = best_elo
         if (
             config.eval_interval is not None
             and (iteration + 1) % config.eval_interval == 0

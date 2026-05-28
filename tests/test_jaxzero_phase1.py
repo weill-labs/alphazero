@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import subprocess
 import sys
 from dataclasses import replace
@@ -216,6 +217,68 @@ def test_eval_interval_logs_vs_random_metrics() -> None:
         )
         assert all(0.0 <= r <= 1.0 for r in rates)
         assert abs(sum(rates) - 1.0) < 1e-6
+
+
+def test_gating_logs_keys_when_enabled() -> None:
+    # threshold=0.0 forces promotion every gate (winrate>=0 always true), which
+    # both exercises the promotion path and pins eval/promoted=1.
+    config = replace(
+        _tiny_training_config(),
+        iterations=2,
+        gating_interval=1,
+        gating_games=2,
+        gating_threshold=0.0,
+    )
+    logged: list[dict[str, float | int]] = []
+    run_training(config, on_iteration=logged.append)
+
+    assert len(logged) == 2
+    for metrics in logged:
+        for key in (
+            "eval/elo",
+            "eval/gating_winrate",
+            "eval/promoted",
+            "eval/gating_wins",
+            "eval/gating_draws",
+            "eval/gating_losses",
+            "eval/gating_score",
+        ):
+            assert key in metrics, f"missing {key}"
+        assert metrics["eval/promoted"] == 1
+        assert 0.0 <= metrics["eval/gating_score"] <= 1.0
+        assert math.isfinite(metrics["eval/elo"])
+
+
+def test_gating_disabled_does_not_log_gating_keys() -> None:
+    # Default config has gating_interval=None — eval/* gating keys must stay out
+    # of wandb to avoid polluting non-gated baseline charts.
+    logged: list[dict[str, float | int]] = []
+    run_training(_tiny_training_config(), on_iteration=logged.append)
+    for metrics in logged:
+        for key in ("eval/elo", "eval/gating_winrate", "eval/promoted"):
+            assert key not in metrics
+
+
+def test_gating_config_rejects_odd_gating_games() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="even"):
+        replace(
+            _tiny_training_config(),
+            gating_interval=1,
+            gating_games=3,
+        )
+
+
+def test_gating_config_rejects_threshold_out_of_range() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="gating_threshold"):
+        replace(
+            _tiny_training_config(),
+            gating_interval=1,
+            gating_threshold=1.5,
+        )
 
 
 def _dummy_selfplay_data(n: int, value: float) -> SelfPlayData:
