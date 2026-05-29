@@ -402,11 +402,18 @@ def run_training(
             config.eval_interval is not None
             and (iteration + 1) % config.eval_interval == 0
         ):
+            # Score the SAME params that get persisted: under gating the
+            # checkpoint saves best_params (see the save sites below), so the
+            # inline eval must score best_params too, otherwise eval/c4_* and
+            # eval/vs_random_* describe the live candidate while the
+            # saved/certified checkpoint is a different (best) model. With
+            # gating off, best_params is None and we score the live params.
+            eval_params = best_params if gating_enabled else params
             if evaluator is not None:
                 key, eval_key = jax.random.split(key)
-                host_metrics.update(vs_random_metrics(evaluator(params, eval_key)))
+                host_metrics.update(vs_random_metrics(evaluator(eval_params, eval_key)))
             if extra_evaluator is not None:
-                host_metrics.update(extra_evaluator(nnx.merge(graphdef, params)))
+                host_metrics.update(extra_evaluator(nnx.merge(graphdef, eval_params)))
         history.append(host_metrics)
         if on_iteration is not None:
             on_iteration(host_metrics)
