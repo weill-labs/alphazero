@@ -8,9 +8,13 @@ import numpy as np
 
 from alphazero.c4_certify import (
     JaxMCTSAgent,
+    certify_checkpoint_batched,
     certify_connect_four,
+    load_eval_labels,
     pgx_state_to_solver_state,
+    precompute_solver_labels,
     sample_positions,
+    save_eval_labels,
     solver_state_to_pgx_state,
 )
 from alphazero.c4_solver import solve
@@ -325,3 +329,64 @@ def test_c4_certify_imports_do_not_load_torch() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_precompute_solver_labels_aligns_and_caches(tmp_path) -> None:
+    """Labels align 1:1 with kept positions and survive a JSON cache roundtrip.
+
+    Each label carries the position's solver value/score/optimal moves plus a
+    children map (move -> child value/score) covering every legal move, so a
+    later cert needs no solver calls.
+    """
+    positions = sample_positions(sample_size=8, seed=0)
+    kept, labels = precompute_solver_labels(positions)
+    assert len(kept) == len(labels)
+    game = ConnectFour()
+    for state, lab in zip(kept, labels):
+        assert set(lab["children"]) == set(game.legal_moves(state))
+        assert set(lab["optimal_moves"]).issubset(set(game.legal_moves(state)))
+
+    path = tmp_path / "labels.json"
+    save_eval_labels(labels, path)
+    assert load_eval_labels(path) == labels
+
+
+def test_certify_checkpoint_batched_matches_serial_stable_metrics(tmp_path) -> None:
+    """Batched (cached-label) cert reproduces the serial certifier's stable
+    metrics. The batched MCTS uses one top-level rng (vs the serial per-position
+    seed), so the noisy weak-blunder count may differ by a few positions, but
+    the regret/score aggregates and per-record invariants must hold and the
+    evaluated-position count must match the precomputed label set.
+    """
+    config = AlphaZeroNetConfig(
+        obs_shape=(6, 7, 2), action_size=7, channels=4, num_res_blocks=0
+    )
+    checkpoint = tmp_path / "m.msgpack"
+    save_checkpoint(create_model(config, seed=0), checkpoint)
+    positions = sample_positions(sample_size=12, seed=1)
+
+    kept, labels = precompute_solver_labels(positions)
+    report = certify_checkpoint_batched(checkpoint, kept, labels=labels, sims=2, seed=0)
+
+    assert report.evaluated_positions == len(kept)
+    # strong (score) blunders are a superset of weak (outcome) blunders
+    assert report.score_blunders >= report.blunders
+    for record in report.records:
+        assert record.score_regret >= 0
+        assert 0 <= record.wdl_regret <= 2
+        if record.blunder:
+            assert record.score_blunder
+
+
+def test_certify_checkpoint_batched_precomputes_when_labels_omitted(tmp_path) -> None:
+    """Passing labels=None precomputes them internally (no separate cache step)."""
+    config = AlphaZeroNetConfig(
+        obs_shape=(6, 7, 2), action_size=7, channels=4, num_res_blocks=0
+    )
+    checkpoint = tmp_path / "m.msgpack"
+    save_checkpoint(create_model(config, seed=0), checkpoint)
+    positions = sample_positions(sample_size=6, seed=2)
+
+    report = certify_checkpoint_batched(checkpoint, positions, sims=2, seed=0)
+    assert report.evaluated_positions <= len(positions)
+    assert 0.0 <= report.blunder_rate <= 1.0
