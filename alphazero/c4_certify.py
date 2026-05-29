@@ -827,10 +827,25 @@ def precompute_solver_labels(
     return kept, labels
 
 
-def save_eval_labels(labels: Sequence[dict], path: str | Path) -> None:
-    """Serialize precomputed solver labels (children keys -> str for JSON)."""
+def save_eval_labels(
+    positions: Sequence[ConnectFourState],
+    labels: Sequence[dict],
+    path: str | Path,
+) -> None:
+    """Serialize the kept positions + their precomputed solver labels.
+
+    Self-contained: ``load_eval_labels`` returns aligned ``(positions, labels)``
+    so a later ``--batched`` cert needs no solver calls at all. ``children``
+    move keys are stringified for JSON.
+    """
+    if len(positions) != len(labels):
+        raise ValueError("positions and labels must align")
     payload = {
         "version": 1,
+        "positions": [
+            {"board": [list(row) for row in s.board], "player": int(s.player)}
+            for s in positions
+        ],
         "labels": [
             {
                 "solver_value": lab["solver_value"],
@@ -844,11 +859,21 @@ def save_eval_labels(labels: Sequence[dict], path: str | Path) -> None:
     Path(path).write_text(json.dumps(payload))
 
 
-def load_eval_labels(path: str | Path) -> list[dict]:
+def load_eval_labels(
+    path: str | Path,
+) -> tuple[list[ConnectFourState], list[dict]]:
+    """Load aligned ``(kept_positions, labels)`` saved by ``save_eval_labels``."""
     payload = json.loads(Path(path).read_text())
     if int(payload.get("version", 0)) != 1:
         raise ValueError(f"unsupported eval-labels version {payload.get('version')!r}")
-    return [
+    positions = [
+        ConnectFourState(
+            board=tuple(tuple(int(c) for c in row) for row in entry["board"]),
+            player=int(entry["player"]),
+        )
+        for entry in payload["positions"]
+    ]
+    labels = [
         {
             "solver_value": int(lab["solver_value"]),
             "solver_score": int(lab["solver_score"]),
@@ -857,6 +882,7 @@ def load_eval_labels(path: str | Path) -> list[dict]:
         }
         for lab in payload["labels"]
     ]
+    return positions, labels
 
 
 def _stack_pgx_states(states: Sequence[PgxConnectFourState]) -> PgxConnectFourState:
@@ -961,7 +987,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         "solver is single-threaded per process, so >1 gives near-linear speedup "
         "on many-core hosts. Results are identical to --workers 1.",
     )
+    parser.add_argument(
+        "--build-eval-labels",
+        type=Path,
+        help="Precompute solver labels (per-position value/score/optimal moves "
+        "+ per-legal-child scores) for the eval set, save to this path, and "
+        "exit. Reused by --batched to skip all solver calls at cert time.",
+    )
+    parser.add_argument(
+        "--eval-labels",
+        type=Path,
+        help="Load precomputed solver labels (from --build-eval-labels) for the "
+        "--batched cert. Without it, --batched precomputes labels inline.",
+    )
+    parser.add_argument(
+        "--batched",
+        action="store_true",
+        help="Use the batched-MCTS cert (one vmap'd mctx call over all positions "
+        "+ cached-label lookup) instead of the per-position path. Fastest on GPU; "
+        "results are deterministic but not byte-identical to the serial path.",
+    )
     args = parser.parse_args(argv)
+
+    def _resolve_positions() -> list[ConnectFourState]:
+        if args.eval_set is not None:
+            return load_eval_set(args.eval_set)
+        return sample_positions(
+            sample_size=args.sample_size,
+            seed=args.seed,
+            opening_depth=args.opening_depth,
+        )
 
     if args.build_eval_set is not None:
         positions = sample_positions(
@@ -981,27 +1036,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    if args.checkpoint is None:
-        parser.error("--checkpoint is required unless --build-eval-set is given")
-
-    # Resolve a concrete position list up front (so it can be split across
-    # workers and is identical across runs / worker counts).
-    if args.eval_set is not None:
-        positions = load_eval_set(args.eval_set)
-    else:
-        positions = sample_positions(
-            sample_size=args.sample_size,
-            seed=args.seed,
-            opening_depth=args.opening_depth,
+    if args.build_eval_labels is not None:
+        positions = _resolve_positions()
+        kept, labels = precompute_solver_labels(
+            positions, solver_max_nodes=args.solver_max_nodes
         )
-    report = certify_checkpoint(
-        args.checkpoint,
-        positions,
-        sims=args.sims,
-        seed=args.seed,
-        solver_max_nodes=args.solver_max_nodes,
-        workers=args.workers,
-    )
+        save_eval_labels(kept, labels, args.build_eval_labels)
+        print(
+            json.dumps(
+                {
+                    "built_eval_labels": str(args.build_eval_labels),
+                    "kept_positions": len(kept),
+                    "skipped": len(positions) - len(kept),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.checkpoint is None:
+        parser.error(
+            "--checkpoint is required unless --build-eval-set / --build-eval-labels"
+        )
+
+    if args.batched:
+        if args.eval_labels is not None:
+            # Self-contained cache -> aligned (positions, labels), no solver.
+            positions, labels = load_eval_labels(args.eval_labels)
+        else:
+            positions, labels = _resolve_positions(), None
+        report = certify_checkpoint_batched(
+            args.checkpoint,
+            positions,
+            labels=labels,
+            sims=args.sims,
+            seed=args.seed,
+            solver_max_nodes=args.solver_max_nodes,
+        )
+    else:
+        positions = _resolve_positions()
+        # Per-position path, optionally parallel across worker processes.
+        report = certify_checkpoint(
+            args.checkpoint,
+            positions,
+            sims=args.sims,
+            seed=args.seed,
+            solver_max_nodes=args.solver_max_nodes,
+            workers=args.workers,
+        )
     print(json.dumps(report.as_dict(), sort_keys=True))
     return 0
 
