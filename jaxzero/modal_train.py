@@ -140,7 +140,10 @@ else:
     @app.function(
         image=image,
         gpu=_DEFAULT_GPU,
-        timeout=6 * 60 * 60,
+        # 12h: large-batch / high-sim runs (e.g. batch=512 sims=256 iters=150)
+        # need ~6.25h, which the old 6h cap cut short mid-run. 12h is ~2x the
+        # measured need so a slow run finishes, while still bounding a hang.
+        timeout=12 * 60 * 60,
         secrets=[modal.Secret.from_name("wandb")],
         volumes={_CHECKPOINT_MOUNT: checkpoint_volume},
     )
