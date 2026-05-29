@@ -347,8 +347,10 @@ def test_precompute_solver_labels_aligns_and_caches(tmp_path) -> None:
         assert set(lab["optimal_moves"]).issubset(set(game.legal_moves(state)))
 
     path = tmp_path / "labels.json"
-    save_eval_labels(labels, path)
-    assert load_eval_labels(path) == labels
+    save_eval_labels(kept, labels, path)
+    loaded_positions, loaded_labels = load_eval_labels(path)
+    assert loaded_positions == kept
+    assert loaded_labels == labels
 
 
 def test_certify_checkpoint_batched_matches_serial_stable_metrics(tmp_path) -> None:
