@@ -536,6 +536,73 @@ def test_run_training_extra_evaluator_merges_metrics() -> None:
         assert metrics["eval/c4_policy_match"] == 0.877
 
 
+def test_gated_inline_eval_scores_persisted_best_not_live(tmp_path) -> None:
+    """Regression test for alphago-bac.
+
+    Under gating, the inline eval block must score the SAME params that get
+    persisted to the checkpoint (best_params), not the live candidate
+    (params). With tiny games every match draws, so the gating winrate is 0.0
+    (< threshold 0.55) and nothing is ever promoted -- best_params stays at
+    iter-0 init while the live params advance via gradient steps. The
+    extra_evaluator captures the model it receives; we assert those captured
+    params equal the persisted checkpoint (both best_params) and DIFFER from
+    the final live params. The "differ from live" assertion is what fails on
+    the pre-fix code, which scored live params.
+    """
+    checkpoint = tmp_path / "gated.msgpack"
+    config = replace(
+        _tiny_training_config(seed=0, checkpoint_path=str(checkpoint)),
+        iterations=2,
+        gating_interval=2,
+        gating_games=2,
+        gating_threshold=0.55,  # tiny games draw -> winrate 0.0 -> no promotion
+        eval_interval=2,
+    )
+
+    captured: list[list] = []
+
+    def capture_eval(model) -> dict[str, float]:
+        captured.append(_tree_leaves(nnx.state(model, nnx.Param)))
+        return {"eval/c4_stub": 0.0}
+
+    logged: list[dict[str, float | int]] = []
+    result = run_training(
+        config, on_iteration=logged.append, extra_evaluator=capture_eval
+    )
+
+    # Precondition: no promotion happened, so best_params (persisted/eval'd)
+    # diverges from the live trained params -- the property the test needs.
+    assert logged[-1].get("eval/promoted", 0) == 0, (
+        "expected no promotion (tiny games draw); if promoted, best == live "
+        "and the test cannot distinguish best from live"
+    )
+
+    # extra_evaluator fires once at eval_interval=2 (after iteration 2).
+    assert len(captured) == 1
+    eval_leaves = captured[0]
+
+    loaded = load_checkpoint(checkpoint)
+    persisted_leaves = _tree_leaves(nnx.state(loaded, nnx.Param))
+    live_leaves = _tree_leaves(result.params)
+
+    # The inline eval scored exactly the params that were persisted (best).
+    for evaled, persisted in zip(eval_leaves, persisted_leaves, strict=True):
+        assert jnp.allclose(evaled, persisted)
+
+    # And those persisted/eval'd (best, init) params differ from the live
+    # trained params on at least one leaf -- proving eval scored best, not
+    # live. This assertion fails on the pre-fix code.
+    matching = sum(
+        bool(jnp.array_equal(a, b))
+        for a, b in zip(eval_leaves, live_leaves, strict=True)
+    )
+    assert matching < len(eval_leaves), (
+        f"inline eval scored the live params ({matching}/{len(eval_leaves)} "
+        "leaves match live) -- expected it to score best_params (init), which "
+        "differs from the trained live params."
+    )
+
+
 def test_jaxzero_imports_do_not_load_torch() -> None:
     code = (
         "import sys, jaxzero, jaxzero.train; raise SystemExit('torch' in sys.modules)"
