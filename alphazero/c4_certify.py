@@ -763,6 +763,172 @@ def certify_checkpoint(
     )
 
 
+# -----------------------------------------------------------------------------
+# Prototype: batched-MCTS + cached-solver-label certification.
+#
+# The fixed eval set's solver labels never change, so precompute them ONCE
+# (including the per-legal-child scores needed for regret) and reuse forever.
+# Then a cert is just one batched (vmap'd) mctx call over all positions + dict
+# lookups — no per-position solver calls, no per-position MCTS dispatch. On CPU
+# this is ~4x faster MCTS + removes the solver bottleneck entirely; on GPU the
+# batched MCTS is dramatically faster still.
+# -----------------------------------------------------------------------------
+
+
+def precompute_solver_labels(
+    positions: Sequence[ConnectFourState],
+    *,
+    solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
+) -> tuple[list[ConnectFourState], list[dict]]:
+    """Solve every eval position + all its legal children once.
+
+    Returns ``(kept_positions, labels)`` where terminal / node-budget-exceeded
+    positions are dropped (matching the serial certifier's skip logic). Each
+    label dict carries the position's solver value/score/optimal moves and a
+    ``children`` map ``move -> (child_value, child_score)`` (child values are
+    from the opponent's perspective; negate for the mover).
+    """
+    c4 = ConnectFour()
+    kept: list[ConnectFourState] = []
+    labels: list[dict] = []
+    for state in positions:
+        if c4.is_terminal(state) or not c4.legal_moves(state):
+            continue
+        try:
+            solver_value, optimal_moves, solver_score = solve_with_score(
+                state, max_nodes=solver_max_nodes
+            )
+        except NodeBudgetExceeded:
+            continue
+        if not optimal_moves:
+            continue
+        children: dict[int, tuple[int, int]] = {}
+        ok = True
+        for move in c4.legal_moves(state):
+            try:
+                child_value, _, child_score = solve_with_score(
+                    c4.apply_move(state, move), max_nodes=solver_max_nodes
+                )
+            except NodeBudgetExceeded:
+                ok = False
+                break
+            children[int(move)] = (int(child_value), int(child_score))
+        if not ok:
+            continue
+        kept.append(state)
+        labels.append(
+            {
+                "solver_value": int(solver_value),
+                "solver_score": int(solver_score),
+                "optimal_moves": [int(m) for m in optimal_moves],
+                "children": children,
+            }
+        )
+    return kept, labels
+
+
+def save_eval_labels(labels: Sequence[dict], path: str | Path) -> None:
+    """Serialize precomputed solver labels (children keys -> str for JSON)."""
+    payload = {
+        "version": 1,
+        "labels": [
+            {
+                "solver_value": lab["solver_value"],
+                "solver_score": lab["solver_score"],
+                "optimal_moves": lab["optimal_moves"],
+                "children": {str(m): list(v) for m, v in lab["children"].items()},
+            }
+            for lab in labels
+        ],
+    }
+    Path(path).write_text(json.dumps(payload))
+
+
+def load_eval_labels(path: str | Path) -> list[dict]:
+    payload = json.loads(Path(path).read_text())
+    if int(payload.get("version", 0)) != 1:
+        raise ValueError(f"unsupported eval-labels version {payload.get('version')!r}")
+    return [
+        {
+            "solver_value": int(lab["solver_value"]),
+            "solver_score": int(lab["solver_score"]),
+            "optimal_moves": [int(m) for m in lab["optimal_moves"]],
+            "children": {int(m): tuple(v) for m, v in lab["children"].items()},
+        }
+        for lab in payload["labels"]
+    ]
+
+
+def _stack_pgx_states(states: Sequence[PgxConnectFourState]) -> PgxConnectFourState:
+    """Stack a list of single pgx states into one batched state."""
+    return jax.tree.map(lambda *leaves: jnp.stack(leaves, axis=0), *states)
+
+
+def certify_checkpoint_batched(
+    checkpoint: str | Path,
+    positions: Sequence[ConnectFourState],
+    *,
+    labels: Sequence[dict] | None = None,
+    sims: int = DEFAULT_SIMS,
+    seed: int = 0,
+    solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
+) -> CertificationReport:
+    """Certify via one batched mctx call + cached solver labels (prototype).
+
+    Identical metrics to :func:`certify_connect_four`, but all positions are
+    searched in a single vmap'd MCTS call and regret is looked up from
+    precomputed labels (no per-position solver calls). The MCTS rng is one
+    top-level key for the batch (mctx samples per-element gumbel noise), so
+    results are deterministic but not byte-identical to the per-position-seeded
+    serial path — the metrics are statistically equivalent.
+    """
+    if labels is None:
+        positions, labels = precompute_solver_labels(
+            positions, solver_max_nodes=solver_max_nodes
+        )
+    if len(positions) != len(labels):
+        raise ValueError("positions and labels must align (run precompute together)")
+    if not positions:
+        return _report(sampled_positions=0, skipped_positions=0, records=())
+
+    model = load_jax_checkpoint(checkpoint)
+    graphdef, params = nnx.split(model, nnx.Param)
+    search = _make_search(graphdef, sims)
+    predict = _make_predict(graphdef)
+
+    batched = _stack_pgx_states([solver_state_to_pgx_state(s) for s in positions])
+    actions, _ = search(params, batched, jax.random.PRNGKey(seed))
+    moves = [int(a) for a in jax.device_get(actions)]
+    values = [float(v) for v in jax.device_get(predict(params, batched.observation))]
+
+    records: list[PositionCertification] = []
+    for move, agent_value, lab in zip(moves, values, labels, strict=True):
+        child_value, child_score = lab["children"][move]
+        agent_outcome = -child_value
+        agent_score = -child_score
+        score_regret = lab["solver_score"] - agent_score
+        wdl_regret = int(np.sign(lab["solver_value"])) - int(np.sign(agent_outcome))
+        records.append(
+            PositionCertification(
+                solver_value=lab["solver_value"],
+                optimal_moves=tuple(lab["optimal_moves"]),
+                agent_move=move,
+                agent_value=agent_value,
+                agent_outcome=agent_outcome,
+                policy_match=move in lab["optimal_moves"],
+                blunder=agent_outcome < lab["solver_value"],
+                score_blunder=score_regret > 0,
+                score_regret=score_regret,
+                wdl_regret=wdl_regret,
+            )
+        )
+    return _report(
+        sampled_positions=len(positions),
+        skipped_positions=0,
+        records=records,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Certify a Connect Four checkpoint against exact solver labels."
