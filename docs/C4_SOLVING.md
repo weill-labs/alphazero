@@ -99,20 +99,22 @@ architecture and WDLP are multi-seed.
 | Self-play sims 32/64/128 | **null** | non-monotonic 0.041/0.067/0.041 at iters=80 — sampling noise |
 | Training length 80 vs 200 iters | **converged by ~80** | iters=80 ≈ iters=200 for the same seed |
 | Batch size 32/128/256 | **null** | non-monotonic 0.041/0.031/0.041 at iters=80 — sampling noise |
+| Deterministic checkpoint ladder | **adopted** | capstone ResNet `iter_0050` beats final: 20/856 = 0.023 on 1024-sample cert |
 
 ## The blunder floor
 
-The C4 weak-blunder floor (**~0.04–0.07** at `--sims 800`) is robust to every
-algorithmic lever tested above. The transformer matches the ResNet; neither goes
-lower. A SOTA-scale capstone (batch=512, 150 iters, ~76k games) **held the floor
-at 0.046** — disproving the earlier "the gap is just compute/data volume"
-hypothesis: compute scale alone does not solve C4 here. The residual gap to the
-literature (~10–20×) is most likely a setup/eval difference, and the bottleneck
-is **policy fidelity on sharp tactical positions**, not value calibration (which
-several levers improved without reducing blunders). There is no cheap global
-knob left. See the full **[C4_FINDINGS.md](C4_FINDINGS.md)** report for the
-complete results, the capstone, the sims=600 residual-gap test, and the
-value/policy decoupling finding.
+The C4 weak-blunder floor for **final checkpoints** was **~0.04–0.07** at
+`--sims 800`, and every global training lever above failed to move it
+reliably. A later deterministic checkpoint ladder found a free checkpoint
+selection win: the capstone ResNet `trjd57fm/iter_0050` certified at
+**20/856 = 0.023** on a larger 1024-sample cert, better than both the same run's
+final checkpoint (**29/857 = 0.034**) and the sims=600 final (**30/859 =
+0.035**). This does not mean compute scale solved C4; it means periodic
+checkpoint selection matters, and final checkpoint metrics can hide the best
+model. The remaining bottleneck is still **policy fidelity on sharp tactical
+positions**, not value calibration. See the full **[C4_FINDINGS.md](C4_FINDINGS.md)**
+report for the complete results, the capstone, the sims=600 residual-gap test,
+the checkpoint ladder, and the value/policy decoupling finding.
 
 ## SOTA-scale run: cost
 

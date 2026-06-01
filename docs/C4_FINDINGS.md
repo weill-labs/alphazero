@@ -8,15 +8,16 @@ the certification harness, CLI recipes). For the earlier seed-variance study see
 
 ## TL;DR
 
-We drove the weak-blunder rate from a baseline **0.082 down to ~0.04** and then
-hit a hard floor. Every algorithmic lever we tested — architecture, value-head
-representation, eval search depth, self-play search depth, training length, and
-batch size — moves *some* metric but **none break the ~0.04–0.07 floor**. A
-deliberate SOTA-scale capstone run (batch=512, 150 iterations) confirmed the
-floor holds at scale: **compute alone does not solve C4 in this setup.** The
-floor sits ~10–20× above the literature's near-perfect agents (Prasad's weak err
-≈ 0.24%), and the residual gap is a **setup/eval difference**, not a missing
-knob.
+We drove the weak-blunder rate from a baseline **0.082** to a current best
+deterministic cert of **0.023** (20/856) by fixing eval noise and selecting the
+best periodic checkpoint. The global training levers we tested — architecture,
+value-head representation, eval search depth, self-play search depth, training
+length, and batch size — still did **not** explain the gap: final checkpoints
+clustered around the old **~0.04–0.07** floor, and the SOTA-scale capstone
+improved only after checkpoint-ladder selection found that `iter_0050` was better
+than `final.msgpack`. Compute alone does not solve C4 in this setup. The current
+best is still ~10× above the literature's near-perfect agents (Prasad's weak err
+≈ 0.24%), so the residual gap remains real.
 
 The clearest scientific finding is a **decoupling**: several levers (the
 transformer tower, deeper self-play search) sharply improve the value head's
@@ -86,10 +87,12 @@ no-effect). Bead IDs in the last column.
 | Self-play sims 32/64/128 | **null** | 0.072 / 0.108 / 0.073 wdl @ iters=80, non-monotonic | alphago-0fj |
 | Training length 80 vs 200 iters | **converged by ~80** | 0.041 (iter80) ≈ 0.052 (iter200), same seed | alphago-0fj |
 | Batch size 32/128/256 | **null** | 0.072 / 0.052 / 0.067 wdl @ iters=80, non-monotonic | alphago-2s9 |
+| Deterministic checkpoint ladder | **adopted** | capstone ResNet `iter_0050`: 20/856 = 0.023 on 1024-sample cert | alphago-938 |
 
-Reading the table: the only changes that ever *helped* were the early
-capacity/stability/data-augmentation choices that established the baseline. Once
-on that baseline, **every knob we turned was null.**
+Reading the table: the only changes that clearly *helped* were the early
+capacity/stability/data-augmentation choices that established the baseline and
+the later measurement/checkpoint-selection fix. Once on that baseline, the
+global training knobs were null.
 
 ## The transformer arc (full story across scales)
 
@@ -134,10 +137,10 @@ on the fixed set (`alphago-qow`):
 
 **Two verdicts:**
 
-1. **The floor held.** Neither arm broke below ~0.046 — the same band as the
-   30-minute lever-sweep runs. *Compute scale alone does not solve C4 in this
-   setup.* A properly-scaled run lands ~10–20× above the literature's
-   near-perfect agents.
+1. **The final-checkpoint floor held.** Neither final checkpoint broke below
+   ~0.046 — the same band as the 30-minute lever-sweep runs. *Compute scale
+   alone does not solve C4 in this setup.* A properly-scaled final checkpoint
+   still landed far above the literature's near-perfect agents.
 2. **ResNet beats transformer at scale** (see the transformer arc above).
 
 This was the experiment that falsified the "the floor is just compute/data
@@ -164,6 +167,26 @@ The iter-90 and iter-100 certs were identical (converged by ~iter 90).
 position out of 194, statistically tied. The residual gap to the literature is
 not explained by self-play sims either.
 
+## The checkpoint-ladder correction
+
+After fixing certification to default to deterministic perfect-information MCTS
+(`--gumbel-scale 0.0`), we certified periodic checkpoints instead of only
+`final.msgpack` (`alphago-ari`, `alphago-938`). That found a real, non-training
+win:
+
+| Checkpoint | 256-position deterministic cert | 1024-sample deterministic cert |
+| --- | --- | --- |
+| capstone ResNet `trjd57fm/iter_0050` | **6/193 = 0.031**, wdl 0.052 | **20/856 = 0.023**, wdl 0.041 |
+| capstone ResNet `trjd57fm/final` | 9/193 = 0.047, wdl 0.073 | 29/857 = 0.034, wdl 0.056 |
+| sims=600 ResNet `final` | 7/193 = 0.036, wdl 0.057 | 30/859 = 0.035, wdl 0.052 |
+| transformer `53q8o9ht/iter_0025` | 7/193 = 0.036, wdl 0.057 | not promoted; worse than ResNet ladder best |
+
+The evaluated counts differ slightly in the 1024 cert because solver-budget
+skips are move-dependent, so this is not a perfectly paired comparison. It is
+still a material improvement over both final checkpoints and should be treated
+as the current best known C4 model. The main lesson is operational: **certify the
+checkpoint ladder before declaring the run's quality.**
+
 ## The central scientific finding: value/policy decoupling
 
 Three independent results point at the same conclusion:
@@ -175,11 +198,11 @@ Three independent results point at the same conclusion:
 **At the C4 plateau, blunder rate is governed by policy fidelity on a small set
 of sharp tactical positions — not by value-head calibration.** Levers that
 sharpen the value head do not sharpen the policy on those positions, so they do
-not reduce blunders. This is why "no cheap lever remains": we have no knob that
-specifically improves policy accuracy on hard positions. The most promising
-*untested* direction is therefore **solver-supervised hard-position rehearsal**
-(open bead `alphago-fvh`) — directly training the policy on the positions it
-gets wrong — rather than any of the global hyperparameters we swept.
+not reduce blunders. Checkpoint-ladder selection reduced the measured rate, but
+it did not introduce a new learning signal. The most promising *untested*
+direction is therefore **solver-supervised hard-position rehearsal** (open bead
+`alphago-fvh`) — directly training the policy on the positions it gets wrong —
+rather than any of the global hyperparameters we swept.
 
 ## Operational lessons
 
@@ -205,11 +228,14 @@ gets wrong — rather than any of the global hyperparameters we swept.
 
 ## Conclusion and what we'd do next
 
-The C4 weak-blunder floor is **~0.04–0.07 at sims=800, robust to every
-algorithmic lever and to compute scale.** It is structural to this setup, ~10–20×
-above the literature's near-perfect agents. The residual gap is most likely a
-**setup/eval difference** — eval-set difficulty, or a training-detail mismatch
-vs AlphaZero.jl — not a missing global hyperparameter, and not raw compute.
+The best known C4 checkpoint is now the capstone ResNet periodic checkpoint
+`trjd57fm/iter_0050`, at **20/856 = 0.023** weak blunders on the 1024-sample
+deterministic cert. The old **~0.04–0.07** floor describes final checkpoints and
+stochastic/shallower-cert conclusions, not the best checkpoint selected from the
+ladder. That is a useful improvement, but it is not a solve and remains roughly
+an order of magnitude above the literature's near-perfect agents. The residual
+gap is most likely a setup/eval difference or a missing hard-position learning
+signal — not a missing global hyperparameter, and not raw compute.
 
 Given the decoupling finding, global hyperparameter sweeps are exhausted. The
 remaining open directions, in priority order:
@@ -241,6 +267,8 @@ cached solver labels make every cert a paired comparison — build them once wit
 - `alphago-cut` — WDLP value head (null)
 - `alphago-0fj` — self-play sims sweep + training-length (null)
 - `alphago-2s9` — batch-size ladder (null)
-- `alphago-qow` — SOTA-scale capstone (floor held; ResNet > transformer)
+- `alphago-qow` — SOTA-scale capstone (final-checkpoint floor held; ResNet > transformer)
 - `alphago-mgx` — sims=600 residual-gap test (value_mae −25%, floor held)
+- `alphago-ari` — deterministic perfect-information certification default
+- `alphago-938` — checkpoint ladder; current best `trjd57fm/iter_0050`
 - `alphago-fvh` — **open**: solver-supervised hard-position rehearsal (next lever)
