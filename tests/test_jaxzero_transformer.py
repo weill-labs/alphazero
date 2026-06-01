@@ -246,8 +246,8 @@ def test_per_column_policy_head_param_count_is_smaller_than_flatten() -> None:
     def count(model):
         _, params = nnx.split(model, nnx.Param)
         return sum(
-            int(jnp.prod(jnp.array(l.shape)))
-            for l in jax.tree.leaves(nnx.to_pure_dict(params))
+            int(jnp.prod(jnp.array(leaf.shape)))
+            for leaf in jax.tree.leaves(nnx.to_pure_dict(params))
         )
 
     assert count(per_col) < count(flatten), "per_column should have fewer params"
