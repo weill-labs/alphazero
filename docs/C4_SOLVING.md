@@ -199,6 +199,33 @@ flags keep stochastic exploration for the first 8 plies and make later
 self-play choices greedy with no root Dirichlet noise. Certification remains
 deterministic separately via `alphazero.c4_certify --gumbel-scale 0.0`.
 
+Train policy-only hard-position rehearsal:
+
+```bash
+python -m jaxzero.cli \
+  --iterations 150 --batch-size 512 --sims 256 \
+  --channels 128 --num-res-blocks 5 \
+  --gating-interval 10 --gating-games 20 --gating-threshold 0.55 \
+  --mirror-augment \
+  --solver-rehearsal-positions 256 \
+  --solver-rehearsal-hard-pool-size 2048 \
+  --solver-rehearsal-hard-checkpoint checkpoints/best/iter_0050.msgpack \
+  --solver-rehearsal-hard-sims 800 \
+  --solver-rehearsal-batch-size 256 \
+  --solver-rehearsal-target wdl \
+  --solver-rehearsal-policy-loss-weight 1.0 \
+  --solver-rehearsal-value-loss-weight 0.0 \
+  --checkpoint-every 25 --checkpoint checkpoints/connectfour/final.msgpack
+```
+
+Hard mining samples a larger training-only candidate pool, solver-labels it,
+certifies a reference checkpoint, and keeps up to `--solver-rehearsal-positions`
+positions where that checkpoint missed the solver-optimal policy or incurred
+regret. Use `wdl` targets first so all outcome-optimal moves remain acceptable;
+`--solver-rehearsal-value-loss-weight 0.0` makes the extra supervised update
+policy-only, avoiding the value/policy tradeoff seen in the temperature
+schedule experiment.
+
 Train a Tier-1 transformer on Modal:
 
 ```bash
