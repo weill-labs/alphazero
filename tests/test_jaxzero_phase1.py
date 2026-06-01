@@ -28,6 +28,7 @@ from jaxzero.train import (
     load_checkpoint,
     run_training,
     save_checkpoint,
+    solver_rehearsal_data_from_labels,
 )
 
 
@@ -411,6 +412,103 @@ def test_mirror_selfplay_data_keeps_scalar_fields_identical() -> None:
         augmented = getattr(mirrored, field)
         assert jnp.array_equal(augmented[:2], original)
         assert jnp.array_equal(augmented[2:], original)
+
+
+def test_solver_rehearsal_labels_can_target_score_or_wdl_optimal_moves() -> None:
+    from alphazero.games.connectfour import ConnectFour
+
+    state = ConnectFour().initial_state()
+    label = {
+        "solver_value": 1,
+        "solver_score": 5,
+        "optimal_moves": [2, 3],
+        "children": {
+            2: (-1, -5),  # mover score 5: score-optimal
+            3: (-1, -4),  # mover score 4: WDL-optimal but slower
+            4: (0, 0),
+        },
+    }
+
+    score_data = solver_rehearsal_data_from_labels([state], [label], target="score")
+    wdl_data = solver_rehearsal_data_from_labels([state], [label], target="wdl")
+
+    assert score_data.observation.shape == (1, 6, 7, 2)
+    assert jnp.array_equal(
+        score_data.action_weights[0],
+        jnp.array([0, 0, 1, 0, 0, 0, 0], dtype=jnp.float32),
+    )
+    assert jnp.array_equal(
+        wdl_data.action_weights[0],
+        jnp.array([0, 0, 0.5, 0.5, 0, 0, 0], dtype=jnp.float32),
+    )
+    assert score_data.value_target[0] == 1.0
+    assert score_data.value_mask[0]
+
+
+def _dummy_c4_rehearsal_data(n: int = 3) -> SelfPlayData:
+    observation = jnp.zeros((n, 6, 7, 2), dtype=jnp.float32)
+    action_weights = jnp.zeros((n, 7), dtype=jnp.float32).at[:, 3].set(1.0)
+    return SelfPlayData(
+        observation=observation,
+        action_weights=action_weights,
+        reward=jnp.zeros((n,), dtype=jnp.float32),
+        discount=jnp.zeros((n,), dtype=jnp.float32),
+        terminated=jnp.zeros((n,), dtype=jnp.bool_),
+        value_target=jnp.ones((n,), dtype=jnp.float32),
+        value_mask=jnp.ones((n,), dtype=jnp.bool_),
+    )
+
+
+def test_run_training_with_solver_rehearsal_logs_supervised_metrics(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_build_solver_rehearsal_data(**kwargs) -> SelfPlayData:
+        calls.append(kwargs)
+        return _dummy_c4_rehearsal_data(3)
+
+    monkeypatch.setattr(
+        "jaxzero.train.build_solver_rehearsal_data",
+        fake_build_solver_rehearsal_data,
+    )
+    config = replace(
+        _tiny_training_config(seed=12),
+        solver_rehearsal_positions=5,
+        solver_rehearsal_batch_size=2,
+        solver_rehearsal_seed=99,
+        solver_rehearsal_target="wdl",
+    )
+    logged: list[dict[str, float | int]] = []
+
+    run_training(config, on_iteration=logged.append)
+
+    assert calls == [
+        {
+            "sample_size": 5,
+            "seed": 99,
+            "target": "wdl",
+            "solver_max_nodes": 250_000,
+        }
+    ]
+    assert logged[0]["solver_rehearsal/examples"] == 2
+    assert logged[0]["solver_rehearsal/pool_size"] == 3
+    assert jnp.isfinite(logged[0]["solver_rehearsal/loss"])
+    assert "solver_rehearsal/policy_loss" in logged[0]
+    assert "solver_rehearsal/value_loss" in logged[0]
+
+
+def test_solver_rehearsal_config_validation() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="solver_rehearsal_positions"):
+        replace(_tiny_training_config(), solver_rehearsal_positions=-1)
+    with pytest.raises(ValueError, match="solver_rehearsal_batch_size"):
+        replace(_tiny_training_config(), solver_rehearsal_batch_size=-1)
+    with pytest.raises(ValueError, match="solver_rehearsal_interval"):
+        replace(_tiny_training_config(), solver_rehearsal_interval=0)
+    with pytest.raises(ValueError, match="solver_rehearsal_target"):
+        replace(_tiny_training_config(), solver_rehearsal_target="bad")
 
 
 def test_gating_persists_best_params_not_live(tmp_path) -> None:

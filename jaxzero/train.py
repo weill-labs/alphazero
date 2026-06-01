@@ -16,7 +16,6 @@ from jaxzero.arena import gating_summary, make_gating_match, update_elo
 from jaxzero.evaluate import make_evaluator, vs_random_metrics
 from jaxzero.net import (
     ARCH_RESNET,
-    ARCH_TRANSFORMER,
     INPUT_EMBED_LINEAR,
     POLICY_HEAD_FLATTEN,
     AlphaZeroNetConfig,
@@ -59,6 +58,12 @@ class TrainingConfig:
     gating_threshold: float = 0.55
     value_loss_weight: float = 1.0
     mirror_augment: bool = False
+    solver_rehearsal_positions: int = 0
+    solver_rehearsal_batch_size: int = 0
+    solver_rehearsal_interval: int = 1
+    solver_rehearsal_seed: int | None = None
+    solver_rehearsal_target: str = "score"
+    solver_rehearsal_solver_max_nodes: int = 250_000
     weight_decay: float = 0.0
     arch: str = ARCH_RESNET
     d_model: int = 128
@@ -106,6 +111,21 @@ class TrainingConfig:
                 raise ValueError(msg)
         if self.value_loss_weight <= 0:
             msg = "value_loss_weight must be positive"
+            raise ValueError(msg)
+        if self.solver_rehearsal_positions < 0:
+            msg = "solver_rehearsal_positions must be non-negative"
+            raise ValueError(msg)
+        if self.solver_rehearsal_batch_size < 0:
+            msg = "solver_rehearsal_batch_size must be non-negative"
+            raise ValueError(msg)
+        if self.solver_rehearsal_interval <= 0:
+            msg = "solver_rehearsal_interval must be positive"
+            raise ValueError(msg)
+        if self.solver_rehearsal_target not in ("score", "wdl"):
+            msg = "solver_rehearsal_target must be 'score' or 'wdl'"
+            raise ValueError(msg)
+        if self.solver_rehearsal_solver_max_nodes <= 0:
+            msg = "solver_rehearsal_solver_max_nodes must be positive"
             raise ValueError(msg)
         if self.weight_decay < 0:
             msg = "weight_decay must be non-negative"
@@ -227,6 +247,14 @@ def _host_metrics(
     }
 
 
+def _prefixed_host_metrics(
+    metrics: dict[str, jax.Array], *, prefix: str
+) -> dict[str, float]:
+    return {
+        f"{prefix}{key}": float(jax.device_get(value)) for key, value in metrics.items()
+    }
+
+
 def _train_epoch(
     update_step,
     params: nnx.State,
@@ -285,6 +313,124 @@ def _append_to_buffer(
     if n > capacity:
         combined = jax.tree.map(lambda x: x[n - capacity :], combined)
     return combined
+
+
+def _sample_training_data(
+    data: SelfPlayData, batch_size: int, key: jax.Array
+) -> SelfPlayData:
+    n = int(data.observation.shape[0])
+    if n <= 0:
+        raise ValueError("cannot sample from an empty training dataset")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if batch_size <= n:
+        idx = jax.random.permutation(key, n)[:batch_size]
+    else:
+        idx = jax.random.randint(key, (batch_size,), minval=0, maxval=n)
+    return jax.tree.map(lambda leaf: leaf[idx], data)
+
+
+def build_solver_rehearsal_data(
+    *,
+    sample_size: int,
+    seed: int,
+    target: str = "score",
+    solver_max_nodes: int = 250_000,
+) -> SelfPlayData:
+    """Build a fixed C4 solver-labeled rehearsal pool.
+
+    The pool is intentionally separate from the cert eval set: callers choose a
+    seed for training labels and keep held-out cert seeds for verdicts. Policies
+    are uniform over either all WDL-optimal moves or the stricter score-optimal
+    subset; values are exact solver W/D/L labels from the player-to-move view.
+    """
+
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive")
+    if target not in ("score", "wdl"):
+        raise ValueError("target must be 'score' or 'wdl'")
+    if solver_max_nodes <= 0:
+        raise ValueError("solver_max_nodes must be positive")
+
+    # Local import avoids making the generic trainer import the certification
+    # stack unless the C4-specific rehearsal feature is enabled.
+    from alphazero.c4_certify import precompute_solver_labels, sample_positions
+
+    positions = sample_positions(sample_size=sample_size, seed=seed)
+    kept_positions, labels = precompute_solver_labels(
+        positions,
+        solver_max_nodes=solver_max_nodes,
+    )
+    if not kept_positions:
+        raise ValueError("solver rehearsal produced no solved positions")
+    return solver_rehearsal_data_from_labels(
+        kept_positions,
+        labels,
+        target=target,
+    )
+
+
+def solver_rehearsal_data_from_labels(
+    positions,
+    labels,
+    *,
+    target: str = "score",
+) -> SelfPlayData:
+    """Convert precomputed C4 solver labels into ``SelfPlayData`` examples."""
+
+    if target not in ("score", "wdl"):
+        raise ValueError("target must be 'score' or 'wdl'")
+    if len(positions) != len(labels):
+        raise ValueError("positions and labels must align")
+    if not positions:
+        raise ValueError("positions must not be empty")
+
+    observations = []
+    action_weights = []
+    values = []
+    for state, label in zip(positions, labels, strict=True):
+        observations.append(_solver_observation(state))
+        action_weights.append(_solver_policy_target(label, target=target))
+        values.append(float(label["solver_value"]))
+
+    n = len(observations)
+    return SelfPlayData(
+        observation=jnp.asarray(observations, dtype=jnp.float32),
+        action_weights=jnp.asarray(action_weights, dtype=jnp.float32),
+        reward=jnp.zeros((n,), dtype=jnp.float32),
+        discount=jnp.zeros((n,), dtype=jnp.float32),
+        terminated=jnp.zeros((n,), dtype=jnp.bool_),
+        value_target=jnp.asarray(values, dtype=jnp.float32),
+        value_mask=jnp.ones((n,), dtype=jnp.bool_),
+    )
+
+
+def _solver_observation(state) -> jax.Array:
+    import numpy as np
+
+    board = np.asarray(state.board, dtype=np.int32)
+    current = (board == int(state.player)).astype(np.float32)
+    opponent = (board == -int(state.player)).astype(np.float32)
+    return np.stack([current, opponent], axis=-1)
+
+
+def _solver_policy_target(label, *, target: str) -> jax.Array:
+    import numpy as np
+
+    if target == "wdl":
+        moves = [int(move) for move in label["optimal_moves"]]
+    else:
+        solver_score = int(label["solver_score"])
+        moves = [
+            int(move)
+            for move, (_, child_score) in label["children"].items()
+            if -int(child_score) == solver_score
+        ]
+    if not moves:
+        moves = [int(move) for move in label["optimal_moves"]]
+    weights = np.zeros((7,), dtype=np.float32)
+    weights[moves] = 1.0 / len(moves)
+    return weights
 
 
 def run_training(
@@ -361,12 +507,37 @@ def run_training(
     best_elo = 0.0
     last_gating_winrate = 0.0
     last_promoted = 0
+    solver_rehearsal_pool = (
+        build_solver_rehearsal_data(
+            sample_size=config.solver_rehearsal_positions,
+            seed=(
+                config.solver_rehearsal_seed
+                if config.solver_rehearsal_seed is not None
+                else config.seed + 10_000
+            ),
+            target=config.solver_rehearsal_target,
+            solver_max_nodes=config.solver_rehearsal_solver_max_nodes,
+        )
+        if config.solver_rehearsal_positions > 0
+        else None
+    )
+    solver_rehearsal_batch_size = (
+        config.solver_rehearsal_batch_size
+        if config.solver_rehearsal_batch_size > 0
+        else (
+            int(solver_rehearsal_pool.observation.shape[0])
+            if solver_rehearsal_pool is not None
+            else 0
+        )
+    )
 
     key = jax.random.PRNGKey(config.seed)
     history: list[dict[str, float | int]] = []
     buffer: SelfPlayData | None = None
     for iteration in range(config.iterations):
-        key, selfplay_key, shuffle_key = jax.random.split(key, 3)
+        key, selfplay_key, shuffle_key, rehearsal_key, rehearsal_shuffle_key = (
+            jax.random.split(key, 5)
+        )
         selfplay_params = best_params if gating_enabled else params
         new_data = flatten_selfplay_data(selfplay(selfplay_params, selfplay_key))
         if config.mirror_augment:
@@ -376,6 +547,37 @@ def run_training(
             update_step, params, opt_state, buffer, config.minibatch_size, shuffle_key
         )
         host_metrics = _host_metrics(metrics, iteration=iteration)
+        if (
+            solver_rehearsal_pool is not None
+            and (iteration + 1) % config.solver_rehearsal_interval == 0
+        ):
+            rehearsal_data = _sample_training_data(
+                solver_rehearsal_pool,
+                solver_rehearsal_batch_size,
+                rehearsal_key,
+            )
+            if config.mirror_augment:
+                rehearsal_data = mirror_selfplay_data(rehearsal_data)
+            params, opt_state, rehearsal_metrics = _train_epoch(
+                update_step,
+                params,
+                opt_state,
+                rehearsal_data,
+                config.minibatch_size,
+                rehearsal_shuffle_key,
+            )
+            host_metrics.update(
+                _prefixed_host_metrics(
+                    rehearsal_metrics,
+                    prefix="solver_rehearsal/",
+                )
+            )
+            host_metrics["solver_rehearsal/examples"] = int(
+                rehearsal_data.observation.shape[0]
+            )
+            host_metrics["solver_rehearsal/pool_size"] = int(
+                solver_rehearsal_pool.observation.shape[0]
+            )
         if gating_enabled:
             iteration_number = iteration + 1
             if iteration_number % config.gating_interval == 0:
