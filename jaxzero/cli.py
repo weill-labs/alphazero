@@ -18,6 +18,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--sims", "--num-simulations", dest="num_simulations", type=int, default=32
     )
     parser.add_argument("--max-steps", type=int, default=64)
+    parser.add_argument(
+        "--selfplay-temperature",
+        type=float,
+        default=1.0,
+        help="Visit-count sampling temperature for self-play actions. "
+        "Default 1.0 preserves current behavior; 0.0 is greedy.",
+    )
+    parser.add_argument(
+        "--selfplay-temperature-drop-step",
+        type=int,
+        help="At this zero-based ply and later, use --selfplay-temperature-after-drop.",
+    )
+    parser.add_argument(
+        "--selfplay-temperature-after-drop",
+        type=float,
+        default=1.0,
+        help="Self-play action temperature after the drop step. Default 1.0.",
+    )
+    parser.add_argument(
+        "--selfplay-dirichlet-fraction",
+        type=float,
+        default=0.25,
+        help="Root Dirichlet-noise mixture for self-play MCTS. Default 0.25.",
+    )
+    parser.add_argument(
+        "--selfplay-dirichlet-fraction-drop-step",
+        type=int,
+        help="At this zero-based ply and later, use "
+        "--selfplay-dirichlet-fraction-after-drop.",
+    )
+    parser.add_argument(
+        "--selfplay-dirichlet-fraction-after-drop",
+        type=float,
+        default=0.25,
+        help="Root Dirichlet-noise mixture after the drop step. Default 0.25.",
+    )
+    parser.add_argument(
+        "--selfplay-dirichlet-alpha",
+        type=float,
+        default=0.3,
+        help="Dirichlet alpha for root exploration noise. Default 0.3.",
+    )
     parser.add_argument("--channels", type=int, default=64)
     parser.add_argument("--num-res-blocks", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -210,6 +252,17 @@ def main(argv: list[str] | None = None) -> None:
         batch_size=args.batch_size,
         num_simulations=args.num_simulations,
         max_steps=args.max_steps,
+        selfplay_temperature=args.selfplay_temperature,
+        selfplay_temperature_drop_step=args.selfplay_temperature_drop_step,
+        selfplay_temperature_after_drop=args.selfplay_temperature_after_drop,
+        selfplay_dirichlet_fraction=args.selfplay_dirichlet_fraction,
+        selfplay_dirichlet_fraction_drop_step=(
+            args.selfplay_dirichlet_fraction_drop_step
+        ),
+        selfplay_dirichlet_fraction_after_drop=(
+            args.selfplay_dirichlet_fraction_after_drop
+        ),
+        selfplay_dirichlet_alpha=args.selfplay_dirichlet_alpha,
         channels=args.channels,
         num_res_blocks=args.num_res_blocks,
         learning_rate=args.learning_rate,

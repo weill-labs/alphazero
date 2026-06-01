@@ -21,6 +21,7 @@ from jaxzero.selfplay import (
     make_env,
     make_selfplay,
     mirror_selfplay_data,
+    scheduled_scalar,
 )
 from jaxzero.train import (
     TrainingConfig,
@@ -113,6 +114,77 @@ def test_selfplay_smoke_produces_training_data() -> None:
     assert jnp.allclose(jnp.sum(flat.action_weights, axis=-1), 1.0)
     assert flat.value_target.shape == (4,)
     assert flat.value_mask.shape == (4,)
+
+
+def test_selfplay_schedule_defaults_preserve_current_behavior() -> None:
+    config = SelfPlayConfig()
+
+    assert config.temperature == 1.0
+    assert config.temperature_drop_step is None
+    assert config.temperature_after_drop == 1.0
+    assert config.dirichlet_fraction == 0.25
+    assert config.dirichlet_fraction_drop_step is None
+    assert config.dirichlet_fraction_after_drop == 0.25
+    assert config.dirichlet_alpha == 0.3
+
+
+def test_scheduled_scalar_switches_at_drop_step() -> None:
+    before = scheduled_scalar(jnp.asarray(7), initial=1.0, drop_step=8, after_drop=0.0)
+    at_drop = scheduled_scalar(jnp.asarray(8), initial=1.0, drop_step=8, after_drop=0.0)
+    disabled = scheduled_scalar(
+        jnp.asarray(100), initial=0.25, drop_step=None, after_drop=0.0
+    )
+
+    assert before == 1.0
+    assert at_drop == 0.0
+    assert disabled == 0.25
+
+
+def test_selfplay_schedule_config_validation() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="temperature"):
+        SelfPlayConfig(temperature=-0.1)
+    with pytest.raises(ValueError, match="temperature_after_drop"):
+        SelfPlayConfig(temperature_after_drop=-0.1)
+    with pytest.raises(ValueError, match="temperature_drop_step"):
+        SelfPlayConfig(temperature_drop_step=-1)
+    with pytest.raises(ValueError, match="dirichlet_fraction"):
+        SelfPlayConfig(dirichlet_fraction=1.1)
+    with pytest.raises(ValueError, match="dirichlet_fraction_after_drop"):
+        SelfPlayConfig(dirichlet_fraction_after_drop=-0.1)
+    with pytest.raises(ValueError, match="dirichlet_fraction_drop_step"):
+        SelfPlayConfig(dirichlet_fraction_drop_step=-1)
+    with pytest.raises(ValueError, match="dirichlet_alpha"):
+        SelfPlayConfig(dirichlet_alpha=0.0)
+
+
+def test_selfplay_non_default_schedule_runs() -> None:
+    env = make_env()
+    config = AlphaZeroNetConfig(
+        obs_shape=initial_observation_shape(),
+        action_size=env.num_actions,
+        channels=4,
+        num_res_blocks=1,
+    )
+    graphdef, params = nnx.split(create_model(config, seed=0), nnx.Param)
+    selfplay = make_selfplay(
+        SelfPlayConfig(
+            batch_size=2,
+            num_simulations=1,
+            max_steps=2,
+            temperature_drop_step=1,
+            temperature_after_drop=0.0,
+            dirichlet_fraction_drop_step=1,
+            dirichlet_fraction_after_drop=0.0,
+        ),
+        graphdef,
+    )
+
+    data = selfplay(params, jax.random.PRNGKey(0))
+
+    assert data.action_weights.shape == (2, 2, env.num_actions)
+    assert jnp.allclose(jnp.sum(data.action_weights, axis=-1), 1.0)
 
 
 def test_discounted_returns_mask_truncated_suffix() -> None:
@@ -351,6 +423,15 @@ def test_value_loss_weight_must_be_positive() -> None:
         replace(_tiny_training_config(), value_loss_weight=0.0)
     with pytest.raises(ValueError, match="value_loss_weight"):
         replace(_tiny_training_config(), value_loss_weight=-1.0)
+
+
+def test_training_config_passes_selfplay_schedule_validation() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="temperature_drop_step"):
+        replace(_tiny_training_config(), selfplay_temperature_drop_step=-1)
+    with pytest.raises(ValueError, match="dirichlet_fraction_after_drop"):
+        replace(_tiny_training_config(), selfplay_dirichlet_fraction_after_drop=2.0)
 
 
 def _example_data_for_mirror() -> SelfPlayData:

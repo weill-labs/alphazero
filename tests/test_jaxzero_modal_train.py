@@ -257,6 +257,13 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
         batch_size=4,
         num_simulations=5,
         max_steps=6,
+        selfplay_temperature=1.0,
+        selfplay_temperature_drop_step=8,
+        selfplay_temperature_after_drop=0.0,
+        selfplay_dirichlet_fraction=0.25,
+        selfplay_dirichlet_fraction_drop_step=8,
+        selfplay_dirichlet_fraction_after_drop=0.0,
+        selfplay_dirichlet_alpha=0.3,
         channels=7,
         num_res_blocks=1,
         learning_rate=0.02,
@@ -279,6 +286,13 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert config.iterations == 2
     assert config.batch_size == 4
     assert config.num_simulations == 5
+    assert config.selfplay_temperature == 1.0
+    assert config.selfplay_temperature_drop_step == 8
+    assert config.selfplay_temperature_after_drop == 0.0
+    assert config.selfplay_dirichlet_fraction == 0.25
+    assert config.selfplay_dirichlet_fraction_drop_step == 8
+    assert config.selfplay_dirichlet_fraction_after_drop == 0.0
+    assert config.selfplay_dirichlet_alpha == 0.3
     assert config.gating_interval == 3
     assert config.gating_games == 4
     assert config.gating_threshold == 0.6
@@ -295,6 +309,7 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert result["final_metrics"] == {"iteration": 1, "loss": 0.5}
     assert result["config"]["requested_gpu"] == "A100-40GB"
     assert result["config"]["solver_rehearsal_positions"] == 8
+    assert result["config"]["selfplay_temperature_after_drop"] == 0.0
     assert fake_run.logs[0] == ({"iteration": 0, "loss": 1.25}, 0)
     assert fake_run.logs[1] == ({"iteration": 1, "loss": 0.5}, 1)
     assert fake_run.logs[2][0]["checkpoint_written"] == 1

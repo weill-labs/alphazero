@@ -42,6 +42,13 @@ class TrainingConfig:
     batch_size: int = 32
     num_simulations: int = 32
     max_steps: int = 64
+    selfplay_temperature: float = 1.0
+    selfplay_temperature_drop_step: int | None = None
+    selfplay_temperature_after_drop: float = 1.0
+    selfplay_dirichlet_fraction: float = 0.25
+    selfplay_dirichlet_fraction_drop_step: int | None = None
+    selfplay_dirichlet_fraction_after_drop: float = 0.25
+    selfplay_dirichlet_alpha: float = 0.3
     channels: int = 64
     num_res_blocks: int = 5
     learning_rate: float = 1e-3
@@ -134,6 +141,13 @@ class TrainingConfig:
             batch_size=self.batch_size,
             num_simulations=self.num_simulations,
             max_steps=self.max_steps,
+            temperature=self.selfplay_temperature,
+            temperature_drop_step=self.selfplay_temperature_drop_step,
+            temperature_after_drop=self.selfplay_temperature_after_drop,
+            dirichlet_fraction=self.selfplay_dirichlet_fraction,
+            dirichlet_fraction_drop_step=self.selfplay_dirichlet_fraction_drop_step,
+            dirichlet_fraction_after_drop=self.selfplay_dirichlet_fraction_after_drop,
+            dirichlet_alpha=self.selfplay_dirichlet_alpha,
         )
         AlphaZeroNetConfig(
             obs_shape=initial_observation_shape(),
@@ -466,6 +480,13 @@ def run_training(
             batch_size=config.batch_size,
             num_simulations=config.num_simulations,
             max_steps=config.max_steps,
+            temperature=config.selfplay_temperature,
+            temperature_drop_step=config.selfplay_temperature_drop_step,
+            temperature_after_drop=config.selfplay_temperature_after_drop,
+            dirichlet_fraction=config.selfplay_dirichlet_fraction,
+            dirichlet_fraction_drop_step=config.selfplay_dirichlet_fraction_drop_step,
+            dirichlet_fraction_after_drop=config.selfplay_dirichlet_fraction_after_drop,
+            dirichlet_alpha=config.selfplay_dirichlet_alpha,
         ),
         graphdef,
     )
