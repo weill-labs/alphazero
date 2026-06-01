@@ -103,10 +103,16 @@ architecture and WDLP are multi-seed.
 ## The blunder floor
 
 The C4 weak-blunder floor (**~0.04–0.07** at `--sims 800`) is robust to every
-algorithmic lever tested above. The transformer matches the ResNet; neither
-goes lower. The residual gap to literal-zero is **compute-scale**, not
-architecture/search/calibration: we train `--batch-size 32` games/iter, vs
-AlphaZero.jl's 5000. There is no cheap knob left.
+algorithmic lever tested above. The transformer matches the ResNet; neither goes
+lower. A SOTA-scale capstone (batch=512, 150 iters, ~76k games) **held the floor
+at 0.046** — disproving the earlier "the gap is just compute/data volume"
+hypothesis: compute scale alone does not solve C4 here. The residual gap to the
+literature (~10–20×) is most likely a setup/eval difference, and the bottleneck
+is **policy fidelity on sharp tactical positions**, not value calibration (which
+several levers improved without reducing blunders). There is no cheap global
+knob left. See the full **[C4_FINDINGS.md](C4_FINDINGS.md)** report for the
+complete results, the capstone, the sims=600 residual-gap test, and the
+value/policy decoupling finding.
 
 ## SOTA-scale run: cost
 
@@ -159,11 +165,19 @@ modal run jaxzero/modal_train.py::main \
 
 ## Future work
 
-- **The one SOTA-scale run** (above) — the decisive capstone: either breaks the
-  floor toward "solved" or confirms compute-bound at a measured scale.
-- **Bigger boards** (Othello / Gomoku) — where AlphaViT suggests attention may
-  beat convolution; requires non-solver (Elo-based) evaluation since the exact
-  solver is C4-specific.
-- **Inline batched eval** — wire the batched cert into the per-iteration
-  training eval; marginal (small sample, infrequent) but removes the inline
-  solver cost on the training container.
+The SOTA-scale capstone is **done** (it held the floor — see
+[C4_FINDINGS.md](C4_FINDINGS.md)). Global hyperparameter sweeps are exhausted.
+The remaining directions, in priority order:
+
+- **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — train the
+  policy directly on the tactical positions it blunders. Targets the actual
+  bottleneck (policy fidelity), unlike every lever swept so far.
+- **Eval-set / methodology reconciliation** — confirm whether the ~10–20× gap to
+  the literature is real or an eval-set artifact, using a fixed shareable eval
+  set + cached labels (`alphago-yom`).
+- **Bigger boards** (Othello / Gomoku, `alphago-hjx`) — where AlphaViT suggests
+  attention may beat convolution; requires non-solver (Elo-based) evaluation
+  since the exact solver is C4-specific.
+- **Inline batched eval** — wire the batched cert into the per-iteration training
+  eval; marginal (small sample, infrequent) but removes the inline solver cost on
+  the training container.
