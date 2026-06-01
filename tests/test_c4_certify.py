@@ -7,12 +7,15 @@ import jax
 import numpy as np
 
 from alphazero.c4_certify import (
+    CertificationReport,
     JaxMCTSAgent,
+    certify_checkpoint_ladder,
     certify_checkpoint_batched,
     certify_connect_four,
     load_eval_labels,
     pgx_state_to_solver_state,
     precompute_solver_labels,
+    resolve_checkpoint_ladder_paths,
     sample_positions,
     save_eval_labels,
     solver_state_to_pgx_state,
@@ -154,6 +157,38 @@ def test_jax_mcts_agent_loads_checkpoint_and_selects_legal_move(tmp_path) -> Non
 
     assert move in game.legal_moves(state)
     assert np.isfinite(value)
+
+
+def test_certify_checkpoint_passes_gumbel_scale_to_mctx(tmp_path, monkeypatch) -> None:
+    import alphazero.c4_certify as c4_certify
+    from alphazero.c4_certify import certify_checkpoint
+
+    captured: list[float] = []
+    original = c4_certify.mctx.gumbel_muzero_policy
+
+    def wrapped(*args, **kwargs):
+        captured.append(kwargs["gumbel_scale"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(c4_certify.mctx, "gumbel_muzero_policy", wrapped)
+
+    config = AlphaZeroNetConfig(
+        obs_shape=(6, 7, 2), action_size=7, channels=4, num_res_blocks=0
+    )
+    checkpoint = tmp_path / "jaxzero.msgpack"
+    save_checkpoint(create_model(config, seed=0), checkpoint)
+    _, state = _play(_FORCED_BLOCK_DRAW)
+
+    certify_checkpoint(
+        checkpoint,
+        [state],
+        sims=1,
+        seed=0,
+        gumbel_scale=0.25,
+    )
+
+    assert captured
+    assert set(captured) == {0.25}
 
 
 def test_make_solver_evaluator_returns_blunder_policy_value_and_regret_keys(
@@ -318,6 +353,74 @@ def test_parallel_certify_matches_serial(tmp_path) -> None:
     assert parallel.as_dict() == serial.as_dict()
 
 
+def test_resolve_checkpoint_ladder_paths_sorts_iters_before_final(tmp_path) -> None:
+    for name in (
+        "final.msgpack",
+        "iter_0010.msgpack",
+        "iter_0002.msgpack",
+        "notes.msgpack",
+    ):
+        (tmp_path / name).write_bytes(b"")
+
+    paths = resolve_checkpoint_ladder_paths(tmp_path)
+
+    assert [path.name for path in paths] == [
+        "iter_0002.msgpack",
+        "iter_0010.msgpack",
+        "final.msgpack",
+        "notes.msgpack",
+    ]
+
+
+def test_certify_checkpoint_ladder_selects_lowest_solver_regret(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import alphazero.c4_certify as c4_certify
+
+    first = tmp_path / "iter_0010.msgpack"
+    second = tmp_path / "iter_0020.msgpack"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    def report(mean_wdl_regret: float, blunder_rate: float) -> CertificationReport:
+        return CertificationReport(
+            sampled_positions=1,
+            evaluated_positions=1,
+            skipped_positions=0,
+            policy_matches=1,
+            blunders=int(blunder_rate > 0),
+            policy_match_percent=100.0,
+            blunder_rate=blunder_rate,
+            value_mae=0.0,
+            solved=blunder_rate == 0.0,
+            score_blunders=0,
+            score_blunder_rate=0.0,
+            mean_wdl_regret=mean_wdl_regret,
+            mean_score_regret=mean_wdl_regret,
+            records=(),
+        )
+
+    def fake_certify(checkpoint, positions, **kwargs):
+        del positions, kwargs
+        if checkpoint == first:
+            return report(0.2, 0.1)
+        return report(0.1, 0.2)
+
+    monkeypatch.setattr(c4_certify, "certify_checkpoint", fake_certify)
+
+    ladder = certify_checkpoint_ladder(
+        [first, second],
+        positions=[],
+        batched=False,
+    )
+
+    assert ladder.best_index == 1
+    assert ladder.best is not None
+    assert ladder.best.checkpoint == str(second)
+    assert ladder.as_dict()["best_checkpoint"] == str(second)
+
+
 def test_c4_certify_imports_do_not_load_torch() -> None:
     code = "import sys, alphazero.c4_certify; raise SystemExit('torch' in sys.modules)"
     completed = subprocess.run(
@@ -378,6 +481,41 @@ def test_certify_checkpoint_batched_matches_serial_stable_metrics(tmp_path) -> N
         assert 0 <= record.wdl_regret <= 2
         if record.blunder:
             assert record.score_blunder
+
+
+def test_certify_checkpoint_batched_passes_gumbel_scale_to_mctx(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import alphazero.c4_certify as c4_certify
+
+    captured: list[float] = []
+    original = c4_certify.mctx.gumbel_muzero_policy
+
+    def wrapped(*args, **kwargs):
+        captured.append(kwargs["gumbel_scale"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(c4_certify.mctx, "gumbel_muzero_policy", wrapped)
+
+    config = AlphaZeroNetConfig(
+        obs_shape=(6, 7, 2), action_size=7, channels=4, num_res_blocks=0
+    )
+    checkpoint = tmp_path / "m.msgpack"
+    save_checkpoint(create_model(config, seed=0), checkpoint)
+    _, state = _play(_FORCED_BLOCK_DRAW)
+    kept, labels = precompute_solver_labels([state])
+
+    certify_checkpoint_batched(
+        checkpoint,
+        kept,
+        labels=labels,
+        sims=2,
+        seed=0,
+        gumbel_scale=0.5,
+    )
+
+    assert captured == [0.5]
 
 
 def test_certify_checkpoint_batched_precomputes_when_labels_omitted(tmp_path) -> None:

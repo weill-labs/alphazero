@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
+import re
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from flax import nnx
 from pgx.connect_four import GameState as PgxGameState
 from pgx.connect_four import State as PgxConnectFourState
 
-from alphazero.c4_solver import NodeBudgetExceeded, solve, solve_with_score
+from alphazero.c4_solver import NodeBudgetExceeded, solve_with_score
 from alphazero.games.connectfour import ConnectFour, ConnectFourState
 from jaxzero.net import AlphaZeroNet, apply_model
 from jaxzero.train import load_checkpoint as load_jax_checkpoint
@@ -35,6 +36,7 @@ from jaxzero.train import load_checkpoint as load_jax_checkpoint
 C4_BOARD_CELLS = 42
 DEFAULT_SAMPLE_SIZE = 32
 DEFAULT_SIMS = 200
+DEFAULT_GUMBEL_SCALE = 0.0
 DEFAULT_SOLVER_MAX_NODES = 250_000
 DEFAULT_OPENING_DEPTH = 2
 DEFAULT_RANDOM_MIN_PLIES = 18
@@ -73,8 +75,11 @@ class JaxMCTSAgent:
         *,
         sims: int = DEFAULT_SIMS,
         seed: int = 0,
+        gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
     ) -> None:
         _validate_positive("sims", sims)
+        if gumbel_scale < 0.0:
+            raise ValueError("gumbel_scale must be non-negative")
         if model.config.obs_shape != (_ROWS, _COLS, 2):
             raise ValueError(
                 "JAX Connect Four checkpoints must use pgx observation shape "
@@ -89,8 +94,13 @@ class JaxMCTSAgent:
         self.model = model
         self.sims = sims
         self.seed = seed
+        self.gumbel_scale = float(gumbel_scale)
         self._graphdef, self._params = nnx.split(model, nnx.Param)
-        self._search = _make_search(self._graphdef, sims)
+        self._search = _make_search(
+            self._graphdef,
+            sims,
+            gumbel_scale=self.gumbel_scale,
+        )
         self._predict = _make_predict(self._graphdef)
 
     @classmethod
@@ -100,10 +110,16 @@ class JaxMCTSAgent:
         *,
         sims: int = DEFAULT_SIMS,
         seed: int = 0,
+        gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
     ) -> JaxMCTSAgent:
         """Load a Phase-1 JAX checkpoint and wrap it in the Agent protocol."""
 
-        return cls(load_jax_checkpoint(checkpoint), sims=sims, seed=seed)
+        return cls(
+            load_jax_checkpoint(checkpoint),
+            sims=sims,
+            seed=seed,
+            gumbel_scale=gumbel_scale,
+        )
 
     def move(self, state: ConnectFourState) -> int:
         legal_moves = ConnectFour().legal_moves(state)
@@ -188,6 +204,38 @@ class CertificationReport:
             "score_blunder_rate": self.score_blunder_rate,
             "mean_wdl_regret": self.mean_wdl_regret,
             "mean_score_regret": self.mean_score_regret,
+        }
+
+
+@dataclass(frozen=True)
+class CheckpointLadderEntry:
+    checkpoint: str
+    report: CertificationReport
+
+    def as_dict(self) -> dict[str, bool | float | int | str]:
+        return {"checkpoint": self.checkpoint, **self.report.as_dict()}
+
+
+@dataclass(frozen=True)
+class CheckpointLadderReport:
+    entries: tuple[CheckpointLadderEntry, ...]
+    best_index: int | None
+    rank_metric: str = "mean_wdl_regret, blunder_rate, mean_score_regret"
+
+    @property
+    def best(self) -> CheckpointLadderEntry | None:
+        if self.best_index is None:
+            return None
+        return self.entries[self.best_index]
+
+    def as_dict(self) -> dict[str, object]:
+        best = self.best
+        return {
+            "rank_metric": self.rank_metric,
+            "best_index": self.best_index,
+            "best_checkpoint": best.checkpoint if best is not None else None,
+            "best": best.as_dict() if best is not None else None,
+            "checkpoints": [entry.as_dict() for entry in self.entries],
         }
 
 
@@ -289,6 +337,7 @@ def make_solver_evaluator(
     sims: int = 64,
     seed: int = 0,
     solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
 ) -> Callable[[AlphaZeroNet], dict[str, float]]:
     """Return a callback that certifies a JAX model against the solver inline.
 
@@ -303,7 +352,12 @@ def make_solver_evaluator(
     """
 
     def run(model: AlphaZeroNet) -> dict[str, float]:
-        agent = JaxMCTSAgent(model, sims=sims, seed=seed)
+        agent = JaxMCTSAgent(
+            model,
+            sims=sims,
+            seed=seed,
+            gumbel_scale=gumbel_scale,
+        )
         report = certify_connect_four(
             agent,
             sample_size=sample_size,
@@ -396,7 +450,11 @@ def pgx_state_to_solver_state(state: PgxConnectFourState) -> ConnectFourState:
 def _make_search(
     graphdef: nnx.GraphDef[AlphaZeroNet],
     sims: int,
+    *,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
 ) -> SearchFn:
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
     env = pgx.make("connect_four")
 
     def recurrent_fn(params, rng_key, action, state):
@@ -434,7 +492,7 @@ def _make_search(
             num_simulations=sims,
             invalid_actions=~state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
-            gumbel_scale=1.0,
+            gumbel_scale=gumbel_scale,
         )
         return policy_output.action, policy_output.action_weights
 
@@ -684,7 +742,7 @@ def load_eval_set(path: str | Path) -> list[ConnectFourState]:
 
 
 def _certify_chunk_worker(
-    payload: tuple[str, int, int, int, list[ConnectFourState]],
+    payload: tuple[str, int, int, float, int, list[ConnectFourState]],
 ) -> tuple[int, int, list[PositionCertification]]:
     """Worker entrypoint: build an agent and certify one chunk of positions.
 
@@ -692,8 +750,13 @@ def _certify_chunk_worker(
     worker initializes JAX and loads the checkpoint independently. Returns the
     raw counts + records so the parent can merge and aggregate once.
     """
-    checkpoint, sims, seed, solver_max_nodes, chunk = payload
-    agent = JaxMCTSAgent.from_checkpoint(checkpoint, sims=sims, seed=seed)
+    checkpoint, sims, seed, gumbel_scale, solver_max_nodes, chunk = payload
+    agent = JaxMCTSAgent.from_checkpoint(
+        checkpoint,
+        sims=sims,
+        seed=seed,
+        gumbel_scale=gumbel_scale,
+    )
     report = certify_connect_four(
         agent,
         positions=chunk,
@@ -711,6 +774,7 @@ def certify_checkpoint(
     seed: int = 0,
     solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
     workers: int = 1,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
 ) -> CertificationReport:
     """Certify ``checkpoint`` on a fixed ``positions`` list, optionally parallel.
 
@@ -721,7 +785,12 @@ def certify_checkpoint(
     from the board state, so the merged result is identical to ``workers=1``.
     """
     if workers <= 1:
-        agent = JaxMCTSAgent.from_checkpoint(checkpoint, sims=sims, seed=seed)
+        agent = JaxMCTSAgent.from_checkpoint(
+            checkpoint,
+            sims=sims,
+            seed=seed,
+            gumbel_scale=gumbel_scale,
+        )
         return certify_connect_four(
             agent,
             positions=positions,
@@ -739,7 +808,7 @@ def certify_checkpoint(
         positions[i::n_workers] for i in range(n_workers)
     ]
     payloads = [
-        (str(checkpoint), sims, seed, solver_max_nodes, chunk)
+        (str(checkpoint), sims, seed, gumbel_scale, solver_max_nodes, chunk)
         for chunk in chunks
         if chunk
     ]
@@ -760,6 +829,92 @@ def certify_checkpoint(
         sampled_positions=sampled_total,
         skipped_positions=skipped_total,
         records=records,
+    )
+
+
+def resolve_checkpoint_ladder_paths(checkpoint_dir: str | Path) -> list[Path]:
+    """Return local checkpoint files in training order, with final last."""
+    root = Path(checkpoint_dir)
+    return sorted(root.glob("*.msgpack"), key=_checkpoint_ladder_sort_key)
+
+
+def certify_checkpoint_ladder(
+    checkpoints: Sequence[str | Path],
+    positions: Sequence[ConnectFourState],
+    *,
+    labels: Sequence[dict] | None = None,
+    sims: int = DEFAULT_SIMS,
+    seed: int = 0,
+    solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
+    workers: int = 1,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    batched: bool = False,
+) -> CheckpointLadderReport:
+    """Certify a checkpoint sequence and select the best solver-scored one.
+
+    Ranking is by the headline low-variance solver metric first
+    (``mean_wdl_regret``), then weak blunder rate, then score regret. This lets
+    periodic checkpoints compete with ``final.msgpack`` on the actual solve
+    target instead of assuming the training gate's final checkpoint is best.
+    """
+    checkpoint_paths = [Path(path) for path in checkpoints]
+    if batched and labels is None:
+        positions, labels = precompute_solver_labels(
+            positions,
+            solver_max_nodes=solver_max_nodes,
+        )
+
+    entries: list[CheckpointLadderEntry] = []
+    for checkpoint in checkpoint_paths:
+        if batched:
+            report = certify_checkpoint_batched(
+                checkpoint,
+                positions,
+                labels=labels,
+                sims=sims,
+                seed=seed,
+                solver_max_nodes=solver_max_nodes,
+                gumbel_scale=gumbel_scale,
+            )
+        else:
+            report = certify_checkpoint(
+                checkpoint,
+                positions,
+                sims=sims,
+                seed=seed,
+                solver_max_nodes=solver_max_nodes,
+                workers=workers,
+                gumbel_scale=gumbel_scale,
+            )
+        entries.append(CheckpointLadderEntry(str(checkpoint), report))
+
+    best_index = (
+        min(range(len(entries)), key=lambda i: _checkpoint_ladder_rank_key(entries[i]))
+        if entries
+        else None
+    )
+    return CheckpointLadderReport(entries=tuple(entries), best_index=best_index)
+
+
+def _checkpoint_ladder_sort_key(path: Path) -> tuple[int, int, str]:
+    match = re.fullmatch(r"iter_(\d+)\.msgpack", path.name)
+    if match is not None:
+        return (0, int(match.group(1)), path.name)
+    if path.name == "final.msgpack":
+        return (1, 0, path.name)
+    return (2, 0, path.name)
+
+
+def _checkpoint_ladder_rank_key(
+    entry: CheckpointLadderEntry,
+) -> tuple[float, float, float, float, float]:
+    report = entry.report
+    return (
+        report.mean_wdl_regret,
+        report.blunder_rate,
+        report.mean_score_regret,
+        report.score_blunder_rate,
+        report.value_mae,
     )
 
 
@@ -898,15 +1053,16 @@ def certify_checkpoint_batched(
     sims: int = DEFAULT_SIMS,
     seed: int = 0,
     solver_max_nodes: int = DEFAULT_SOLVER_MAX_NODES,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
 ) -> CertificationReport:
     """Certify via one batched mctx call + cached solver labels (prototype).
 
     Identical metrics to :func:`certify_connect_four`, but all positions are
     searched in a single vmap'd MCTS call and regret is looked up from
     precomputed labels (no per-position solver calls). The MCTS rng is one
-    top-level key for the batch (mctx samples per-element gumbel noise), so
-    results are deterministic but not byte-identical to the per-position-seeded
-    serial path — the metrics are statistically equivalent.
+    top-level key for the batch, so stochastic Gumbel certs
+    (``gumbel_scale > 0``) are deterministic but not byte-identical to the
+    per-position-seeded serial path.
     """
     if labels is None:
         positions, labels = precompute_solver_labels(
@@ -919,7 +1075,7 @@ def certify_checkpoint_batched(
 
     model = load_jax_checkpoint(checkpoint)
     graphdef, params = nnx.split(model, nnx.Param)
-    search = _make_search(graphdef, sims)
+    search = _make_search(graphdef, sims, gumbel_scale=gumbel_scale)
     predict = _make_predict(graphdef)
 
     batched = _stack_pgx_states([solver_state_to_pgx_state(s) for s in positions])
@@ -960,9 +1116,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Certify a Connect Four checkpoint against exact solver labels."
     )
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        help="Certify every *.msgpack checkpoint in this directory and report "
+        "the best checkpoint by solver regret. iter_NNNN files are scored in "
+        "numeric order and final.msgpack is scored last.",
+    )
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
     parser.add_argument("--sims", type=int, default=DEFAULT_SIMS)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--gumbel-scale",
+        type=float,
+        default=DEFAULT_GUMBEL_SCALE,
+        help="Root Gumbel noise scale used by mctx.gumbel_muzero_policy during "
+        "certification. Default 0.0 gives deterministic perfect-information "
+        "evaluation; use 1.0 to reproduce older stochastic certs.",
+    )
     parser.add_argument(
         "--solver-max-nodes", type=int, default=DEFAULT_SOLVER_MAX_NODES
     )
@@ -1054,10 +1225,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    if args.checkpoint is None:
+    if args.checkpoint is not None and args.checkpoint_dir is not None:
+        parser.error("--checkpoint and --checkpoint-dir are mutually exclusive")
+    if args.checkpoint is None and args.checkpoint_dir is None:
         parser.error(
-            "--checkpoint is required unless --build-eval-set / --build-eval-labels"
+            "--checkpoint or --checkpoint-dir is required unless "
+            "--build-eval-set / --build-eval-labels"
         )
+
+    if args.checkpoint_dir is not None:
+        checkpoint_paths = resolve_checkpoint_ladder_paths(args.checkpoint_dir)
+        if not checkpoint_paths:
+            parser.error(f"no *.msgpack checkpoints found in {args.checkpoint_dir}")
+        if args.batched and args.eval_labels is not None:
+            positions, labels = load_eval_labels(args.eval_labels)
+        else:
+            positions, labels = _resolve_positions(), None
+        ladder = certify_checkpoint_ladder(
+            checkpoint_paths,
+            positions,
+            labels=labels,
+            sims=args.sims,
+            seed=args.seed,
+            solver_max_nodes=args.solver_max_nodes,
+            workers=args.workers,
+            gumbel_scale=args.gumbel_scale,
+            batched=args.batched,
+        )
+        print(json.dumps(ladder.as_dict(), sort_keys=True))
+        return 0
 
     if args.batched:
         if args.eval_labels is not None:
@@ -1072,6 +1268,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sims=args.sims,
             seed=args.seed,
             solver_max_nodes=args.solver_max_nodes,
+            gumbel_scale=args.gumbel_scale,
         )
     else:
         positions = _resolve_positions()
@@ -1083,6 +1280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed,
             solver_max_nodes=args.solver_max_nodes,
             workers=args.workers,
+            gumbel_scale=args.gumbel_scale,
         )
     print(json.dumps(report.as_dict(), sort_keys=True))
     return 0

@@ -37,6 +37,10 @@ runs:
 weak/strong split and both regrets are real (plain `solve()` collapses to
 ternary W/D/L).
 
+Certification defaults to deterministic perfect-information search:
+`--gumbel-scale 0.0`. Older certs used Gumbel root noise (`--gumbel-scale 1.0`);
+use that flag only when reproducing historical stochastic numbers.
+
 ### Why these metrics
 
 Bare blunder rate on ~100 sampled positions has SE ≈ 0.03 (±3 positions at
@@ -135,6 +139,11 @@ python -m alphazero.c4_certify --checkpoint final.msgpack --eval-set evalset.jso
 # Or the batched/cached path (fast per-cert; best on GPU).
 python -m alphazero.c4_certify --checkpoint final.msgpack --eval-set evalset.json \
   --sims 800 --batched --eval-labels evalset.labels.json
+
+# Certify every periodic checkpoint in a local directory and pick the best
+# solver-scored checkpoint (mean_wdl_regret, then weak blunder).
+python -m alphazero.c4_certify --checkpoint-dir checkpoints/run/connectfour \
+  --eval-labels evalset.labels.json --batched --sims 800
 ```
 
 Train a Tier-1 transformer on Modal:

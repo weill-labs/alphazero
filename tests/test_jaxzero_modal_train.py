@@ -125,7 +125,7 @@ def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
     options = module.app.functions[0].options
     assert options["image"] is module.image
     assert options["gpu"] == "A10G"
-    assert options["timeout"] == 6 * 60 * 60
+    assert options["timeout"] == 12 * 60 * 60
     volumes = options["volumes"]
     assert volumes["/checkpoints"].name == "alphazero-checkpoints"
     assert module.app.entrypoint is not None
