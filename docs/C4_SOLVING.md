@@ -174,6 +174,31 @@ iteration. `--solver-rehearsal-target score` trains only on distance-optimal
 moves; `wdl` trains on all outcome-optimal moves. Keep cert/eval seeds held out
 and still use the checkpoint ladder for verdicts.
 
+Train the same recipe with opening-only exploration:
+
+```bash
+python -m jaxzero.cli \
+  --iterations 150 --batch-size 512 --sims 256 \
+  --channels 128 --num-res-blocks 5 \
+  --gating-interval 10 --gating-games 20 --gating-threshold 0.55 \
+  --mirror-augment \
+  --solver-rehearsal-positions 256 \
+  --solver-rehearsal-batch-size 256 \
+  --solver-rehearsal-target score \
+  --selfplay-temperature 1.0 \
+  --selfplay-temperature-drop-step 8 \
+  --selfplay-temperature-after-drop 0.0 \
+  --selfplay-dirichlet-fraction 0.25 \
+  --selfplay-dirichlet-fraction-drop-step 8 \
+  --selfplay-dirichlet-fraction-after-drop 0.0 \
+  --checkpoint-every 25 --checkpoint checkpoints/connectfour/final.msgpack
+```
+
+`mctx.muzero_policy` samples the self-play action from visit counts, so these
+flags keep stochastic exploration for the first 8 plies and make later
+self-play choices greedy with no root Dirichlet noise. Certification remains
+deterministic separately via `alphazero.c4_certify --gumbel-scale 0.0`.
+
 Train a Tier-1 transformer on Modal:
 
 ```bash
@@ -195,6 +220,11 @@ The remaining directions, in priority order:
   policy directly on solver-labeled tactical positions. Implemented as
   `--solver-rehearsal-*`; verdict still requires held-out certs and multi-seed
   confirmation.
+- **Self-play temperature / noise schedules** (`alphago-be8`) — reduce the
+  remaining policy mismatch by keeping self-play stochastic in the opening but
+  greedy in tactical late positions. Implemented as `--selfplay-temperature-*`
+  and `--selfplay-dirichlet-fraction-*`; verdict still requires the fixed
+  eval-set checkpoint ladder.
 - **Eval-set / methodology reconciliation** — confirm whether the ~10–20× gap to
   the literature is real or an eval-set artifact, using a fixed shareable eval
   set + cached labels (`alphago-yom`).
