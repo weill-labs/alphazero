@@ -199,10 +199,10 @@ Three independent results point at the same conclusion:
 of sharp tactical positions — not by value-head calibration.** Levers that
 sharpen the value head do not sharpen the policy on those positions, so they do
 not reduce blunders. Checkpoint-ladder selection reduced the measured rate, but
-it did not introduce a new learning signal. The most promising *untested*
-direction is therefore **solver-supervised hard-position rehearsal** (open bead
-`alphago-fvh`) — directly training the policy on the positions it gets wrong —
-rather than any of the global hyperparameters we swept.
+it did not introduce a new learning signal. The next thing to test is therefore
+**solver-supervised hard-position rehearsal** (`alphago-fvh`) — directly
+training the policy on solver-labeled tactical positions — rather than any of
+the global hyperparameters we swept.
 
 ## Operational lessons
 
@@ -240,9 +240,10 @@ signal — not a missing global hyperparameter, and not raw compute.
 Given the decoupling finding, global hyperparameter sweeps are exhausted. The
 remaining open directions, in priority order:
 
-1. **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — train the
-   policy directly on the tactical positions it blunders. This targets the actual
-   bottleneck (policy fidelity), unlike everything swept so far.
+1. **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — implemented
+   behind `--solver-rehearsal-*`; still needs held-out checkpoint-ladder certs
+   and multi-seed confirmation. This targets the actual bottleneck (policy
+   fidelity), unlike everything swept so far.
 2. **Eval-set / methodology reconciliation** — confirm whether the gap to the
    literature is real or an eval-set artifact (the open eval-set + cached-labels
    work in `alphago-yom` makes this a fixed, shareable comparison).
@@ -271,4 +272,4 @@ cached solver labels make every cert a paired comparison — build them once wit
 - `alphago-mgx` — sims=600 residual-gap test (value_mae −25%, floor held)
 - `alphago-ari` — deterministic perfect-information certification default
 - `alphago-938` — checkpoint ladder; current best `trjd57fm/iter_0050`
-- `alphago-fvh` — **open**: solver-supervised hard-position rehearsal (next lever)
+- `alphago-fvh` — **in progress**: solver-supervised hard-position rehearsal

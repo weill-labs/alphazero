@@ -154,6 +154,26 @@ python -m alphazero.c4_certify --checkpoint-dir checkpoints/run/connectfour \
   --eval-labels evalset.labels.json --batched --sims 800
 ```
 
+Train with solver-supervised hard-position rehearsal:
+
+```bash
+python -m jaxzero.cli \
+  --iterations 150 --batch-size 512 --sims 256 \
+  --channels 128 --num-res-blocks 5 \
+  --gating-interval 10 --gating-games 20 --gating-threshold 0.55 \
+  --mirror-augment \
+  --solver-rehearsal-positions 256 \
+  --solver-rehearsal-batch-size 256 \
+  --solver-rehearsal-target score \
+  --checkpoint-every 25 --checkpoint checkpoints/connectfour/final.msgpack
+```
+
+This builds a fixed solver-labeled C4 pool from a training-only seed
+(`seed + 10000` by default), then adds one extra supervised update each
+iteration. `--solver-rehearsal-target score` trains only on distance-optimal
+moves; `wdl` trains on all outcome-optimal moves. Keep cert/eval seeds held out
+and still use the checkpoint ladder for verdicts.
+
 Train a Tier-1 transformer on Modal:
 
 ```bash
@@ -172,8 +192,9 @@ The SOTA-scale capstone is **done** (it held the floor — see
 The remaining directions, in priority order:
 
 - **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — train the
-  policy directly on the tactical positions it blunders. Targets the actual
-  bottleneck (policy fidelity), unlike every lever swept so far.
+  policy directly on solver-labeled tactical positions. Implemented as
+  `--solver-rehearsal-*`; verdict still requires held-out certs and multi-seed
+  confirmation.
 - **Eval-set / methodology reconciliation** — confirm whether the ~10–20× gap to
   the literature is real or an eval-set artifact, using a fixed shareable eval
   set + cached labels (`alphago-yom`).
