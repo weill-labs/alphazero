@@ -84,6 +84,46 @@ def build_parser() -> argparse.ArgumentParser:
         "extra self-play cost; directly boosts value-signal density.",
     )
     parser.add_argument(
+        "--solver-rehearsal-positions",
+        type=int,
+        default=0,
+        help="Build a fixed C4 solver-labeled rehearsal pool with this many "
+        "sampled positions. Default 0 disables solver-supervised rehearsal.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-batch-size",
+        type=int,
+        default=0,
+        help="Number of solver-labeled examples to train on each rehearsal "
+        "step. Default 0 uses the whole solved rehearsal pool.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-interval",
+        type=int,
+        default=1,
+        help="Run one solver-supervised rehearsal update every N iterations "
+        "when --solver-rehearsal-positions is enabled.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-seed",
+        type=int,
+        help="Seed for sampling the rehearsal pool. Default uses training "
+        "seed + 10000 so cert/eval seeds can remain held out.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-target",
+        choices=("score", "wdl"),
+        default="score",
+        help="Policy target for solver rehearsal: 'score' trains only on "
+        "distance-optimal moves; 'wdl' trains on all outcome-optimal moves.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-solver-max-nodes",
+        type=int,
+        default=250_000,
+        help="Per-position solver node budget used when building rehearsal labels.",
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.0,
@@ -186,6 +226,12 @@ def main(argv: list[str] | None = None) -> None:
         gating_threshold=args.gating_threshold,
         value_loss_weight=args.value_loss_weight,
         mirror_augment=args.mirror_augment,
+        solver_rehearsal_positions=args.solver_rehearsal_positions,
+        solver_rehearsal_batch_size=args.solver_rehearsal_batch_size,
+        solver_rehearsal_interval=args.solver_rehearsal_interval,
+        solver_rehearsal_seed=args.solver_rehearsal_seed,
+        solver_rehearsal_target=args.solver_rehearsal_target,
+        solver_rehearsal_solver_max_nodes=args.solver_rehearsal_solver_max_nodes,
         weight_decay=args.weight_decay,
         arch=args.arch,
         d_model=args.d_model,
