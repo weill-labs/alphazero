@@ -166,6 +166,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-position solver node budget used when building rehearsal labels.",
     )
     parser.add_argument(
+        "--solver-rehearsal-policy-loss-weight",
+        type=float,
+        default=1.0,
+        help="Policy-loss multiplier for solver rehearsal updates. Default 1.0.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-value-loss-weight",
+        type=float,
+        default=1.0,
+        help="Value-loss multiplier for solver rehearsal updates. Set 0.0 for "
+        "policy-only hard-position rehearsal.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-hard-checkpoint",
+        help="Reference checkpoint used to mine hard rehearsal positions. "
+        "Requires --solver-rehearsal-hard-pool-size > 0.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-hard-pool-size",
+        type=int,
+        default=0,
+        help="Sample this many candidate positions, certify the reference "
+        "checkpoint, and keep up to --solver-rehearsal-positions policy "
+        "misses/high-regret examples. Default 0 disables hard mining.",
+    )
+    parser.add_argument(
+        "--solver-rehearsal-hard-sims",
+        type=int,
+        default=800,
+        help="MCTS sims used when mining hard rehearsal positions. Default 800.",
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.0,
@@ -285,6 +317,11 @@ def main(argv: list[str] | None = None) -> None:
         solver_rehearsal_seed=args.solver_rehearsal_seed,
         solver_rehearsal_target=args.solver_rehearsal_target,
         solver_rehearsal_solver_max_nodes=args.solver_rehearsal_solver_max_nodes,
+        solver_rehearsal_policy_loss_weight=(args.solver_rehearsal_policy_loss_weight),
+        solver_rehearsal_value_loss_weight=args.solver_rehearsal_value_loss_weight,
+        solver_rehearsal_hard_checkpoint=args.solver_rehearsal_hard_checkpoint,
+        solver_rehearsal_hard_pool_size=args.solver_rehearsal_hard_pool_size,
+        solver_rehearsal_hard_sims=args.solver_rehearsal_hard_sims,
         weight_decay=args.weight_decay,
         arch=args.arch,
         d_model=args.d_model,

@@ -277,6 +277,11 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
         solver_rehearsal_seed=123,
         solver_rehearsal_target="wdl",
         solver_rehearsal_solver_max_nodes=10_000,
+        solver_rehearsal_policy_loss_weight=1.5,
+        solver_rehearsal_value_loss_weight=0.0,
+        solver_rehearsal_hard_checkpoint="/checkpoints/ref/connectfour/iter_0050.msgpack",
+        solver_rehearsal_hard_pool_size=32,
+        solver_rehearsal_hard_sims=64,
         seed=9,
         requested_gpu="A100-40GB",
     )
@@ -302,6 +307,14 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert config.solver_rehearsal_seed == 123
     assert config.solver_rehearsal_target == "wdl"
     assert config.solver_rehearsal_solver_max_nodes == 10_000
+    assert config.solver_rehearsal_policy_loss_weight == 1.5
+    assert config.solver_rehearsal_value_loss_weight == 0.0
+    assert (
+        config.solver_rehearsal_hard_checkpoint
+        == "/checkpoints/ref/connectfour/iter_0050.msgpack"
+    )
+    assert config.solver_rehearsal_hard_pool_size == 32
+    assert config.solver_rehearsal_hard_sims == 64
     assert init_kwargs["project"] == "alphazero-connectfour"
     assert result["checkpoint_path"] == config.checkpoint_path
     assert result["checkpoint_dir"] == "/checkpoints/wandb123/connectfour"
@@ -309,6 +322,7 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert result["final_metrics"] == {"iteration": 1, "loss": 0.5}
     assert result["config"]["requested_gpu"] == "A100-40GB"
     assert result["config"]["solver_rehearsal_positions"] == 8
+    assert result["config"]["solver_rehearsal_value_loss_weight"] == 0.0
     assert result["config"]["selfplay_temperature_after_drop"] == 0.0
     assert fake_run.logs[0] == ({"iteration": 0, "loss": 1.25}, 0)
     assert fake_run.logs[1] == ({"iteration": 1, "loss": 0.5}, 1)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,6 +71,11 @@ class TrainingConfig:
     solver_rehearsal_seed: int | None = None
     solver_rehearsal_target: str = "score"
     solver_rehearsal_solver_max_nodes: int = 250_000
+    solver_rehearsal_policy_loss_weight: float = 1.0
+    solver_rehearsal_value_loss_weight: float = 1.0
+    solver_rehearsal_hard_checkpoint: str | None = None
+    solver_rehearsal_hard_pool_size: int = 0
+    solver_rehearsal_hard_sims: int = 800
     weight_decay: float = 0.0
     arch: str = ARCH_RESNET
     d_model: int = 128
@@ -133,6 +138,30 @@ class TrainingConfig:
             raise ValueError(msg)
         if self.solver_rehearsal_solver_max_nodes <= 0:
             msg = "solver_rehearsal_solver_max_nodes must be positive"
+            raise ValueError(msg)
+        if self.solver_rehearsal_policy_loss_weight < 0:
+            msg = "solver_rehearsal_policy_loss_weight must be non-negative"
+            raise ValueError(msg)
+        if self.solver_rehearsal_value_loss_weight < 0:
+            msg = "solver_rehearsal_value_loss_weight must be non-negative"
+            raise ValueError(msg)
+        if (
+            self.solver_rehearsal_policy_loss_weight == 0
+            and self.solver_rehearsal_value_loss_weight == 0
+        ):
+            msg = "at least one solver rehearsal loss weight must be positive"
+            raise ValueError(msg)
+        if self.solver_rehearsal_hard_pool_size < 0:
+            msg = "solver_rehearsal_hard_pool_size must be non-negative"
+            raise ValueError(msg)
+        if self.solver_rehearsal_hard_sims <= 0:
+            msg = "solver_rehearsal_hard_sims must be positive"
+            raise ValueError(msg)
+        if (
+            self.solver_rehearsal_hard_pool_size > 0
+            and self.solver_rehearsal_hard_checkpoint is None
+        ):
+            msg = "solver_rehearsal_hard_checkpoint is required for hard-pool mining"
             raise ValueError(msg)
         if self.weight_decay < 0:
             msg = "weight_decay must be non-negative"
@@ -197,6 +226,7 @@ def _loss(
     params: nnx.State,
     batch: SelfPlayData,
     *,
+    policy_loss_weight: float = 1.0,
     value_loss_weight: float,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     policy_logits, value = apply_model(graphdef, params, batch.observation)
@@ -215,7 +245,7 @@ def _loss(
     # `loss` (the gradient signal) is weighted; `policy_loss` and `value_loss`
     # are reported unweighted so wandb curves remain comparable across runs
     # with different weights.
-    loss = policy_loss + value_loss_weight * value_loss
+    loss = policy_loss_weight * policy_loss + value_loss_weight * value_loss
     metrics = {
         "loss": loss,
         "policy_loss": policy_loss,
@@ -229,10 +259,17 @@ def make_update_step(
     graphdef: nnx.GraphDef[Net],
     tx: optax.GradientTransformation,
     *,
+    policy_loss_weight: float = 1.0,
     value_loss_weight: float = 1.0,
 ):
     def loss_fn(params: nnx.State, batch: SelfPlayData):
-        return _loss(graphdef, params, batch, value_loss_weight=value_loss_weight)
+        return _loss(
+            graphdef,
+            params,
+            batch,
+            policy_loss_weight=policy_loss_weight,
+            value_loss_weight=value_loss_weight,
+        )
 
     @jax.jit
     def update_step(
@@ -350,6 +387,9 @@ def build_solver_rehearsal_data(
     seed: int,
     target: str = "score",
     solver_max_nodes: int = 250_000,
+    hard_checkpoint: str | None = None,
+    hard_pool_size: int = 0,
+    hard_sims: int = 800,
 ) -> SelfPlayData:
     """Build a fixed C4 solver-labeled rehearsal pool.
 
@@ -365,23 +405,80 @@ def build_solver_rehearsal_data(
         raise ValueError("target must be 'score' or 'wdl'")
     if solver_max_nodes <= 0:
         raise ValueError("solver_max_nodes must be positive")
+    if hard_pool_size < 0:
+        raise ValueError("hard_pool_size must be non-negative")
+    if hard_sims <= 0:
+        raise ValueError("hard_sims must be positive")
+    if hard_pool_size > 0 and hard_checkpoint is None:
+        raise ValueError("hard_checkpoint is required when hard_pool_size > 0")
 
     # Local import avoids making the generic trainer import the certification
     # stack unless the C4-specific rehearsal feature is enabled.
-    from alphazero.c4_certify import precompute_solver_labels, sample_positions
+    from alphazero.c4_certify import (
+        certify_checkpoint_batched,
+        precompute_solver_labels,
+        sample_positions,
+    )
 
-    positions = sample_positions(sample_size=sample_size, seed=seed)
+    candidate_size = hard_pool_size if hard_pool_size > 0 else sample_size
+    positions = sample_positions(sample_size=candidate_size, seed=seed)
     kept_positions, labels = precompute_solver_labels(
         positions,
         solver_max_nodes=solver_max_nodes,
     )
     if not kept_positions:
         raise ValueError("solver rehearsal produced no solved positions")
+    if hard_pool_size > 0:
+        report = certify_checkpoint_batched(
+            hard_checkpoint,
+            kept_positions,
+            labels=labels,
+            sims=hard_sims,
+            seed=seed,
+            solver_max_nodes=solver_max_nodes,
+        )
+        kept_positions, labels = select_hard_rehearsal_examples(
+            kept_positions,
+            labels,
+            report.records,
+            limit=sample_size,
+        )
+        if not kept_positions:
+            raise ValueError("hard rehearsal mining found no policy misses")
     return solver_rehearsal_data_from_labels(
         kept_positions,
         labels,
         target=target,
     )
+
+
+def select_hard_rehearsal_examples(
+    positions: Sequence,
+    labels: Sequence[dict],
+    records: Sequence,
+    *,
+    limit: int,
+) -> tuple[list, list[dict]]:
+    """Select solver-labeled positions where a reference checkpoint struggled."""
+
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if not (len(positions) == len(labels) == len(records)):
+        raise ValueError("positions, labels, and records must align")
+
+    scored = []
+    for i, record in enumerate(records):
+        policy_match = bool(getattr(record, "policy_match"))
+        wdl_regret = float(getattr(record, "wdl_regret"))
+        score_regret = float(getattr(record, "score_regret"))
+        if policy_match and wdl_regret <= 0 and score_regret <= 0:
+            continue
+        scored.append(
+            (max(wdl_regret, 0.0), max(score_regret, 0.0), not policy_match, i)
+        )
+    scored.sort(reverse=True)
+    selected = [i for *_rank, i in scored[:limit]]
+    return [positions[i] for i in selected], [labels[i] for i in selected]
 
 
 def solver_rehearsal_data_from_labels(
@@ -503,6 +600,12 @@ def run_training(
     update_step = make_update_step(
         graphdef, tx, value_loss_weight=config.value_loss_weight
     )
+    solver_rehearsal_update_step = make_update_step(
+        graphdef,
+        tx,
+        policy_loss_weight=config.solver_rehearsal_policy_loss_weight,
+        value_loss_weight=config.solver_rehearsal_value_loss_weight,
+    )
     evaluator = (
         make_evaluator(
             graphdef, num_games=config.eval_games, max_steps=config.max_steps
@@ -538,6 +641,9 @@ def run_training(
             ),
             target=config.solver_rehearsal_target,
             solver_max_nodes=config.solver_rehearsal_solver_max_nodes,
+            hard_checkpoint=config.solver_rehearsal_hard_checkpoint,
+            hard_pool_size=config.solver_rehearsal_hard_pool_size,
+            hard_sims=config.solver_rehearsal_hard_sims,
         )
         if config.solver_rehearsal_positions > 0
         else None
@@ -580,7 +686,7 @@ def run_training(
             if config.mirror_augment:
                 rehearsal_data = mirror_selfplay_data(rehearsal_data)
             params, opt_state, rehearsal_metrics = _train_epoch(
-                update_step,
+                solver_rehearsal_update_step,
                 params,
                 opt_state,
                 rehearsal_data,
