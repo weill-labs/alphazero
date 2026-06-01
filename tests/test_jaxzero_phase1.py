@@ -559,6 +559,26 @@ def test_select_hard_rehearsal_examples_prefers_wdl_then_score_regret() -> None:
     assert selected_labels == [{"id": "wdl"}, {"id": "score"}]
 
 
+def test_select_hard_rehearsal_examples_can_ignore_score_only_regret() -> None:
+    positions = ["easy", "slow-win", "wdl"]
+    labels = [{"id": name} for name in positions]
+    records = [
+        SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=0),
+        SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=10),
+        SimpleNamespace(policy_match=False, wdl_regret=1, score_regret=1),
+    ]
+
+    selected_positions, _ = select_hard_rehearsal_examples(
+        positions,
+        labels,
+        records,
+        limit=2,
+        include_score_regret=False,
+    )
+
+    assert selected_positions == ["wdl"]
+
+
 def _dummy_c4_rehearsal_data(n: int = 3) -> SelfPlayData:
     observation = jnp.zeros((n, 6, 7, 2), dtype=jnp.float32)
     action_weights = jnp.zeros((n, 7), dtype=jnp.float32).at[:, 3].set(1.0)
@@ -689,7 +709,7 @@ def test_build_solver_rehearsal_data_can_mine_hard_positions(monkeypatch) -> Non
         return SimpleNamespace(
             records=(
                 SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=0),
-                SimpleNamespace(policy_match=False, wdl_regret=0, score_regret=2),
+                SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=2),
                 SimpleNamespace(policy_match=False, wdl_regret=1, score_regret=1),
             )
         )
@@ -716,14 +736,10 @@ def test_build_solver_rehearsal_data_can_mine_hard_positions(monkeypatch) -> Non
     assert calls["precompute"] == (positions, 10_000)
     assert calls["checkpoint"] == "ref.msgpack"
     assert calls["certify"]["sims"] == 64
-    assert data.observation.shape == (2, 6, 7, 2)
+    assert data.observation.shape == (1, 6, 7, 2)
     assert jnp.array_equal(
         data.action_weights[0],
         jnp.array([0, 0, 0, 0, 1, 0, 0], dtype=jnp.float32),
-    )
-    assert jnp.array_equal(
-        data.action_weights[1],
-        jnp.array([0, 0, 0.5, 0.5, 0, 0, 0], dtype=jnp.float32),
     )
 
 

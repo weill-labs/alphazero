@@ -442,6 +442,7 @@ def build_solver_rehearsal_data(
             labels,
             report.records,
             limit=sample_size,
+            include_score_regret=target == "score",
         )
         if not kept_positions:
             raise ValueError("hard rehearsal mining found no policy misses")
@@ -458,6 +459,7 @@ def select_hard_rehearsal_examples(
     records: Sequence,
     *,
     limit: int,
+    include_score_regret: bool = True,
 ) -> tuple[list, list[dict]]:
     """Select solver-labeled positions where a reference checkpoint struggled."""
 
@@ -471,11 +473,10 @@ def select_hard_rehearsal_examples(
         policy_match = bool(getattr(record, "policy_match"))
         wdl_regret = float(getattr(record, "wdl_regret"))
         score_regret = float(getattr(record, "score_regret"))
-        if policy_match and wdl_regret <= 0 and score_regret <= 0:
+        ranked_score_regret = max(score_regret, 0.0) if include_score_regret else 0.0
+        if policy_match and wdl_regret <= 0 and ranked_score_regret <= 0:
             continue
-        scored.append(
-            (max(wdl_regret, 0.0), max(score_regret, 0.0), not policy_match, i)
-        )
+        scored.append((max(wdl_regret, 0.0), ranked_score_regret, not policy_match, i))
     scored.sort(reverse=True)
     selected = [i for *_rank, i in scored[:limit]]
     return [positions[i] for i in selected], [labels[i] for i in selected]
