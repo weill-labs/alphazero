@@ -165,3 +165,32 @@ Early read: at equal `iter_0040`, the transformer seeds are ahead in greedy
 policy play, with seeds 102 and 103 far ahead. Do not claim the A/B yet; the
 next required comparison is best-checkpoint Elo after `60/80/final` checkpoints
 exist for all transformer and ResNet seeds.
+
+## 2026-06-02 17:40 UTC ResNet Ladders Complete
+
+All three ResNet runs finished and their full checkpoint ladders are local.
+Transformer runs were still active at summary iterations 65, 67, and 65.
+
+Full ResNet greedy-ladder best checkpoints, using
+`--games-per-pairing 16 --max-steps 128`:
+
+| Run | Seed 0 best | Seed 0 Elo | Seed 1 best | Seed 1 Elo |
+| --- | --- | ---: | --- | ---: |
+| `othello-resnet-s101` | `iter_0040` | 35.9 | `iter_0020` | 0.0 |
+| `othello-resnet-s102` | `final` | 808.8 | `iter_0080` | 838.1 |
+| `othello-resnet-s103` | `final` | 274.2 | `final` | 266.1 |
+
+Matched `iter_0060` six-model round-robin, two evaluator seeds:
+
+| Checkpoint | Seed 0 Elo | Seed 1 Elo |
+| --- | ---: | ---: |
+| `othello-resnet-s101/iter_0060` | 0.0 | 0.0 |
+| `othello-resnet-s102/iter_0060` | 706.2 | 697.5 |
+| `othello-resnet-s103/iter_0060` | 610.3 | 650.5 |
+| `othello-transformer-s101/iter_0060` | 1277.5 | 1128.9 |
+| `othello-transformer-s102/iter_0060` | 947.8 | 960.4 |
+| `othello-transformer-s103/iter_0060` | 1035.0 | 968.3 |
+
+Early read: the transformer lead persists at equal `iter_0060`, but this is
+still not the final A/B. The final comparison must use best-checkpoint ladders
+for the transformer seeds once `iter_0080` and `final` exist.
