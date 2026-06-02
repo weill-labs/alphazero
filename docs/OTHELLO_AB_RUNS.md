@@ -119,3 +119,49 @@ uv run jaxzero-checkpoint-elo --game othello --mode round-robin \
 
 The smoke completed successfully. Treat the numbers as a pipeline check only:
 2 games per pairing is too small for an architecture claim.
+
+## 2026-06-02 17:31 UTC Preliminary Greedy Elo
+
+Additional checkpoints downloaded locally:
+
+- `othello-resnet-s101`: `iter_0040`, `iter_0060`, `iter_0080`, `final`
+- `othello-resnet-s102`: `iter_0040`
+- `othello-resnet-s103`: `iter_0060`, `iter_0080`, `final`
+- all three transformer seeds: `iter_0040`
+
+Live status at the time of this checkpoint:
+
+- `othello-resnet-s101`: finished at training summary iteration 79
+- `othello-resnet-s102`: running at summary iteration 47
+- `othello-resnet-s103`: finished at training summary iteration 79
+- transformer seeds: running at summary iterations 38, 40, 38
+
+Greedy Elo diagnostics used `--games-per-pairing 16 --max-steps 128` and two
+evaluator seeds where noted. These are not final architecture results because
+they are greedy-policy matches and the transformer checkpoint ladders are not
+complete yet.
+
+Completed ResNet ladder diagnostics:
+
+- `othello-resnet-s101`: seed 0 best was `iter_0040` (+35.9 Elo vs
+  `iter_0020` anchor); seed 1 best was `iter_0020`. Later checkpoints were
+  consistently below the early checkpoints.
+- `othello-resnet-s103`: seed 0 and seed 1 both selected `final` as best
+  (+274.2 and +266.1 Elo vs `iter_0020` anchor). `iter_0080` was second and
+  `iter_0060` was the trough in both runs.
+
+Matched `iter_0040` six-model round-robin, two evaluator seeds:
+
+| Checkpoint | Seed 0 Elo | Seed 1 Elo |
+| --- | ---: | ---: |
+| `othello-resnet-s101/iter_0040` | 0.0 | 0.0 |
+| `othello-resnet-s102/iter_0040` | 174.9 | 191.4 |
+| `othello-resnet-s103/iter_0040` | -56.4 | -71.2 |
+| `othello-transformer-s101/iter_0040` | 270.8 | 274.9 |
+| `othello-transformer-s102/iter_0040` | 991.1 | 952.2 |
+| `othello-transformer-s103/iter_0040` | 909.5 | 952.2 |
+
+Early read: at equal `iter_0040`, the transformer seeds are ahead in greedy
+policy play, with seeds 102 and 103 far ahead. Do not claim the A/B yet; the
+next required comparison is best-checkpoint Elo after `60/80/final` checkpoints
+exist for all transformer and ResNet seeds.
