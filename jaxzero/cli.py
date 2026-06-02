@@ -198,6 +198,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="MCTS sims used when mining hard rehearsal positions. Default 800.",
     )
     parser.add_argument(
+        "--solver-rehearsal-anchor-positions",
+        type=int,
+        default=0,
+        help="Add this many random single-WDL-optimal solved positions from the "
+        "hard pool as anti-regression anchors. Default 0 disables anchors.",
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.0,
@@ -322,6 +329,7 @@ def main(argv: list[str] | None = None) -> None:
         solver_rehearsal_hard_checkpoint=args.solver_rehearsal_hard_checkpoint,
         solver_rehearsal_hard_pool_size=args.solver_rehearsal_hard_pool_size,
         solver_rehearsal_hard_sims=args.solver_rehearsal_hard_sims,
+        solver_rehearsal_anchor_positions=args.solver_rehearsal_anchor_positions,
         weight_decay=args.weight_decay,
         arch=args.arch,
         d_model=args.d_model,

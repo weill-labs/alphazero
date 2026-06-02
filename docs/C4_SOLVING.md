@@ -226,6 +226,37 @@ regret. Use `wdl` targets first so all outcome-optimal moves remain acceptable;
 policy-only, avoiding the value/policy tradeoff seen in the temperature
 schedule experiment.
 
+Train a broader hard-archive / anti-regression rehearsal:
+
+```bash
+python -m jaxzero.cli \
+  --init-checkpoint checkpoints/trjd57fm/connectfour/iter_0050.msgpack \
+  --iterations 75 --batch-size 512 --sims 256 \
+  --channels 128 --num-res-blocks 5 \
+  --mirror-augment \
+  --solver-rehearsal-positions 512 \
+  --solver-rehearsal-hard-pool-size 8192 \
+  --solver-rehearsal-hard-checkpoint \
+    checkpoints/trjd57fm/connectfour/iter_0050.msgpack,checkpoints/jphh1t67/connectfour/iter_0075.msgpack \
+  --solver-rehearsal-anchor-positions 512 \
+  --solver-rehearsal-hard-sims 800 \
+  --solver-rehearsal-batch-size 512 \
+  --solver-rehearsal-target wdl \
+  --solver-rehearsal-policy-loss-weight 1.0 \
+  --solver-rehearsal-value-loss-weight 0.0 \
+  --learning-rate 1e-4 \
+  --checkpoint-every 25 --checkpoint checkpoints/connectfour/final.msgpack
+```
+
+`--solver-rehearsal-hard-checkpoint` accepts a comma-separated checkpoint list.
+Hard mining certifies every reference checkpoint and keeps the union of their
+highest-regret/policy-miss positions, so a new run cannot only repair one
+failure set while ignoring another. `--solver-rehearsal-anchor-positions` adds
+single-WDL-optimal solved positions from the same candidate pool as
+anti-regression anchors. This is the SOTA-shaped direction after `alphago-fvh`:
+iterative hard-state aggregation plus broad replay, not a narrow one-shot
+solver-only fine-tune.
+
 Train a Tier-1 transformer on Modal:
 
 ```bash
@@ -243,10 +274,13 @@ The SOTA-scale capstone is **done** (it held the floor — see
 [C4_FINDINGS.md](C4_FINDINGS.md)). Global hyperparameter sweeps are exhausted.
 The remaining directions, in priority order:
 
-- **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — train the
-  policy directly on solver-labeled tactical positions. Implemented as
-  `--solver-rehearsal-*`; verdict still requires held-out certs and multi-seed
-  confirmation.
+- **Hard-archive anti-regression rehearsal** (`alphago-27k`) — aggregate hard
+  states from multiple reference checkpoints and add broad single-optimal
+  anchors so rehearsal does not simply trade one failure set for another.
+- **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — implemented
+  behind `--solver-rehearsal-*`; mixed/negative verdict. It improved the small
+  frozen ladder and average WDL regret, but did not reduce the 1024-position
+  weak-blunder count.
 - **Self-play temperature / noise schedules** (`alphago-be8`) — reduce the
   remaining policy mismatch by keeping self-play stochastic in the opening but
   greedy in tactical late positions. Implemented as `--selfplay-temperature-*`

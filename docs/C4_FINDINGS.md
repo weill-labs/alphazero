@@ -240,10 +240,12 @@ signal — not a missing global hyperparameter, and not raw compute.
 Given the decoupling finding, global hyperparameter sweeps are exhausted. The
 remaining open directions, in priority order:
 
-1. **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — implemented
-   behind `--solver-rehearsal-*`; still needs held-out checkpoint-ladder certs
-   and multi-seed confirmation. This targets the actual bottleneck (policy
-   fidelity), unlike everything swept so far.
+1. **Hard-archive anti-regression rehearsal** (`alphago-27k`) — current best
+   next lever. The 1024 failure analysis showed hard rehearsal repaired many
+   old failures but introduced a comparable number of new failures. The next
+   run should mine against multiple reference checkpoints and include
+   single-optimal anchor replay so it cannot trade one sparse failure set for
+   another.
 2. **Eval-set / methodology reconciliation** — confirm whether the gap to the
    literature is real or an eval-set artifact (the open eval-set + cached-labels
    work in `alphago-yom` makes this a fixed, shareable comparison).
@@ -272,4 +274,6 @@ cached solver labels make every cert a paired comparison — build them once wit
 - `alphago-mgx` — sims=600 residual-gap test (value_mae −25%, floor held)
 - `alphago-ari` — deterministic perfect-information certification default
 - `alphago-938` — checkpoint ladder; current best `trjd57fm/iter_0050`
-- `alphago-fvh` — **in progress**: solver-supervised hard-position rehearsal
+- `alphago-fvh` — solver-supervised hard-position rehearsal (mixed/negative)
+- `alphago-8ij` — 1024 failure analysis: midgame single-correct-move traps
+- `alphago-27k` — **in progress**: hard-archive anti-regression rehearsal

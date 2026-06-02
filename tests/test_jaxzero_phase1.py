@@ -31,6 +31,8 @@ from jaxzero.train import (
     load_checkpoint,
     run_training,
     save_checkpoint,
+    select_anchor_rehearsal_examples,
+    select_hard_rehearsal_archive,
     select_hard_rehearsal_examples,
     solver_rehearsal_data_from_labels,
 )
@@ -626,6 +628,7 @@ def test_run_training_with_solver_rehearsal_logs_supervised_metrics(
             "hard_checkpoint": None,
             "hard_pool_size": 0,
             "hard_sims": 800,
+            "anchor_positions": 0,
         }
     ]
     assert logged[0]["solver_rehearsal/examples"] == 2
@@ -743,6 +746,151 @@ def test_build_solver_rehearsal_data_can_mine_hard_positions(monkeypatch) -> Non
     )
 
 
+def test_hard_rehearsal_archive_unions_multiple_checkpoints() -> None:
+    positions = ["easy", "old_fail", "new_fail"]
+    labels = [{"id": name} for name in positions]
+    calls: list[str] = []
+
+    def fake_certify_checkpoint_batched(checkpoint, sampled, **kwargs):
+        calls.append(checkpoint)
+        if checkpoint == "old.msgpack":
+            records = (
+                SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=0),
+                SimpleNamespace(policy_match=False, wdl_regret=2, score_regret=5),
+                SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=0),
+            )
+        else:
+            records = (
+                SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=0),
+                SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=0),
+                SimpleNamespace(policy_match=False, wdl_regret=1, score_regret=9),
+            )
+        return SimpleNamespace(records=records)
+
+    selected_positions, selected_labels, selected_indices = (
+        select_hard_rehearsal_archive(
+            positions,
+            labels,
+            checkpoints=("old.msgpack", "new.msgpack"),
+            certify_checkpoint_batched=fake_certify_checkpoint_batched,
+            hard_sims=64,
+            seed=3,
+            solver_max_nodes=10_000,
+            limit=4,
+        )
+    )
+
+    assert calls == ["old.msgpack", "new.msgpack"]
+    assert selected_positions == ["old_fail", "new_fail"]
+    assert selected_labels == [{"id": "old_fail"}, {"id": "new_fail"}]
+    assert selected_indices == {1, 2}
+
+
+def test_anchor_rehearsal_examples_select_single_wdl_optimal_unselected() -> None:
+    positions = ["hard", "multi", "single-a", "single-b"]
+    labels = [
+        {"optimal_moves": [3]},
+        {"optimal_moves": [2, 3]},
+        {"optimal_moves": [4]},
+        {"optimal_moves": [5]},
+    ]
+
+    selected_positions, selected_labels = select_anchor_rehearsal_examples(
+        positions,
+        labels,
+        exclude_indices={0},
+        limit=2,
+    )
+
+    assert selected_positions == ["single-a", "single-b"]
+    assert selected_labels == [{"optimal_moves": [4]}, {"optimal_moves": [5]}]
+
+
+def test_build_solver_rehearsal_data_adds_anchor_positions(monkeypatch) -> None:
+    from alphazero.games.connectfour import ConnectFour
+    import alphazero.c4_certify as c4_certify
+
+    game = ConnectFour()
+    positions = [
+        game.initial_state(),
+        game.apply_move(game.initial_state(), 3),
+        game.apply_move(game.initial_state(), 2),
+    ]
+    labels = [
+        {
+            "solver_value": 1,
+            "solver_score": 5,
+            "optimal_moves": [3],
+            "children": {3: (-1, -5), 2: (0, 0)},
+        },
+        {
+            "solver_value": 1,
+            "solver_score": 2,
+            "optimal_moves": [2],
+            "children": {2: (-1, -2), 3: (0, 0)},
+        },
+        {
+            "solver_value": 0,
+            "solver_score": 0,
+            "optimal_moves": [2, 3],
+            "children": {2: (0, 0), 3: (0, 0)},
+        },
+    ]
+
+    def fake_sample_positions(**kwargs):
+        return positions
+
+    def fake_precompute_solver_labels(sampled, *, solver_max_nodes: int):
+        return positions, labels
+
+    def fake_certify_checkpoint_batched(checkpoint, sampled, **kwargs):
+        return SimpleNamespace(
+            records=(
+                SimpleNamespace(policy_match=False, wdl_regret=1, score_regret=1),
+                SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=0),
+                SimpleNamespace(policy_match=True, wdl_regret=0, score_regret=0),
+            )
+        )
+
+    monkeypatch.setattr(c4_certify, "sample_positions", fake_sample_positions)
+    monkeypatch.setattr(
+        c4_certify, "precompute_solver_labels", fake_precompute_solver_labels
+    )
+    monkeypatch.setattr(
+        c4_certify, "certify_checkpoint_batched", fake_certify_checkpoint_batched
+    )
+
+    data = build_solver_rehearsal_data(
+        sample_size=1,
+        seed=123,
+        target="wdl",
+        hard_checkpoint="old.msgpack,new.msgpack",
+        hard_pool_size=3,
+        anchor_positions=1,
+    )
+
+    assert data.observation.shape == (2, 6, 7, 2)
+    assert jnp.array_equal(
+        data.action_weights[0],
+        jnp.array([0, 0, 0, 1, 0, 0, 0], dtype=jnp.float32),
+    )
+    assert jnp.array_equal(
+        data.action_weights[1],
+        jnp.array([0, 0, 1, 0, 0, 0, 0], dtype=jnp.float32),
+    )
+
+
+def test_build_solver_rehearsal_data_rejects_anchor_without_hard_pool() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="anchor_positions requires hard-pool"):
+        build_solver_rehearsal_data(
+            sample_size=2,
+            seed=123,
+            anchor_positions=1,
+        )
+
+
 def test_solver_rehearsal_config_validation() -> None:
     import pytest
 
@@ -768,6 +916,10 @@ def test_solver_rehearsal_config_validation() -> None:
         replace(_tiny_training_config(), solver_rehearsal_hard_pool_size=-1)
     with pytest.raises(ValueError, match="solver_rehearsal_hard_sims"):
         replace(_tiny_training_config(), solver_rehearsal_hard_sims=0)
+    with pytest.raises(ValueError, match="solver_rehearsal_anchor_positions"):
+        replace(_tiny_training_config(), solver_rehearsal_anchor_positions=-1)
+    with pytest.raises(ValueError, match="requires hard-pool"):
+        replace(_tiny_training_config(), solver_rehearsal_anchor_positions=1)
     with pytest.raises(ValueError, match="solver_rehearsal_hard_checkpoint"):
         replace(_tiny_training_config(), solver_rehearsal_hard_pool_size=10)
 

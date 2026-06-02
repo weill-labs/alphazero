@@ -76,6 +76,7 @@ class TrainingConfig:
     solver_rehearsal_hard_checkpoint: str | None = None
     solver_rehearsal_hard_pool_size: int = 0
     solver_rehearsal_hard_sims: int = 800
+    solver_rehearsal_anchor_positions: int = 0
     weight_decay: float = 0.0
     arch: str = ARCH_RESNET
     d_model: int = 128
@@ -156,6 +157,15 @@ class TrainingConfig:
             raise ValueError(msg)
         if self.solver_rehearsal_hard_sims <= 0:
             msg = "solver_rehearsal_hard_sims must be positive"
+            raise ValueError(msg)
+        if self.solver_rehearsal_anchor_positions < 0:
+            msg = "solver_rehearsal_anchor_positions must be non-negative"
+            raise ValueError(msg)
+        if (
+            self.solver_rehearsal_anchor_positions > 0
+            and self.solver_rehearsal_hard_pool_size <= 0
+        ):
+            msg = "solver_rehearsal_anchor_positions requires hard-pool mining"
             raise ValueError(msg)
         if (
             self.solver_rehearsal_hard_pool_size > 0
@@ -390,6 +400,7 @@ def build_solver_rehearsal_data(
     hard_checkpoint: str | None = None,
     hard_pool_size: int = 0,
     hard_sims: int = 800,
+    anchor_positions: int = 0,
 ) -> SelfPlayData:
     """Build a fixed C4 solver-labeled rehearsal pool.
 
@@ -409,6 +420,10 @@ def build_solver_rehearsal_data(
         raise ValueError("hard_pool_size must be non-negative")
     if hard_sims <= 0:
         raise ValueError("hard_sims must be positive")
+    if anchor_positions < 0:
+        raise ValueError("anchor_positions must be non-negative")
+    if anchor_positions > 0 and hard_pool_size <= 0:
+        raise ValueError("anchor_positions requires hard-pool mining")
     if hard_pool_size > 0 and hard_checkpoint is None:
         raise ValueError("hard_checkpoint is required when hard_pool_size > 0")
 
@@ -429,21 +444,25 @@ def build_solver_rehearsal_data(
     if not kept_positions:
         raise ValueError("solver rehearsal produced no solved positions")
     if hard_pool_size > 0:
-        report = certify_checkpoint_batched(
-            hard_checkpoint,
-            kept_positions,
-            labels=labels,
-            sims=hard_sims,
-            seed=seed,
-            solver_max_nodes=solver_max_nodes,
-        )
-        kept_positions, labels = select_hard_rehearsal_examples(
+        hard_positions, hard_labels, selected_indices = select_hard_rehearsal_archive(
             kept_positions,
             labels,
-            report.records,
+            checkpoints=_split_checkpoint_list(hard_checkpoint),
+            certify_checkpoint_batched=certify_checkpoint_batched,
+            hard_sims=hard_sims,
+            seed=seed,
+            solver_max_nodes=solver_max_nodes,
             limit=sample_size,
             include_score_regret=target == "score",
         )
+        anchor_positions_list, anchor_labels = select_anchor_rehearsal_examples(
+            kept_positions,
+            labels,
+            exclude_indices=selected_indices,
+            limit=anchor_positions,
+        )
+        kept_positions = [*hard_positions, *anchor_positions_list]
+        labels = [*hard_labels, *anchor_labels]
         if not kept_positions:
             raise ValueError("hard rehearsal mining found no policy misses")
     return solver_rehearsal_data_from_labels(
@@ -451,6 +470,114 @@ def build_solver_rehearsal_data(
         labels,
         target=target,
     )
+
+
+def _split_checkpoint_list(checkpoint: str | None) -> tuple[str, ...]:
+    if checkpoint is None:
+        return ()
+    checkpoints = tuple(part.strip() for part in checkpoint.split(",") if part.strip())
+    if not checkpoints:
+        raise ValueError("hard_checkpoint must name at least one checkpoint")
+    return checkpoints
+
+
+def select_hard_rehearsal_archive(
+    positions: Sequence,
+    labels: Sequence[dict],
+    *,
+    checkpoints: Sequence[str],
+    certify_checkpoint_batched,
+    hard_sims: int,
+    seed: int,
+    solver_max_nodes: int,
+    limit: int,
+    include_score_regret: bool = True,
+) -> tuple[list, list[dict], set[int]]:
+    """Mine a hard archive from the union of several reference checkpoints."""
+
+    if not checkpoints:
+        raise ValueError("checkpoints must not be empty")
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if len(positions) != len(labels):
+        raise ValueError("positions and labels must align")
+
+    best_rank_by_index: dict[int, tuple[float, float, bool]] = {}
+    for checkpoint in checkpoints:
+        report = certify_checkpoint_batched(
+            checkpoint,
+            positions,
+            labels=labels,
+            sims=hard_sims,
+            seed=seed,
+            solver_max_nodes=solver_max_nodes,
+        )
+        if len(report.records) != len(positions):
+            raise ValueError("hard checkpoint cert records must align with positions")
+        for i, record in enumerate(report.records):
+            rank = _hard_rehearsal_rank(
+                record,
+                include_score_regret=include_score_regret,
+            )
+            if rank is None:
+                continue
+            if rank > best_rank_by_index.get(i, (-1.0, -1.0, False)):
+                best_rank_by_index[i] = rank
+
+    selected = sorted(
+        best_rank_by_index,
+        key=lambda i: (*best_rank_by_index[i], -i),
+        reverse=True,
+    )[:limit]
+    return (
+        [positions[i] for i in selected],
+        [labels[i] for i in selected],
+        set(selected),
+    )
+
+
+def _hard_rehearsal_rank(
+    record,
+    *,
+    include_score_regret: bool,
+) -> tuple[float, float, bool] | None:
+    policy_match = bool(getattr(record, "policy_match"))
+    wdl_regret = float(getattr(record, "wdl_regret"))
+    score_regret = float(getattr(record, "score_regret"))
+    ranked_score_regret = max(score_regret, 0.0) if include_score_regret else 0.0
+    if policy_match and wdl_regret <= 0 and ranked_score_regret <= 0:
+        return None
+    return (max(wdl_regret, 0.0), ranked_score_regret, not policy_match)
+
+
+def select_anchor_rehearsal_examples(
+    positions: Sequence,
+    labels: Sequence[dict],
+    *,
+    exclude_indices: set[int] | None = None,
+    limit: int,
+) -> tuple[list, list[dict]]:
+    """Select broad single-WDL-optimal anchors for anti-regression replay."""
+
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    if len(positions) != len(labels):
+        raise ValueError("positions and labels must align")
+    if limit == 0:
+        return [], []
+
+    exclude_indices = exclude_indices or set()
+    selected: list[int] = []
+    for i, label in enumerate(labels):
+        if i in exclude_indices:
+            continue
+        if len(label["optimal_moves"]) != 1:
+            continue
+        selected.append(i)
+        if len(selected) == limit:
+            break
+
+    return [positions[i] for i in selected], [labels[i] for i in selected]
 
 
 def select_hard_rehearsal_examples(
@@ -470,13 +597,13 @@ def select_hard_rehearsal_examples(
 
     scored = []
     for i, record in enumerate(records):
-        policy_match = bool(getattr(record, "policy_match"))
-        wdl_regret = float(getattr(record, "wdl_regret"))
-        score_regret = float(getattr(record, "score_regret"))
-        ranked_score_regret = max(score_regret, 0.0) if include_score_regret else 0.0
-        if policy_match and wdl_regret <= 0 and ranked_score_regret <= 0:
+        rank = _hard_rehearsal_rank(
+            record,
+            include_score_regret=include_score_regret,
+        )
+        if rank is None:
             continue
-        scored.append((max(wdl_regret, 0.0), ranked_score_regret, not policy_match, i))
+        scored.append((*rank, i))
     scored.sort(reverse=True)
     selected = [i for *_rank, i in scored[:limit]]
     return [positions[i] for i in selected], [labels[i] for i in selected]
@@ -645,6 +772,7 @@ def run_training(
             hard_checkpoint=config.solver_rehearsal_hard_checkpoint,
             hard_pool_size=config.solver_rehearsal_hard_pool_size,
             hard_sims=config.solver_rehearsal_hard_sims,
+            anchor_positions=config.solver_rehearsal_anchor_positions,
         )
         if config.solver_rehearsal_positions > 0
         else None
