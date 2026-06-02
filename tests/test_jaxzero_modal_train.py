@@ -147,6 +147,14 @@ def test_jaxzero_modal_train_checkpoint_paths(monkeypatch) -> None:
     assert module._wandb_project_for_game("connectfour") == "alphazero-connectfour"
     assert module._wandb_project_for_game("othello") == "alphazero-othello"
     assert module._checkpoint_run_tag(SimpleNamespace(id="abc123"), seed=0) == "abc123"
+    assert (
+        module._checkpoint_run_tag(
+            SimpleNamespace(id="abc123"), seed=0, run_tag="othello-resnet-s101"
+        )
+        == "othello-resnet-s101"
+    )
+    with pytest.raises(ValueError, match="run_tag"):
+        module._checkpoint_run_tag(SimpleNamespace(id="abc123"), seed=0, run_tag="../x")
     assert module._resolve_max_steps("connectfour", module._AUTO_MAX_STEPS) == 64
     assert module._resolve_max_steps("othello", module._AUTO_MAX_STEPS) == 128
     assert (
@@ -305,10 +313,14 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
         solver_rehearsal_anchor_positions=7,
         seed=9,
         requested_gpu="A100-40GB",
+        run_tag="othello-resnet-s9",
     )
 
     config = captured["config"]
-    assert config.checkpoint_path == "/checkpoints/wandb123/connectfour/final.msgpack"
+    assert (
+        config.checkpoint_path
+        == "/checkpoints/othello-resnet-s9/connectfour/final.msgpack"
+    )
     assert config.game == "connectfour"
     assert config.iterations == 2
     assert config.batch_size == 4
@@ -340,12 +352,14 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert config.solver_rehearsal_hard_sims == 64
     assert config.solver_rehearsal_anchor_positions == 7
     assert init_kwargs["project"] == "alphazero-connectfour"
+    assert init_kwargs["run_name"] == "jaxzero-modal-connectfour-othello-resnet-s9"
     assert result["checkpoint_path"] == config.checkpoint_path
-    assert result["checkpoint_dir"] == "/checkpoints/wandb123/connectfour"
+    assert result["checkpoint_dir"] == "/checkpoints/othello-resnet-s9/connectfour"
     assert result["checkpoint_volume"] == "alphazero-checkpoints"
     assert result["final_metrics"] == {"iteration": 1, "loss": 0.5}
     assert result["config"]["game"] == "connectfour"
     assert result["config"]["requested_gpu"] == "A100-40GB"
+    assert result["config"]["run_tag"] == "othello-resnet-s9"
     assert result["config"]["max_steps"] == 6
     assert result["config"]["solver_eval_positions"] == 0
     assert result["config"]["solver_rehearsal_positions"] == 8

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from collections.abc import Mapping
@@ -110,7 +111,15 @@ def _wandb_finish(run) -> None:
         print(f"Warning: wandb finish skipped: {exc}", file=sys.stderr)
 
 
-def _checkpoint_run_tag(wandb_run, seed: int) -> str:
+def _validate_run_tag(run_tag: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", run_tag):
+        raise ValueError("run_tag must contain only letters, numbers, '.', '_' or '-'")
+    return run_tag
+
+
+def _checkpoint_run_tag(wandb_run, seed: int, run_tag: str | None = None) -> str:
+    if run_tag is not None:
+        return _validate_run_tag(run_tag)
     run_id = getattr(wandb_run, "id", None)
     if run_id:
         return str(run_id)
@@ -226,10 +235,13 @@ else:
         eval_sims: int = 64,
         seed: int = 0,
         requested_gpu: str = _DEFAULT_GPU,
+        run_tag: str | None = None,
     ) -> dict[str, object]:
         from jaxzero.train import TrainingConfig, run_training
 
         game = _validate_game(game)
+        if run_tag is not None:
+            run_tag = _validate_run_tag(run_tag)
         max_steps = _resolve_max_steps(game, max_steps)
         solver_eval_positions = _resolve_solver_eval_positions(
             game, solver_eval_positions
@@ -292,15 +304,23 @@ else:
             "eval_sims": eval_sims,
             "seed": seed,
             "requested_gpu": requested_gpu,
+            "run_tag": run_tag,
         }
+        run_name = (
+            f"jaxzero-modal-{game}-{run_tag}"
+            if run_tag is not None
+            else f"jaxzero-modal-{game}-seed-{seed}"
+        )
         wandb_run = _wandb_init(
             project=_wandb_project_for_game(game),
-            run_name=f"jaxzero-modal-{game}-seed-{seed}",
+            run_name=run_name,
             config=run_config,
         )
         _print_wandb_url(wandb_run)
-        run_tag = _checkpoint_run_tag(wandb_run, seed)
-        checkpoint_path, checkpoint_dir = _resolve_checkpoint_paths(game, run_tag)
+        checkpoint_run_tag = _checkpoint_run_tag(wandb_run, seed, run_tag=run_tag)
+        checkpoint_path, checkpoint_dir = _resolve_checkpoint_paths(
+            game, checkpoint_run_tag
+        )
         print(f"checkpoint: {checkpoint_path} (volume {_CHECKPOINT_VOLUME_NAME})")
         try:
             training_started = time.perf_counter()
@@ -464,6 +484,7 @@ else:
         eval_sims: int = 64,
         seed: int = 0,
         gpu: str = _DEFAULT_GPU,
+        run_tag: str | None = None,
     ) -> None:
         remote_train = (
             train_remote.with_options(gpu=gpu) if gpu != _DEFAULT_GPU else train_remote
@@ -522,5 +543,6 @@ else:
             eval_sims=eval_sims,
             seed=seed,
             requested_gpu=gpu,
+            run_tag=run_tag,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
