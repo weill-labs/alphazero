@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from jaxzero.game_specs import DEFAULT_GAME, resolve_game
 from jaxzero.net import AlphaZeroNetConfig, create_model
 from jaxzero.selfplay import (
     SelfPlayConfig,
@@ -39,9 +40,13 @@ from jaxzero.train import (
 
 
 def _tiny_training_config(
-    *, seed: int = 0, checkpoint_path: str | None = None
+    *,
+    seed: int = 0,
+    checkpoint_path: str | None = None,
+    game: str = DEFAULT_GAME,
 ) -> TrainingConfig:
     return TrainingConfig(
+        game=game,
         iterations=1,
         batch_size=2,
         num_simulations=1,
@@ -119,6 +124,40 @@ def test_selfplay_smoke_produces_training_data() -> None:
     assert jnp.allclose(jnp.sum(flat.action_weights, axis=-1), 1.0)
     assert flat.value_target.shape == (4,)
     assert flat.value_mask.shape == (4,)
+
+
+def test_game_specs_resolve_canonical_names_and_aliases() -> None:
+    assert resolve_game("connectfour").env_id == "connect_four"
+    assert resolve_game("connect-4").name == "connectfour"
+    assert resolve_game("c4").name == "connectfour"
+    assert resolve_game("othello").env_id == "othello"
+    assert resolve_game("othello").default_max_steps == 128
+
+
+def test_othello_selfplay_smoke_produces_training_data() -> None:
+    game = "othello"
+    env = make_env(game)
+    config = AlphaZeroNetConfig(
+        obs_shape=initial_observation_shape(game),
+        action_size=env.num_actions,
+        channels=4,
+        num_res_blocks=1,
+    )
+    graphdef, params = nnx.split(create_model(config, seed=0), nnx.Param)
+    selfplay = make_selfplay(
+        SelfPlayConfig(batch_size=2, num_simulations=1, max_steps=2),
+        graphdef,
+        game=game,
+    )
+
+    data = selfplay(params, jax.random.PRNGKey(0))
+    flat = flatten_selfplay_data(data)
+
+    assert config.obs_shape == (8, 8, 2)
+    assert env.num_actions == 65
+    assert data.observation.shape == (2, 2, 8, 8, 2)
+    assert flat.action_weights.shape == (4, 65)
+    assert jnp.allclose(jnp.sum(flat.action_weights, axis=-1), 1.0)
 
 
 def test_selfplay_schedule_defaults_preserve_current_behavior() -> None:
@@ -216,6 +255,46 @@ def test_training_smoke_and_checkpoint_round_trip(tmp_path) -> None:
     assert len(reloaded_leaves) == len(result_leaves)
     for actual, expected in zip(reloaded_leaves, result_leaves, strict=True):
         assert jnp.allclose(actual, expected)
+
+
+def test_othello_training_smoke_and_checkpoint_round_trip(tmp_path) -> None:
+    checkpoint = tmp_path / "othello.msgpack"
+    config = _tiny_training_config(
+        game="othello",
+        checkpoint_path=str(checkpoint),
+    )
+
+    result = run_training(config)
+    loaded = load_checkpoint(checkpoint)
+
+    assert result.config.game == "othello"
+    assert result.net_config.obs_shape == (8, 8, 2)
+    assert result.net_config.action_size == 65
+    assert loaded.config.obs_shape == (8, 8, 2)
+    assert loaded.config.action_size == 65
+    assert jnp.isfinite(result.metrics[0]["loss"])
+
+
+def test_training_config_rejects_c4_only_features_on_othello() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="mirror_augment"):
+        replace(_tiny_training_config(game="othello"), mirror_augment=True)
+    with pytest.raises(ValueError, match="solver rehearsal"):
+        replace(_tiny_training_config(game="othello"), solver_rehearsal_positions=1)
+    with pytest.raises(ValueError, match="per_column"):
+        replace(_tiny_training_config(game="othello"), policy_head_style="per_column")
+
+
+def test_init_checkpoint_rejects_wrong_game_shape(tmp_path) -> None:
+    import pytest
+
+    checkpoint = tmp_path / "c4.msgpack"
+    run_training(_tiny_training_config(seed=1, checkpoint_path=str(checkpoint)))
+    config = _tiny_training_config(game="othello", seed=2)
+
+    with pytest.raises(ValueError, match="does not match game 'othello'"):
+        run_training(replace(config, init_checkpoint=str(checkpoint)))
 
 
 def test_checkpoint_helpers_store_net_config(tmp_path) -> None:

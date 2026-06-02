@@ -21,10 +21,10 @@ from jaxzero.net import AlphaZeroNetConfig, create_model
 from jaxzero.selfplay import initial_observation_shape, make_env
 
 
-def _tiny_graphdef_and_params(*, seed: int = 0):
-    env = make_env()
+def _tiny_graphdef_and_params(*, seed: int = 0, game: str = "connectfour"):
+    env = make_env(game)
     config = AlphaZeroNetConfig(
-        obs_shape=initial_observation_shape(),
+        obs_shape=initial_observation_shape(game),
         action_size=env.num_actions,
         channels=4,
         num_res_blocks=1,
@@ -132,6 +132,16 @@ def test_make_gating_match_returns_int_counts_summing_to_num_games() -> None:
     assert total == 4
     wins, draws, losses = (int(v) for v in counts.tolist())
     assert wins >= 0 and draws >= 0 and losses >= 0
+
+
+def test_make_gating_match_supports_othello_shape() -> None:
+    graphdef, params = _tiny_graphdef_and_params(seed=0, game="othello")
+    play = make_gating_match(graphdef, num_games=2, max_steps=2, game="othello")
+    counts = play(params, params, jax.random.PRNGKey(0))
+
+    assert counts.shape == (3,)
+    assert counts.dtype == jnp.int32
+    assert int(jnp.sum(counts)) == 2
 
 
 def test_gating_match_is_deterministic_for_fixed_seed_and_params() -> None:

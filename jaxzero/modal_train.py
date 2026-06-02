@@ -7,11 +7,14 @@ import sys
 import time
 from collections.abc import Mapping
 
+from jaxzero.game_specs import DEFAULT_GAME, resolve_game, supported_games
+
 WANDB_PROJECT_PREFIX = "alphazero"
 _DEFAULT_GPU = "A10G"
 _CHECKPOINT_VOLUME_NAME = "alphazero-checkpoints"
 _CHECKPOINT_MOUNT = "/checkpoints"
-_SUPPORTED_GAME = "connectfour"
+_AUTO_MAX_STEPS = -1
+_AUTO_SOLVER_EVAL_POSITIONS = -1
 
 try:
     import modal
@@ -27,11 +30,35 @@ def _modal_missing() -> RuntimeError:
 
 
 def _validate_game(game: str) -> str:
-    if game != _SUPPORTED_GAME:
+    try:
+        return resolve_game(game).name
+    except ValueError as exc:
+        supported = ", ".join(supported_games())
         raise ValueError(
-            f"jaxzero Modal training supports only {_SUPPORTED_GAME!r}; got {game!r}"
+            f"jaxzero Modal training supports games: {supported}; got {game!r}"
+        ) from exc
+
+
+def _resolve_max_steps(game: str, max_steps: int) -> int:
+    if max_steps == _AUTO_MAX_STEPS:
+        return resolve_game(game).default_max_steps
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    return max_steps
+
+
+def _resolve_solver_eval_positions(game: str, solver_eval_positions: int) -> int:
+    spec = resolve_game(game)
+    if solver_eval_positions == _AUTO_SOLVER_EVAL_POSITIONS:
+        return 64 if spec.supports_solver_eval else 0
+    if solver_eval_positions < 0:
+        raise ValueError("solver_eval_positions must be non-negative")
+    if solver_eval_positions > 0 and not spec.supports_solver_eval:
+        raise ValueError(
+            "solver_eval_positions requires C4 solver support; "
+            f"game {spec.name!r} has none"
         )
-    return game
+    return solver_eval_positions
 
 
 def _wandb_project_for_game(game: str) -> str:
@@ -148,11 +175,11 @@ else:
         volumes={_CHECKPOINT_MOUNT: checkpoint_volume},
     )
     def train_remote(
-        game: str = _SUPPORTED_GAME,
+        game: str = DEFAULT_GAME,
         iterations: int = 10,
         batch_size: int = 32,
         num_simulations: int = 32,
-        max_steps: int = 64,
+        max_steps: int = _AUTO_MAX_STEPS,
         selfplay_temperature: float = 1.0,
         selfplay_temperature_drop_step: int | None = None,
         selfplay_temperature_after_drop: float = 1.0,
@@ -195,7 +222,7 @@ else:
         use_value_cls_token: bool = False,
         policy_head_style: str = "flatten",
         input_embed_style: str = "linear",
-        solver_eval_positions: int = 64,
+        solver_eval_positions: int = _AUTO_SOLVER_EVAL_POSITIONS,
         eval_sims: int = 64,
         seed: int = 0,
         requested_gpu: str = _DEFAULT_GPU,
@@ -203,6 +230,10 @@ else:
         from jaxzero.train import TrainingConfig, run_training
 
         game = _validate_game(game)
+        max_steps = _resolve_max_steps(game, max_steps)
+        solver_eval_positions = _resolve_solver_eval_positions(
+            game, solver_eval_positions
+        )
         run_config = {
             "game": game,
             "iterations": iterations,
@@ -294,6 +325,7 @@ else:
 
             result = run_training(
                 TrainingConfig(
+                    game=game,
                     iterations=iterations,
                     batch_size=batch_size,
                     num_simulations=num_simulations,
@@ -381,11 +413,11 @@ else:
 
     @app.local_entrypoint()
     def main(
-        game: str = _SUPPORTED_GAME,
+        game: str = DEFAULT_GAME,
         iterations: int = 10,
         batch_size: int = 32,
         num_simulations: int = 32,
-        max_steps: int = 64,
+        max_steps: int = _AUTO_MAX_STEPS,
         selfplay_temperature: float = 1.0,
         selfplay_temperature_drop_step: int | None = None,
         selfplay_temperature_after_drop: float = 1.0,
@@ -428,7 +460,7 @@ else:
         use_value_cls_token: bool = False,
         policy_head_style: str = "flatten",
         input_embed_style: str = "linear",
-        solver_eval_positions: int = 64,
+        solver_eval_positions: int = _AUTO_SOLVER_EVAL_POSITIONS,
         eval_sims: int = 64,
         seed: int = 0,
         gpu: str = _DEFAULT_GPU,

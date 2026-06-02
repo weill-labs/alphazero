@@ -1,4 +1,4 @@
-"""Batched pgx + mctx Gumbel self-play for Connect Four."""
+"""Batched pgx + mctx Gumbel self-play."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ import pgx
 from flax import nnx
 from pgx.experimental import auto_reset
 
+from jaxzero.game_specs import DEFAULT_GAME, resolve_game
 from jaxzero.net import AlphaZeroNet, apply_model
 
-ENV_ID = "connect_four"
 # Root exploration noise (AlphaZero defaults). PUCT + Dirichlet makes the
 # visit-count policy target non-uniform from the first game, so the policy
 # learns immediately instead of waiting for the value head to bootstrap. Gumbel
@@ -109,12 +109,12 @@ class SelfPlayData(NamedTuple):
     value_mask: jax.Array
 
 
-def make_env() -> pgx.Env:
-    return pgx.make(ENV_ID)
+def make_env(game: str = DEFAULT_GAME) -> pgx.Env:
+    return pgx.make(resolve_game(game).env_id)
 
 
-def initial_observation_shape() -> tuple[int, int, int]:
-    env = make_env()
+def initial_observation_shape(game: str = DEFAULT_GAME) -> tuple[int, int, int]:
+    env = make_env(game)
     state = env.init(jax.random.PRNGKey(0))
     return tuple(int(dim) for dim in state.observation.shape)
 
@@ -167,10 +167,12 @@ def discounted_returns(
 def make_selfplay(
     config: SelfPlayConfig,
     graphdef: nnx.GraphDef[AlphaZeroNet],
+    *,
+    game: str = DEFAULT_GAME,
 ):
     """Return a jitted self-play function ``params, rng_key -> SelfPlayData``."""
 
-    env = make_env()
+    env = make_env(game)
     batch_size = config.batch_size
     num_simulations = config.num_simulations
     max_steps = config.max_steps

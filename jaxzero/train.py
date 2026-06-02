@@ -14,10 +14,12 @@ from flax import nnx, serialization
 
 from jaxzero.arena import gating_summary, make_gating_match, update_elo
 from jaxzero.evaluate import make_evaluator, vs_random_metrics
+from jaxzero.game_specs import DEFAULT_GAME, resolve_game
 from jaxzero.net import (
     ARCH_RESNET,
     INPUT_EMBED_LINEAR,
     POLICY_HEAD_FLATTEN,
+    POLICY_HEAD_PER_COLUMN,
     AlphaZeroNetConfig,
     Net,
     apply_model,
@@ -38,6 +40,7 @@ CHECKPOINT_VERSION = 1
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    game: str = DEFAULT_GAME
     iterations: int = 10
     batch_size: int = 32
     num_simulations: int = 32
@@ -88,6 +91,8 @@ class TrainingConfig:
     input_embed_style: str = INPUT_EMBED_LINEAR
 
     def __post_init__(self) -> None:
+        game_spec = resolve_game(self.game)
+        object.__setattr__(self, "game", game_spec.name)
         if self.iterations <= 0:
             msg = "iterations must be positive"
             raise ValueError(msg)
@@ -124,6 +129,9 @@ class TrainingConfig:
                 raise ValueError(msg)
         if self.value_loss_weight <= 0:
             msg = "value_loss_weight must be positive"
+            raise ValueError(msg)
+        if self.mirror_augment and not game_spec.supports_mirror_augment:
+            msg = f"mirror_augment is not supported for game {game_spec.name!r}"
             raise ValueError(msg)
         if self.solver_rehearsal_positions < 0:
             msg = "solver_rehearsal_positions must be non-negative"
@@ -173,8 +181,26 @@ class TrainingConfig:
         ):
             msg = "solver_rehearsal_hard_checkpoint is required for hard-pool mining"
             raise ValueError(msg)
+        solver_rehearsal_enabled = (
+            self.solver_rehearsal_positions > 0
+            or self.solver_rehearsal_hard_checkpoint is not None
+            or self.solver_rehearsal_hard_pool_size > 0
+            or self.solver_rehearsal_anchor_positions > 0
+        )
+        if solver_rehearsal_enabled and not game_spec.supports_solver_rehearsal:
+            msg = f"solver rehearsal is not supported for game {game_spec.name!r}"
+            raise ValueError(msg)
         if self.weight_decay < 0:
             msg = "weight_decay must be non-negative"
+            raise ValueError(msg)
+        if (
+            self.policy_head_style == POLICY_HEAD_PER_COLUMN
+            and not game_spec.supports_per_column_policy
+        ):
+            msg = (
+                "policy_head_style='per_column' is not supported for game "
+                f"{game_spec.name!r}"
+            )
             raise ValueError(msg)
         SelfPlayConfig(
             batch_size=self.batch_size,
@@ -189,8 +215,8 @@ class TrainingConfig:
             dirichlet_alpha=self.selfplay_dirichlet_alpha,
         )
         AlphaZeroNetConfig(
-            obs_shape=initial_observation_shape(),
-            action_size=make_env().num_actions,
+            obs_shape=initial_observation_shape(self.game),
+            action_size=make_env(self.game).num_actions,
             channels=self.channels,
             num_res_blocks=self.num_res_blocks,
             arch=self.arch,
@@ -214,9 +240,9 @@ class TrainingResult:
 
 
 def build_net_config(config: TrainingConfig) -> AlphaZeroNetConfig:
-    env = make_env()
+    env = make_env(config.game)
     return AlphaZeroNetConfig(
-        obs_shape=initial_observation_shape(),
+        obs_shape=initial_observation_shape(config.game),
         action_size=env.num_actions,
         channels=config.channels,
         num_res_blocks=config.num_res_blocks,
@@ -229,6 +255,24 @@ def build_net_config(config: TrainingConfig) -> AlphaZeroNetConfig:
         policy_head_style=config.policy_head_style,
         input_embed_style=config.input_embed_style,
     )
+
+
+def _validate_net_config_matches_game(
+    net_config: AlphaZeroNetConfig, *, game: str
+) -> None:
+    expected_obs_shape = initial_observation_shape(game)
+    expected_action_size = make_env(game).num_actions
+    if (
+        net_config.obs_shape != expected_obs_shape
+        or net_config.action_size != expected_action_size
+    ):
+        msg = (
+            "init_checkpoint net shape does not match game "
+            f"{resolve_game(game).name!r}: checkpoint obs_shape={net_config.obs_shape}, "
+            f"action_size={net_config.action_size}; expected "
+            f"obs_shape={expected_obs_shape}, action_size={expected_action_size}"
+        )
+        raise ValueError(msg)
 
 
 def _loss(
@@ -695,6 +739,7 @@ def run_training(
         # be refined at high sims without the cold-start uniform-target problem.
         model = load_checkpoint(config.init_checkpoint)
         net_config = model.config
+        _validate_net_config_matches_game(net_config, game=config.game)
     else:
         net_config = build_net_config(config)
         model = create_model(net_config, seed=config.seed)
@@ -714,6 +759,7 @@ def run_training(
             dirichlet_alpha=config.selfplay_dirichlet_alpha,
         ),
         graphdef,
+        game=config.game,
     )
     # AdamW when weight_decay > 0 (decoupled L2 reg); standard Adam otherwise.
     # The closed alphago-{ul3, 1q2, 1kc} trail never tried regularization;
@@ -736,7 +782,10 @@ def run_training(
     )
     evaluator = (
         make_evaluator(
-            graphdef, num_games=config.eval_games, max_steps=config.max_steps
+            graphdef,
+            num_games=config.eval_games,
+            max_steps=config.max_steps,
+            game=config.game,
         )
         if config.eval_interval is not None
         else None
@@ -747,6 +796,7 @@ def run_training(
             graphdef,
             num_games=config.gating_games,
             max_steps=config.max_steps,
+            game=config.game,
         )
         if gating_enabled
         else None

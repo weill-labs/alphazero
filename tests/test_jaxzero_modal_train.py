@@ -141,9 +141,29 @@ def test_jaxzero_modal_train_checkpoint_paths(monkeypatch) -> None:
 
     assert checkpoint_dir == "/checkpoints/run123/connectfour"
     assert final_path == "/checkpoints/run123/connectfour/final.msgpack"
+    othello_final, othello_dir = module._resolve_checkpoint_paths("othello", "run123")
+    assert othello_dir == "/checkpoints/run123/othello"
+    assert othello_final == "/checkpoints/run123/othello/final.msgpack"
     assert module._wandb_project_for_game("connectfour") == "alphazero-connectfour"
+    assert module._wandb_project_for_game("othello") == "alphazero-othello"
     assert module._checkpoint_run_tag(SimpleNamespace(id="abc123"), seed=0) == "abc123"
-    with pytest.raises(ValueError, match="supports only"):
+    assert module._resolve_max_steps("connectfour", module._AUTO_MAX_STEPS) == 64
+    assert module._resolve_max_steps("othello", module._AUTO_MAX_STEPS) == 128
+    assert (
+        module._resolve_solver_eval_positions(
+            "connectfour", module._AUTO_SOLVER_EVAL_POSITIONS
+        )
+        == 64
+    )
+    assert (
+        module._resolve_solver_eval_positions(
+            "othello", module._AUTO_SOLVER_EVAL_POSITIONS
+        )
+        == 0
+    )
+    with pytest.raises(ValueError, match="solver_eval_positions"):
+        module._resolve_solver_eval_positions("othello", 16)
+    with pytest.raises(ValueError, match="supports games"):
         module._resolve_checkpoint_paths("tictactoe", "run123")
 
 
@@ -289,9 +309,11 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
 
     config = captured["config"]
     assert config.checkpoint_path == "/checkpoints/wandb123/connectfour/final.msgpack"
+    assert config.game == "connectfour"
     assert config.iterations == 2
     assert config.batch_size == 4
     assert config.num_simulations == 5
+    assert config.max_steps == 6
     assert config.selfplay_temperature == 1.0
     assert config.selfplay_temperature_drop_step == 8
     assert config.selfplay_temperature_after_drop == 0.0
@@ -322,7 +344,10 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert result["checkpoint_dir"] == "/checkpoints/wandb123/connectfour"
     assert result["checkpoint_volume"] == "alphazero-checkpoints"
     assert result["final_metrics"] == {"iteration": 1, "loss": 0.5}
+    assert result["config"]["game"] == "connectfour"
     assert result["config"]["requested_gpu"] == "A100-40GB"
+    assert result["config"]["max_steps"] == 6
+    assert result["config"]["solver_eval_positions"] == 0
     assert result["config"]["solver_rehearsal_positions"] == 8
     assert result["config"]["solver_rehearsal_value_loss_weight"] == 0.0
     assert result["config"]["solver_rehearsal_anchor_positions"] == 7

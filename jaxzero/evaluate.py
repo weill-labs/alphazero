@@ -1,7 +1,7 @@
 """Lightweight vs-random evaluation for a live strength signal during training.
 
 The net plays greedy (argmax of the masked policy — no search, so it's cheap) vs
-a uniform-random opponent over a batch of pgx Connect Four games. It saturates
+a uniform-random opponent over a batch of pgx games. It saturates
 once the net is strong, but it's a sharp *early* signal: a run that isn't
 learning sits near 50%, a run that is climbs toward ~100%. Pure pgx/JAX, so it
 adds no dependency and runs batched on-device.
@@ -14,13 +14,16 @@ import jax.numpy as jnp
 import pgx
 from flax import nnx
 
+from jaxzero.game_specs import DEFAULT_GAME, resolve_game
 from jaxzero.net import AlphaZeroNet, apply_model
-
-ENV_ID = "connect_four"
 
 
 def make_evaluator(
-    graphdef: nnx.GraphDef[AlphaZeroNet], *, num_games: int, max_steps: int
+    graphdef: nnx.GraphDef[AlphaZeroNet],
+    *,
+    num_games: int,
+    max_steps: int,
+    game: str = DEFAULT_GAME,
 ):
     """Return a jitted ``params, rng_key -> net_return[num_games]`` evaluator.
 
@@ -28,7 +31,7 @@ def make_evaluator(
     ``net_return`` is the net's terminal reward per game in {-1, 0, 1} (rewards
     are 0 until terminal, so summing over the no-auto-reset rollout yields it).
     """
-    env = pgx.make(ENV_ID)
+    env = pgx.make(resolve_game(game).env_id)
     net_player = jnp.arange(num_games) % 2
     neg_inf = jnp.finfo(jnp.float32).min
     game_index = jnp.arange(num_games)

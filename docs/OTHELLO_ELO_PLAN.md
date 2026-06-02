@@ -18,10 +18,23 @@ Use Othello first:
 Do not carry C4 solver expectations forward. Othello needs non-solver
 evaluation.
 
-## Current hardwired seams
+## Current status
 
 The network can already handle arbitrary observation shape and action size via
-`AlphaZeroNetConfig`. The main C4-specific seams are elsewhere:
+`AlphaZeroNetConfig`.
+
+`alphago-wnk` added the first generic-game plumbing pass:
+
+- `jaxzero.game_specs` maps canonical games to pgx env IDs and capability
+  flags.
+- `jaxzero.selfplay`, `jaxzero.evaluate`, and `jaxzero.arena` accept a `game`
+  argument while preserving C4 defaults.
+- `TrainingConfig(game="othello")` builds `(8, 8, 2)` / `65`-action nets and
+  rejects C4-only solver rehearsal, mirror augmentation, and per-column policy.
+- `jaxzero.cli` and `jaxzero.modal_train` default max steps and solver eval by
+  game, so Othello does not import or run the C4 solver path by default.
+
+The fixed seams were:
 
 - `jaxzero.selfplay`: `ENV_ID = "connect_four"` and `make_env()` has no game
   parameter.
@@ -34,6 +47,8 @@ The network can already handle arbitrary observation shape and action size via
   `--policy-head-style per_column`) should not silently run on Othello.
 
 ## Minimal implementation path
+
+Items 1-4 are implemented by `alphago-wnk`. Items 5-6 remain.
 
 1. Add a small pgx game spec layer.
 

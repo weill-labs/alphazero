@@ -5,19 +5,29 @@ from __future__ import annotations
 import argparse
 import json
 
+from jaxzero.game_specs import DEFAULT_GAME, resolve_game, supported_games
 from jaxzero.train import TrainingConfig, run_training
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Train JAX AlphaZero on pgx Connect Four."
+    parser = argparse.ArgumentParser(description="Train JAX AlphaZero on pgx games.")
+    parser.add_argument(
+        "--game",
+        choices=supported_games(),
+        default=DEFAULT_GAME,
+        help="pgx game to train. Default: connectfour.",
     )
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
         "--sims", "--num-simulations", dest="num_simulations", type=int, default=32
     )
-    parser.add_argument("--max-steps", type=int, default=64)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Maximum self-play plies per game. Default is game-specific "
+        "(connectfour: 64, othello: 128).",
+    )
     parser.add_argument(
         "--selfplay-temperature",
         type=float,
@@ -216,12 +226,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--solver-eval-positions",
         type=int,
-        default=64,
+        default=None,
         help="Every --eval-interval iterations, certify the net against the "
-        "solver on this many positions and log eval/c4_blunder_rate "
-        "(solver-anchored). Default 64 gives SE ~0.04 on rates near 0.1; "
-        "below ~32 the curve discretizes too coarsely to read. Set to 0 to "
-        "disable.",
+        "C4 solver on this many positions and log eval/c4_blunder_rate "
+        "(solver-anchored). Default is 64 for connectfour and 0 for games "
+        "without solver support. Set to 0 to disable.",
     )
     parser.add_argument("--eval-sims", type=int, default=64)
     parser.add_argument(
@@ -285,12 +294,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    game_spec = resolve_game(args.game)
+    max_steps = (
+        args.max_steps if args.max_steps is not None else game_spec.default_max_steps
+    )
+    solver_eval_positions = (
+        args.solver_eval_positions
+        if args.solver_eval_positions is not None
+        else (64 if game_spec.supports_solver_eval else 0)
+    )
+    if solver_eval_positions < 0:
+        parser.error("--solver-eval-positions must be non-negative")
+    if solver_eval_positions > 0 and not game_spec.supports_solver_eval:
+        parser.error(
+            f"--solver-eval-positions requires C4 solver support; "
+            f"game {game_spec.name!r} has none"
+        )
     config = TrainingConfig(
+        game=game_spec.name,
         iterations=args.iterations,
         batch_size=args.batch_size,
         num_simulations=args.num_simulations,
-        max_steps=args.max_steps,
+        max_steps=max_steps,
         selfplay_temperature=args.selfplay_temperature,
         selfplay_temperature_drop_step=args.selfplay_temperature_drop_step,
         selfplay_temperature_after_drop=args.selfplay_temperature_after_drop,
@@ -341,11 +368,11 @@ def main(argv: list[str] | None = None) -> None:
         input_embed_style=args.input_embed_style,
     )
     extra_evaluator = None
-    if args.solver_eval_positions > 0:
+    if solver_eval_positions > 0:
         from alphazero.c4_certify import make_solver_evaluator
 
         extra_evaluator = make_solver_evaluator(
-            sample_size=args.solver_eval_positions,
+            sample_size=solver_eval_positions,
             sims=args.eval_sims,
             seed=args.seed,
         )

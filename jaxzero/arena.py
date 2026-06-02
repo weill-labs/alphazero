@@ -23,9 +23,9 @@ import jax.numpy as jnp
 import pgx
 from flax import nnx
 
+from jaxzero.game_specs import DEFAULT_GAME, resolve_game
 from jaxzero.net import AlphaZeroNet, apply_model
 
-ENV_ID = "connect_four"
 ELO_K = 16.0  # matches alphazero.elo_ladder.DEFAULT_ELO_K
 
 
@@ -67,6 +67,7 @@ def make_gating_match(
     *,
     num_games: int,
     max_steps: int,
+    game: str = DEFAULT_GAME,
 ):
     """Return a jitted heads-up match function for gating.
 
@@ -84,7 +85,7 @@ def make_gating_match(
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
 
-    env = pgx.make(ENV_ID)
+    env = pgx.make(resolve_game(game).env_id)
     candidate_player = jnp.concatenate(
         [
             jnp.zeros(num_games // 2, dtype=jnp.int32),
