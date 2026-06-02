@@ -144,6 +144,16 @@ def _last_metrics(metrics: list[dict[str, float | int]]) -> dict[str, float | in
     return dict(metrics[-1]) if metrics else {}
 
 
+def _function_call_id(function_call) -> str:
+    return str(
+        getattr(
+            function_call,
+            "object_id",
+            getattr(function_call, "id", function_call),
+        )
+    )
+
+
 if modal is None:
     app = None
     image = None
@@ -485,11 +495,12 @@ else:
         seed: int = 0,
         gpu: str = _DEFAULT_GPU,
         run_tag: str | None = None,
+        spawn: bool = False,
     ) -> None:
         remote_train = (
             train_remote.with_options(gpu=gpu) if gpu != _DEFAULT_GPU else train_remote
         )
-        result = remote_train.remote(
+        kwargs = dict(
             game=game,
             iterations=iterations,
             batch_size=batch_size,
@@ -545,4 +556,20 @@ else:
             requested_gpu=gpu,
             run_tag=run_tag,
         )
+        if spawn:
+            function_call = remote_train.spawn(**kwargs)
+            print(
+                json.dumps(
+                    {
+                        "function_call_id": _function_call_id(function_call),
+                        "game": game,
+                        "run_tag": run_tag,
+                        "gpu": gpu,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
+
+        result = remote_train.remote(**kwargs)
         print(json.dumps(result, indent=2, sort_keys=True))

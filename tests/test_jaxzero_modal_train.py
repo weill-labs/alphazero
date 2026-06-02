@@ -155,6 +155,8 @@ def test_jaxzero_modal_train_checkpoint_paths(monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match="run_tag"):
         module._checkpoint_run_tag(SimpleNamespace(id="abc123"), seed=0, run_tag="../x")
+    assert module._function_call_id(SimpleNamespace(object_id="fc-123")) == "fc-123"
+    assert module._function_call_id(SimpleNamespace(id="fc-456")) == "fc-456"
     assert module._resolve_max_steps("connectfour", module._AUTO_MAX_STEPS) == 64
     assert module._resolve_max_steps("othello", module._AUTO_MAX_STEPS) == 128
     assert (
