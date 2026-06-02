@@ -112,9 +112,12 @@ final checkpoint (**29/857 = 0.034**) and the sims=600 final (**30/859 =
 0.035**). This does not mean compute scale solved C4; it means periodic
 checkpoint selection matters, and final checkpoint metrics can hide the best
 model. The remaining bottleneck is still **policy fidelity on sharp tactical
-positions**, not value calibration. See the full **[C4_FINDINGS.md](C4_FINDINGS.md)**
-report for the complete results, the capstone, the sims=600 residual-gap test,
-the checkpoint ladder, and the value/policy decoupling finding.
+positions**, not value calibration. The hard-archive rehearsal follow-up
+improved the frozen-193 ladder but failed the 1024 cert (`rd6in41i/final`:
+`23/858 = 0.0268`), confirming that small-set wins can still trade failures.
+See the full **[C4_FINDINGS.md](C4_FINDINGS.md)** report for the complete
+results, the capstone, the sims=600 residual-gap test, the checkpoint ladder,
+and the value/policy decoupling/failure-overlap findings.
 
 ## SOTA-scale run: cost
 
@@ -271,21 +274,10 @@ modal run jaxzero/modal_train.py::main \
 ## Future work
 
 The SOTA-scale capstone is **done** (it held the floor — see
-[C4_FINDINGS.md](C4_FINDINGS.md)). Global hyperparameter sweeps are exhausted.
-The remaining directions, in priority order:
+[C4_FINDINGS.md](C4_FINDINGS.md)). Global hyperparameter sweeps and the current
+C4 hard-rehearsal family are exhausted. Keep C4 as a regression benchmark, not
+the main optimization target. The remaining directions, in priority order:
 
-- **Hard-archive anti-regression rehearsal** (`alphago-27k`) — aggregate hard
-  states from multiple reference checkpoints and add broad single-optimal
-  anchors so rehearsal does not simply trade one failure set for another.
-- **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — implemented
-  behind `--solver-rehearsal-*`; mixed/negative verdict. It improved the small
-  frozen ladder and average WDL regret, but did not reduce the 1024-position
-  weak-blunder count.
-- **Self-play temperature / noise schedules** (`alphago-be8`) — reduce the
-  remaining policy mismatch by keeping self-play stochastic in the opening but
-  greedy in tactical late positions. Implemented as `--selfplay-temperature-*`
-  and `--selfplay-dirichlet-fraction-*`; verdict still requires the fixed
-  eval-set checkpoint ladder.
 - **Eval-set / methodology reconciliation** — confirm whether the ~10–20× gap to
   the literature is real or an eval-set artifact, using a fixed shareable eval
   set + cached labels (`alphago-yom`).
@@ -295,3 +287,12 @@ The remaining directions, in priority order:
 - **Inline batched eval** — wire the batched cert into the per-iteration training
   eval; marginal (small sample, infrequent) but removes the inline solver cost on
   the training container.
+
+Completed C4 directions to avoid repeating:
+
+- **Hard-archive anti-regression rehearsal** (`alphago-27k`) — small-set win,
+  1024 fail; failure overlap showed repaired old failures and introduced new
+  ones.
+- **Solver-supervised hard-position rehearsal** (`alphago-fvh`) — mixed/negative
+  1024 verdict.
+- **Self-play temperature / noise schedules** (`alphago-be8`) — negative.

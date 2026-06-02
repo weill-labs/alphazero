@@ -234,27 +234,37 @@ deterministic cert. The old **~0.04–0.07** floor describes final checkpoints a
 stochastic/shallower-cert conclusions, not the best checkpoint selected from the
 ladder. That is a useful improvement, but it is not a solve and remains roughly
 an order of magnitude above the literature's near-perfect agents. The residual
-gap is most likely a setup/eval difference or a missing hard-position learning
-signal — not a missing global hyperparameter, and not raw compute.
+gap is policy-tail generalization on sparse tactical states, plus possible
+eval-method differences with the literature. It is not a missing global
+hyperparameter or raw compute.
 
-Given the decoupling finding, global hyperparameter sweeps are exhausted. The
-remaining open directions, in priority order:
+The hard-archive anti-regression run (`rd6in41i`, `alphago-27k`) is complete. It
+improved the small frozen ladder (`5/193` vs current best `6/193`) but failed
+the 1024 confirmation: `23/858 = 0.0268`, worse than `trjd57fm/iter_0050` at
+`20/856 = 0.0234`. Failure-overlap analysis confirmed the same failure-trading
+pattern as earlier rehearsal variants: against the union of `trjd57fm/iter_0050`
+and `jphh1t67/iter_0075` failures, `rd6in41i` repaired 21 reference failures
+but introduced 11 failures not failed by either reference checkpoint, leaving a
+worse high-resolution blunder count.
 
-1. **Hard-archive anti-regression rehearsal** (`alphago-27k`) — current best
-   next lever. The 1024 failure analysis showed hard rehearsal repaired many
-   old failures but introduced a comparable number of new failures. The next
-   run should mine against multiple reference checkpoints and include
-   single-optimal anchor replay so it cannot trade one sparse failure set for
-   another.
-2. **Eval-set / methodology reconciliation** — confirm whether the gap to the
+Given that result, pause C4 as the main optimization target. Keep it as a
+regression benchmark and return only for eval reconciliation or a materially
+different method. Remaining directions, in priority order:
+
+1. **Eval-set / methodology reconciliation** — confirm whether the gap to the
    literature is real or an eval-set artifact (the open eval-set + cached-labels
    work in `alphago-yom` makes this a fixed, shareable comparison).
-3. **Bigger boards** (Othello/Gomoku, `alphago-hjx`) — where AlphaViT suggests
+2. **Bigger boards** (Othello/Gomoku, `alphago-hjx`) — where AlphaViT suggests
    attention may finally beat convolution; requires Elo-based eval since the
    exact solver is C4-specific.
+3. **C4 only with a new method class** — e.g. iterative DAgger-style data
+   aggregation from learner-induced failures, optimizer-state-preserving
+   warm-starts, or a reference-engine/eval-set reconciliation. Do not launch
+   more one-off C4 hard-rehearsal variants on the current machinery.
 
 Do **not** re-run single-lever sweeps (arch, value-head, sims, iters, batch) or
-the transformer on C4 — all are settled.
+the transformer on C4, and do not treat frozen-193 wins as claims without a
+1024 confirmation. Those paths are settled.
 
 ## Reproduction
 
@@ -276,4 +286,5 @@ cached solver labels make every cert a paired comparison — build them once wit
 - `alphago-938` — checkpoint ladder; current best `trjd57fm/iter_0050`
 - `alphago-fvh` — solver-supervised hard-position rehearsal (mixed/negative)
 - `alphago-8ij` — 1024 failure analysis: midgame single-correct-move traps
-- `alphago-27k` — **in progress**: hard-archive anti-regression rehearsal
+- `alphago-27k` — hard-archive anti-regression rehearsal (small-set win, 1024 fail)
+- `alphago-0t2` — failure overlap: `rd6in41i` repaired old failures but introduced new ones
