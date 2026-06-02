@@ -194,3 +194,63 @@ Matched `iter_0060` six-model round-robin, two evaluator seeds:
 Early read: the transformer lead persists at equal `iter_0060`, but this is
 still not the final A/B. The final comparison must use best-checkpoint ladders
 for the transformer seeds once `iter_0080` and `final` exist.
+
+## 2026-06-02 17:55 UTC Final Greedy Checkpoint A/B
+
+All six production runs finished at summary iteration 79 and all checkpoint
+ladders were downloaded locally.
+
+Cost proxy from W&B runtime, assuming one A100-class GPU per run:
+
+| Run | Runtime seconds | Runtime hours |
+| --- | ---: | ---: |
+| `othello-resnet-s101` | 1321.7 | 0.367 |
+| `othello-resnet-s102` | 2187.6 | 0.608 |
+| `othello-resnet-s103` | 1291.2 | 0.359 |
+| `othello-transformer-s101` | 2689.1 | 0.747 |
+| `othello-transformer-s102` | 2625.2 | 0.729 |
+| `othello-transformer-s103` | 2686.0 | 0.746 |
+
+Total runtime proxy: 12,800.8 seconds, or 3.556 A100-job-hours. ResNets used
+1.333 job-hours; transformers used 2.222 job-hours.
+
+Best checkpoints were selected by averaging the two per-run greedy ladder
+evaluator seeds:
+
+| Run | Selected checkpoint | Ladder seed 0 Elo | Ladder seed 1 Elo |
+| --- | --- | ---: | ---: |
+| `othello-resnet-s101` | `iter_0040` | 35.9 | -6.2 |
+| `othello-resnet-s102` | `iter_0080` | 786.7 | 838.1 |
+| `othello-resnet-s103` | `final` | 274.2 | 266.1 |
+| `othello-transformer-s101` | `iter_0060` | 414.3 | 530.3 |
+| `othello-transformer-s102` | `iter_0060` | 365.8 | 388.9 |
+| `othello-transformer-s103` | `final` | 505.9 | 481.9 |
+
+Best-checkpoint six-model round-robin used `--games-per-pairing 32`,
+`--fit-iterations 300`, and evaluator seeds 0, 1, and 2:
+
+| Best checkpoint | Seed 0 Elo | Seed 1 Elo | Seed 2 Elo | Mean Elo |
+| --- | ---: | ---: | ---: | ---: |
+| `othello-resnet-s101/iter_0040` | 0.0 | 0.0 | 0.0 | 0.0 |
+| `othello-resnet-s102/iter_0080` | 353.0 | 390.9 | 368.5 | 370.8 |
+| `othello-resnet-s103/final` | -130.6 | -17.9 | -47.0 | -65.2 |
+| `othello-transformer-s101/iter_0060` | 318.1 | 433.7 | 409.0 | 386.9 |
+| `othello-transformer-s102/iter_0060` | 341.1 | 415.8 | 365.4 | 374.1 |
+| `othello-transformer-s103/final` | 380.5 | 390.1 | 381.6 | 384.1 |
+
+Architecture read under greedy Elo: transformer wins the distribution. All
+three transformer seeds cluster around 374-387 mean Elo; only one ResNet seed
+(`s102`) is competitive, at 370.8 mean Elo. The mean across all seed/evaluator
+points is 381.7 for transformer versus 101.9 for ResNet. This is a real signal
+for Othello, but the best individual ResNet is close enough to the transformer
+cluster that the next decision should use a stronger MCTS-style evaluator before
+locking architecture changes.
+
+Failure modes observed:
+
+- `--spawn` on an ephemeral Modal app returned a call id but did not persist a
+  useful training run.
+- Detached attempts that were not backgrounded correctly created stopped/idle
+  apps with zero tasks.
+- Production runs using backgrounded `setsid ... modal run --detach` stayed up
+  and produced complete checkpoint ladders.
