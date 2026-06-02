@@ -1,0 +1,184 @@
+"""Tests for pgx checkpoint Elo ladders."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+
+import pytest
+
+from jaxzero.checkpoint_elo import (
+    PairingResult,
+    evaluate_checkpoint_ladder,
+    fit_elo_ratings,
+    main,
+    resolve_checkpoint_paths,
+)
+from jaxzero.net import AlphaZeroNetConfig, create_model
+from jaxzero.selfplay import initial_observation_shape, make_env
+from jaxzero.train import save_checkpoint
+
+
+def _save_checkpoint(path, *, game: str = "othello", seed: int = 0) -> None:
+    env = make_env(game)
+    config = AlphaZeroNetConfig(
+        obs_shape=initial_observation_shape(game),
+        action_size=env.num_actions,
+        channels=4,
+        num_res_blocks=0,
+    )
+    save_checkpoint(create_model(config, seed=seed), path)
+
+
+def test_resolve_checkpoint_paths_orders_periodic_before_final(tmp_path) -> None:
+    final = tmp_path / "final.msgpack"
+    iter_2 = tmp_path / "iter_0002.msgpack"
+    iter_1 = tmp_path / "iter_0001.msgpack"
+    other = tmp_path / "other.msgpack"
+    for path in (final, iter_2, iter_1, other):
+        path.touch()
+
+    paths = resolve_checkpoint_paths(checkpoint_dir=tmp_path)
+
+    assert paths == [iter_1, iter_2, final, other]
+
+
+def test_othello_checkpoint_ladder_loads_and_matches(tmp_path) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    result = evaluate_checkpoint_ladder(
+        [early, late],
+        game="othello",
+        games_per_pairing=2,
+        max_steps=128,
+        seed=7,
+        fit_iterations=1,
+    )
+
+    assert result.game == "othello"
+    assert result.evaluator_mode == "greedy"
+    assert [point.name for point in result.curve] == ["early", "late"]
+    assert [point.path for point in result.curve] == [early, late]
+    assert len(result.pairings) == 1
+    assert result.pairings[0].games == 2
+    assert result.max_steps == 128
+    assert result.as_dict()["best_checkpoint"] in {str(early), str(late)}
+
+
+def test_checkpoint_ladder_is_deterministic_for_fixed_seed(tmp_path) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    first = evaluate_checkpoint_ladder(
+        [early, late],
+        game="othello",
+        games_per_pairing=2,
+        max_steps=2,
+        seed=123,
+        fit_iterations=1,
+    )
+    second = evaluate_checkpoint_ladder(
+        [early, late],
+        game="othello",
+        games_per_pairing=2,
+        max_steps=2,
+        seed=123,
+        fit_iterations=1,
+    )
+
+    assert first.as_dict() == second.as_dict()
+
+
+def test_games_per_pairing_must_be_even_for_balanced_seats(tmp_path) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    with pytest.raises(ValueError, match="balance seats"):
+        evaluate_checkpoint_ladder(
+            [early, late],
+            game="othello",
+            games_per_pairing=3,
+            max_steps=2,
+        )
+
+
+def test_fit_elo_ratings_ranks_monotone_results() -> None:
+    ratings = fit_elo_ratings(
+        ["early", "mid", "late"],
+        [
+            PairingResult("early", "mid", 0, 0, 8),
+            PairingResult("mid", "late", 0, 0, 8),
+        ],
+        anchor_name="early",
+    )
+
+    assert ratings["early"] < ratings["mid"] < ratings["late"]
+
+
+def test_othello_ladder_rejects_c4_checkpoint_shape(tmp_path) -> None:
+    c4_checkpoint = tmp_path / "c4.msgpack"
+    other = tmp_path / "other.msgpack"
+    _save_checkpoint(c4_checkpoint, game="connectfour", seed=0)
+    _save_checkpoint(other, seed=1)
+
+    with pytest.raises(ValueError, match="does not match game 'othello'"):
+        evaluate_checkpoint_ladder(
+            [c4_checkpoint, other],
+            game="othello",
+            games_per_pairing=2,
+            max_steps=2,
+        )
+
+
+def test_checkpoint_elo_cli_prints_json(tmp_path, capsys) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    exit_code = main(
+        [
+            str(early),
+            str(late),
+            "--game",
+            "othello",
+            "--games-per-pairing",
+            "2",
+            "--max-steps",
+            "2",
+            "--fit-iterations",
+            "1",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["game"] == "othello"
+    assert payload["evaluator_mode"] == "greedy"
+    assert payload["pairings"][0]["games"] == 2
+
+
+def test_checkpoint_elo_imports_without_c4_solver_dependency() -> None:
+    code = (
+        "import sys, jaxzero.checkpoint_elo; "
+        "raise SystemExit("
+        "'alphazero.c4_certify' in sys.modules or "
+        "'alphazero.games.connectfour' in sys.modules)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr

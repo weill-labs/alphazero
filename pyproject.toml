@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 alphazero-c4-certify = "alphazero.c4_certify:main"
 alphazero-elo-ladder = "alphazero.elo_ladder:main"
+jaxzero-checkpoint-elo = "jaxzero.checkpoint_elo:main"
 jaxzero-train = "jaxzero.cli:main"
 
 [project.optional-dependencies]

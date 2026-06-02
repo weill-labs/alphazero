@@ -48,7 +48,10 @@ The fixed seams were:
 
 ## Minimal implementation path
 
-Items 1-4 are implemented by `alphago-wnk`. Items 5-6 remain.
+Items 1-4 are implemented by `alphago-wnk`. Item 5 is implemented by
+`alphago-bv2` via `jaxzero-checkpoint-elo`, a greedy pgx checkpoint Elo ladder
+that supports Othello checkpoint directories without the C4 solver stack. Item
+6 remains.
 
 1. Add a small pgx game spec layer.
 
@@ -97,6 +100,14 @@ Items 1-4 are implemented by `alphago-wnk`. Items 5-6 remain.
    - Checkpoint directory ladder support so we can select best periodic
      checkpoint instead of trusting `final.msgpack`.
    - Report Elo, score, win/draw/loss, games per pairing, and evaluator mode.
+
+   Local smoke:
+
+   ```bash
+   uv run jaxzero-checkpoint-elo --game othello \
+     --checkpoint-dir checkpoints/<run>/othello \
+     --games-per-pairing 8
+   ```
 
 6. Run the actual A/B only after the evaluator works.
 
