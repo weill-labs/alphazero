@@ -81,3 +81,41 @@ Modal volume into `checkpoints/<run-tag>/othello`.
 - Download checkpoint ladders.
 - Run per-seed checkpoint Elo.
 - Compare best-checkpoint Elo distributions across the three matched seeds.
+
+## 2026-06-02 17:14 UTC Status
+
+All six Modal apps were still active with `Tasks=1`.
+
+W&B summary iterations:
+
+- `othello-resnet-s101`: 37
+- `othello-resnet-s102`: 23
+- `othello-resnet-s103`: 39
+- `othello-transformer-s101`: 18
+- `othello-transformer-s102`: 19
+- `othello-transformer-s103`: 18
+
+Checkpoint volume status:
+
+- All six runs had `iter_0020.msgpack`.
+- `othello-resnet-s103` also had `iter_0040.msgpack`.
+
+Local checkpoint downloads completed for all six `iter_0020` files and
+`othello-resnet-s103/iter_0040.msgpack`. The downloaded files are under
+`checkpoints/<run-tag>/othello/` and are ignored by git.
+
+Evaluator smoke:
+
+```bash
+uv run jaxzero-checkpoint-elo --game othello --mode round-robin \
+  --games-per-pairing 2 --max-steps 128 --fit-iterations 20 \
+  checkpoints/othello-resnet-s101/othello/iter_0020.msgpack \
+  checkpoints/othello-resnet-s102/othello/iter_0020.msgpack \
+  checkpoints/othello-resnet-s103/othello/iter_0020.msgpack \
+  checkpoints/othello-transformer-s101/othello/iter_0020.msgpack \
+  checkpoints/othello-transformer-s102/othello/iter_0020.msgpack \
+  checkpoints/othello-transformer-s103/othello/iter_0020.msgpack
+```
+
+The smoke completed successfully. Treat the numbers as a pipeline check only:
+2 games per pairing is too small for an architecture claim.
