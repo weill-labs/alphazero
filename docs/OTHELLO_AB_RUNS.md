@@ -344,3 +344,35 @@ uv run --extra modal modal run jaxzero/modal_train.py::checkpoint_elo \
 
 Use `--spawn` for long runs if the local client should detach after submitting
 the remote A100 job.
+
+Validation run:
+
+- Modal app: `ap-fQArE2UxC02fGk5BWtS3Vl`
+- Exact prior top-contender setup: `--mcts-simulations 16`,
+  `--games-per-pairing 16`, `--seed 1`
+- Runtime: 63.5 seconds for 48 games on `A100-40GB`
+- Result reproduced the local 16-sim check: ResNet s102 lost 0-16 to
+  transformer s102 and 0-16 to transformer s103.
+
+32-sim top-contender replication:
+
+| Evaluator seed | ResNet s102 Elo | Transformer s102 Elo | Transformer s103 Elo | Runtime seconds |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 0.0 | -98.0 | -212.5 | 83.1 |
+| 3 | 0.0 | -83.0 | -232.6 | 82.0 |
+| 4 | 0.0 | -148.8 | -241.9 | 82.5 |
+
+Aggregate 32-sim pair scores across seeds 2-4:
+
+| Pairing | Score |
+| --- | ---: |
+| ResNet s102 vs transformer s102 | 42-54 |
+| ResNet s102 vs transformer s103 | 96-0 |
+| Transformer s102 vs transformer s103 | 44-52 |
+
+Read: the Modal runner is correct, but the Othello MCTS verdict is not stable
+across search budgets. At 16 sims, both top transformers crush the best ResNet.
+At 32 sims, the best ResNet wins the aggregate round-robin because it sweeps
+transformer s103, despite losing or tying head-to-head against transformer s102.
+Do not treat Othello architecture as settled until the 16-vs-32-sim flip is
+explained with a sim-budget sweep and/or action-level traces.
