@@ -318,3 +318,29 @@ architecture direction. User-facing training entrypoints now resolve
 Connect Four defaults remain ResNet/v1-compatible. Explicit Othello ResNet
 overrides are still supported, but future Othello training should treat ResNet
 as a control, not the default path.
+
+## 2026-06-03 Modal MCTS Runner
+
+Bead: `alphago-6tz`
+
+`jaxzero/modal_train.py` now has a `checkpoint_elo` Modal local entrypoint for
+running checkpoint Elo directly against the `alphazero-checkpoints` volume. It
+defaults to `A100-40GB` and avoids downloading checkpoint ladders for higher-rep
+MCTS checks.
+
+Top-contender Othello command:
+
+```bash
+uv run --extra modal modal run jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-resnet-s102/othello/iter_0080.msgpack,othello-transformer-s102/othello/iter_0060.msgpack,othello-transformer-s103/othello/final.msgpack" \
+  --mode round-robin \
+  --evaluator-mode mcts \
+  --mcts-simulations 32 \
+  --games-per-pairing 32 \
+  --fit-iterations 300 \
+  --seed 2
+```
+
+Use `--spawn` for long runs if the local client should detach after submitting
+the remote A100 job.

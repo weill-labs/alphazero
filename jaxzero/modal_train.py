@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from collections.abc import Mapping
+from pathlib import Path
 
 from jaxzero.game_specs import (
     DEFAULT_GAME,
@@ -17,6 +18,7 @@ from jaxzero.game_specs import (
 
 WANDB_PROJECT_PREFIX = "alphazero"
 _DEFAULT_GPU = "A10G"
+_DEFAULT_CHECKPOINT_ELO_GPU = "A100-40GB"
 _CHECKPOINT_VOLUME_NAME = "alphazero-checkpoints"
 _CHECKPOINT_MOUNT = "/checkpoints"
 _AUTO_MAX_STEPS = -1
@@ -145,6 +147,28 @@ def _resolve_checkpoint_paths(
     return final_path, checkpoint_dir
 
 
+def _split_checkpoint_refs(checkpoints: str) -> list[str]:
+    """Parse comma/newline-separated checkpoint refs from a Modal CLI string."""
+
+    return [part.strip() for part in re.split(r"[,\n]", checkpoints) if part.strip()]
+
+
+def _checkpoint_volume_path(path: str, *, root: str = _CHECKPOINT_MOUNT) -> str:
+    """Resolve a checkpoint ref to an absolute path inside the Modal Volume."""
+
+    if not path:
+        raise ValueError("checkpoint path must not be empty")
+    root_path = Path(root)
+    ref = Path(path)
+    if ref.is_absolute():
+        if ref == root_path or root_path in ref.parents:
+            return str(ref)
+        raise ValueError(f"checkpoint path must be under {root}: {path!r}")
+    if ".." in ref.parts:
+        raise ValueError(f"checkpoint path must not contain '..': {path!r}")
+    return str(root_path / ref)
+
+
 def _last_metrics(metrics: list[dict[str, float | int]]) -> dict[str, float | int]:
     return dict(metrics[-1]) if metrics else {}
 
@@ -167,7 +191,13 @@ if modal is None:
     def train_remote(*args, **kwargs):
         raise _modal_missing()
 
+    def checkpoint_elo_remote(*args, **kwargs):
+        raise _modal_missing()
+
     def main(*args, **kwargs) -> None:
+        raise _modal_missing()
+
+    def checkpoint_elo(*args, **kwargs) -> None:
         raise _modal_missing()
 
 else:
@@ -457,6 +487,80 @@ else:
             checkpoint_volume.commit()
             _wandb_finish(wandb_run)
 
+    @app.function(
+        image=image,
+        gpu=_DEFAULT_CHECKPOINT_ELO_GPU,
+        timeout=6 * 60 * 60,
+        volumes={_CHECKPOINT_MOUNT: checkpoint_volume},
+    )
+    def checkpoint_elo_remote(
+        game: str = DEFAULT_GAME,
+        checkpoint_paths: list[str] | None = None,
+        checkpoint_dir: str | None = None,
+        pattern: str = "*.msgpack",
+        mode: str = "anchored-sequential",
+        games_per_pairing: int = 8,
+        max_steps: int = _AUTO_MAX_STEPS,
+        evaluator_mode: str = "greedy",
+        mcts_simulations: int = 32,
+        gumbel_scale: float = 0.0,
+        seed: int = 0,
+        fit_iterations: int = 200,
+        elo_k: float = 16.0,
+        requested_gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
+    ) -> dict[str, object]:
+        from jaxzero.checkpoint_elo import (
+            evaluate_checkpoint_ladder,
+            resolve_checkpoint_paths,
+        )
+
+        game = _validate_game(game)
+        max_steps = _resolve_max_steps(game, max_steps)
+        checkpoint_paths = checkpoint_paths or []
+        volume_checkpoint_paths = [
+            _checkpoint_volume_path(path) for path in checkpoint_paths
+        ]
+        volume_checkpoint_dir = (
+            _checkpoint_volume_path(checkpoint_dir)
+            if checkpoint_dir is not None
+            else None
+        )
+        resolved_paths = resolve_checkpoint_paths(
+            checkpoints=volume_checkpoint_paths,
+            checkpoint_dir=volume_checkpoint_dir,
+            pattern=pattern,
+        )
+        if not resolved_paths:
+            raise ValueError("no checkpoints found for Modal checkpoint Elo")
+
+        started = time.perf_counter()
+        result = evaluate_checkpoint_ladder(
+            resolved_paths,
+            game=game,
+            games_per_pairing=games_per_pairing,
+            max_steps=max_steps,
+            mode=mode,
+            evaluator_mode=evaluator_mode,
+            mcts_simulations=mcts_simulations,
+            gumbel_scale=gumbel_scale,
+            seed=seed,
+            fit_iterations=fit_iterations,
+            elo_k=elo_k,
+        )
+        elapsed = max(time.perf_counter() - started, 1e-12)
+        payload = result.as_dict()
+        payload["modal_metrics"] = {
+            "modal_checkpoint_elo_seconds": elapsed,
+            "modal_checkpoint_elo_pairings": len(result.pairings),
+            "modal_checkpoint_elo_games": sum(
+                pairing.games for pairing in result.pairings
+            ),
+        }
+        payload["checkpoint_volume"] = _CHECKPOINT_VOLUME_NAME
+        payload["requested_gpu"] = requested_gpu
+        payload["checkpoint_paths"] = [str(path) for path in resolved_paths]
+        return payload
+
     @app.local_entrypoint()
     def main(
         game: str = DEFAULT_GAME,
@@ -588,4 +692,65 @@ else:
             return
 
         result = remote_train.remote(**kwargs)
+        print(json.dumps(result, indent=2, sort_keys=True))
+
+    @app.local_entrypoint()
+    def checkpoint_elo(
+        game: str = DEFAULT_GAME,
+        checkpoints: str = "",
+        checkpoint_dir: str | None = None,
+        pattern: str = "*.msgpack",
+        mode: str = "anchored-sequential",
+        games_per_pairing: int = 8,
+        max_steps: int = _AUTO_MAX_STEPS,
+        evaluator_mode: str = "greedy",
+        mcts_simulations: int = 32,
+        gumbel_scale: float = 0.0,
+        seed: int = 0,
+        fit_iterations: int = 200,
+        elo_k: float = 16.0,
+        gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
+        spawn: bool = False,
+    ) -> None:
+        refs = _split_checkpoint_refs(checkpoints)
+        if not refs and checkpoint_dir is None:
+            raise ValueError("--checkpoints or --checkpoint-dir is required")
+        remote_elo = (
+            checkpoint_elo_remote.with_options(gpu=gpu)
+            if gpu != _DEFAULT_CHECKPOINT_ELO_GPU
+            else checkpoint_elo_remote
+        )
+        kwargs = dict(
+            game=game,
+            checkpoint_paths=refs,
+            checkpoint_dir=checkpoint_dir,
+            pattern=pattern,
+            mode=mode,
+            games_per_pairing=games_per_pairing,
+            max_steps=max_steps,
+            evaluator_mode=evaluator_mode,
+            mcts_simulations=mcts_simulations,
+            gumbel_scale=gumbel_scale,
+            seed=seed,
+            fit_iterations=fit_iterations,
+            elo_k=elo_k,
+            requested_gpu=gpu,
+        )
+        if spawn:
+            function_call = remote_elo.spawn(**kwargs)
+            print(
+                json.dumps(
+                    {
+                        "function_call_id": _function_call_id(function_call),
+                        "game": game,
+                        "checkpoint_paths": refs,
+                        "checkpoint_dir": checkpoint_dir,
+                        "gpu": gpu,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
+
+        result = remote_elo.remote(**kwargs)
         print(json.dumps(result, indent=2, sort_keys=True))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import importlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,10 @@ def test_jaxzero_modal_train_imports_without_modal_installed(monkeypatch) -> Non
     assert module.checkpoint_volume is None
     with pytest.raises(RuntimeError, match="uv sync --extra modal"):
         module.train_remote()
+    with pytest.raises(RuntimeError, match="uv sync --extra modal"):
+        module.checkpoint_elo_remote()
+    with pytest.raises(RuntimeError, match="uv sync --extra modal"):
+        module.checkpoint_elo()
 
 
 def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
@@ -121,13 +126,19 @@ def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
         "wandb>=0.27.0",
     )
     assert module.image.modules == ("jaxzero", "alphazero")
-    assert module.app.functions
-    options = module.app.functions[0].options
-    assert options["image"] is module.image
-    assert options["gpu"] == "A10G"
-    assert options["timeout"] == 12 * 60 * 60
-    volumes = options["volumes"]
+    assert len(module.app.functions) == 2
+    train_options = module.app.functions[0].options
+    assert train_options["image"] is module.image
+    assert train_options["gpu"] == "A10G"
+    assert train_options["timeout"] == 12 * 60 * 60
+    volumes = train_options["volumes"]
     assert volumes["/checkpoints"].name == "alphazero-checkpoints"
+    elo_options = module.app.functions[1].options
+    assert elo_options["image"] is module.image
+    assert elo_options["gpu"] == "A100-40GB"
+    assert elo_options["timeout"] == 6 * 60 * 60
+    assert "secrets" not in elo_options
+    assert elo_options["volumes"]["/checkpoints"].name == "alphazero-checkpoints"
     assert module.app.entrypoint is not None
 
 
@@ -175,6 +186,150 @@ def test_jaxzero_modal_train_checkpoint_paths(monkeypatch) -> None:
         module._resolve_solver_eval_positions("othello", 16)
     with pytest.raises(ValueError, match="supports games"):
         module._resolve_checkpoint_paths("tictactoe", "run123")
+    assert module._split_checkpoint_refs("a.msgpack, b.msgpack\nc.msgpack") == [
+        "a.msgpack",
+        "b.msgpack",
+        "c.msgpack",
+    ]
+    assert (
+        module._checkpoint_volume_path("run/othello/final.msgpack")
+        == "/checkpoints/run/othello/final.msgpack"
+    )
+    assert (
+        module._checkpoint_volume_path("/checkpoints/run/othello/final.msgpack")
+        == "/checkpoints/run/othello/final.msgpack"
+    )
+    with pytest.raises(ValueError, match="under /checkpoints"):
+        module._checkpoint_volume_path("/tmp/final.msgpack")
+    with pytest.raises(ValueError, match="must not contain"):
+        module._checkpoint_volume_path("../final.msgpack")
+
+
+def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> None:
+    class FakeImage:
+        def pip_install(self, *packages: str):
+            return self
+
+        def add_local_python_source(self, *modules: str):
+            return self
+
+    class FakeImageFactory:
+        @staticmethod
+        def debian_slim(python_version: str | None = None) -> FakeImage:
+            return FakeImage()
+
+    class FakeApp:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def function(self, **options):
+            def decorate(func):
+                return func
+
+            return decorate
+
+        def local_entrypoint(self):
+            def decorate(func):
+                return func
+
+            return decorate
+
+    class FakeSecret:
+        @staticmethod
+        def from_name(name: str) -> SimpleNamespace:
+            return SimpleNamespace(name=name)
+
+    class FakeVolume:
+        @staticmethod
+        def from_name(name: str, create_if_missing: bool = False) -> "FakeVolume":
+            return FakeVolume()
+
+    fake_modal = SimpleNamespace(
+        App=FakeApp,
+        Image=FakeImageFactory,
+        Secret=FakeSecret,
+        Volume=FakeVolume,
+    )
+    monkeypatch.setitem(sys.modules, "modal", fake_modal)
+    module = load_jax_modal_train()
+
+    import jaxzero.checkpoint_elo as checkpoint_elo_module
+
+    captured: dict[str, object] = {}
+
+    def fake_resolve_checkpoint_paths(*, checkpoints, checkpoint_dir=None, pattern):
+        captured["resolve"] = {
+            "checkpoints": list(checkpoints),
+            "checkpoint_dir": checkpoint_dir,
+            "pattern": pattern,
+        }
+        return [Path(path) for path in checkpoints]
+
+    def fake_evaluate_checkpoint_ladder(paths, **kwargs):
+        captured["evaluate"] = {"paths": list(paths), **kwargs}
+
+        class FakeResult:
+            pairings = [SimpleNamespace(games=4), SimpleNamespace(games=4)]
+
+            def as_dict(self):
+                return {
+                    "game": kwargs["game"],
+                    "evaluator_mode": kwargs["evaluator_mode"],
+                }
+
+        return FakeResult()
+
+    monkeypatch.setattr(
+        checkpoint_elo_module, "resolve_checkpoint_paths", fake_resolve_checkpoint_paths
+    )
+    monkeypatch.setattr(
+        checkpoint_elo_module,
+        "evaluate_checkpoint_ladder",
+        fake_evaluate_checkpoint_ladder,
+    )
+
+    result = module.checkpoint_elo_remote(
+        game="othello",
+        checkpoint_paths=[
+            "othello-resnet-s102/othello/iter_0080.msgpack",
+            "/checkpoints/othello-transformer-s102/othello/iter_0060.msgpack",
+        ],
+        pattern="iter_*.msgpack",
+        mode="round-robin",
+        games_per_pairing=4,
+        max_steps=module._AUTO_MAX_STEPS,
+        evaluator_mode="mcts",
+        mcts_simulations=16,
+        gumbel_scale=0.0,
+        seed=3,
+        fit_iterations=20,
+        elo_k=8.0,
+        requested_gpu="A100-40GB",
+    )
+
+    assert captured["resolve"] == {
+        "checkpoints": [
+            "/checkpoints/othello-resnet-s102/othello/iter_0080.msgpack",
+            "/checkpoints/othello-transformer-s102/othello/iter_0060.msgpack",
+        ],
+        "checkpoint_dir": None,
+        "pattern": "iter_*.msgpack",
+    }
+    assert captured["evaluate"]["game"] == "othello"
+    assert captured["evaluate"]["max_steps"] == 128
+    assert captured["evaluate"]["mode"] == "round-robin"
+    assert captured["evaluate"]["games_per_pairing"] == 4
+    assert captured["evaluate"]["evaluator_mode"] == "mcts"
+    assert captured["evaluate"]["mcts_simulations"] == 16
+    assert captured["evaluate"]["seed"] == 3
+    assert captured["evaluate"]["fit_iterations"] == 20
+    assert captured["evaluate"]["elo_k"] == 8.0
+    assert result["game"] == "othello"
+    assert result["evaluator_mode"] == "mcts"
+    assert result["checkpoint_volume"] == "alphazero-checkpoints"
+    assert result["requested_gpu"] == "A100-40GB"
+    assert result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 2
+    assert result["modal_metrics"]["modal_checkpoint_elo_games"] == 8
 
 
 def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> None:
