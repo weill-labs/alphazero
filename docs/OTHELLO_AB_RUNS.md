@@ -254,3 +254,49 @@ Failure modes observed:
   apps with zero tasks.
 - Production runs using backgrounded `setsid ... modal run --detach` stayed up
   and produced complete checkpoint ladders.
+
+## 2026-06-03 05:17 UTC MCTS Verification
+
+Bead: `alphago-jvj`
+
+Added `jaxzero-checkpoint-elo --evaluator-mode mcts`, backed by deterministic
+`mctx.gumbel_muzero_policy` with `--gumbel-scale 0.0`. Focused tests passed:
+
+```bash
+uv run --extra dev pytest tests/test_jaxzero_checkpoint_elo.py
+```
+
+The MCTS evaluator is materially slower than greedy Elo. A 6-model selected
+best-checkpoint round-robin at `--mcts-simulations 16`,
+`--games-per-pairing 8`, and evaluator seed 0 took roughly 12 minutes locally.
+
+Selected best-checkpoint MCTS round-robin:
+
+| Best checkpoint | MCTS Elo |
+| --- | ---: |
+| `othello-resnet-s101/iter_0040` | 0.0 |
+| `othello-resnet-s102/iter_0080` | 135.1 |
+| `othello-resnet-s103/final` | -138.4 |
+| `othello-transformer-s101/iter_0060` | 205.1 |
+| `othello-transformer-s102/iter_0060` | 762.7 |
+| `othello-transformer-s103/final` | 709.4 |
+
+Top-contender confirmation used the best ResNet versus the two strongest
+transformers at `--mcts-simulations 16`, `--games-per-pairing 16`, and
+evaluator seed 1:
+
+| Checkpoint | MCTS Elo |
+| --- | ---: |
+| `othello-resnet-s102/iter_0080` | 0.0 |
+| `othello-transformer-s102/iter_0060` | 740.6 |
+| `othello-transformer-s103/final` | 783.2 |
+
+Pairing detail: `othello-resnet-s102/iter_0080` lost 0-16 to
+`othello-transformer-s102/iter_0060` and 0-16 to
+`othello-transformer-s103/final`.
+
+MCTS verdict: the greedy transformer edge survives search-backed play. The
+best individual ResNet seed that looked close under greedy Elo is not close
+under this 16-sim MCTS check. Remaining caveat: this is not a high-replication
+MCTS Elo study because the naive local MCTS evaluator is slow; further MCTS work
+should run on Modal or optimize pair evaluation before increasing seeds/games.
