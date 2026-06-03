@@ -335,6 +335,10 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert config.selfplay_dirichlet_fraction_drop_step == 8
     assert config.selfplay_dirichlet_fraction_after_drop == 0.0
     assert config.selfplay_dirichlet_alpha == 0.3
+    assert config.arch == "resnet"
+    assert config.use_value_cls_token is False
+    assert config.policy_head_style == "flatten"
+    assert config.input_embed_style == "linear"
     assert config.gating_interval == 3
     assert config.gating_games == 4
     assert config.gating_threshold == 0.6
@@ -363,6 +367,10 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert result["config"]["requested_gpu"] == "A100-40GB"
     assert result["config"]["run_tag"] == "othello-resnet-s9"
     assert result["config"]["max_steps"] == 6
+    assert result["config"]["arch"] == "resnet"
+    assert result["config"]["use_value_cls_token"] is False
+    assert result["config"]["policy_head_style"] == "flatten"
+    assert result["config"]["input_embed_style"] == "linear"
     assert result["config"]["solver_eval_positions"] == 0
     assert result["config"]["solver_rehearsal_positions"] == 8
     assert result["config"]["solver_rehearsal_value_loss_weight"] == 0.0
@@ -375,3 +383,31 @@ def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> N
     assert fake_run.finished
     assert module.checkpoint_volume.committed
     assert captured["extra_evaluator"] is None  # default off when positions == 0
+
+    othello_result = module.train_remote(
+        game="othello",
+        iterations=1,
+        batch_size=1,
+        num_simulations=1,
+        max_steps=module._AUTO_MAX_STEPS,
+        solver_eval_positions=module._AUTO_SOLVER_EVAL_POSITIONS,
+        seed=10,
+        run_tag="othello-default-s10",
+    )
+    othello_config = captured["config"]
+    assert othello_config.game == "othello"
+    assert othello_config.max_steps == 128
+    assert othello_config.arch == "transformer"
+    assert othello_config.use_value_cls_token is True
+    assert othello_config.policy_head_style == "flatten"
+    assert othello_config.input_embed_style == "conv3x3"
+    assert (
+        othello_config.checkpoint_path
+        == "/checkpoints/othello-default-s10/othello/final.msgpack"
+    )
+    assert othello_result["config"]["game"] == "othello"
+    assert othello_result["config"]["solver_eval_positions"] == 0
+    assert othello_result["config"]["arch"] == "transformer"
+    assert othello_result["config"]["use_value_cls_token"] is True
+    assert othello_result["config"]["policy_head_style"] == "flatten"
+    assert othello_result["config"]["input_embed_style"] == "conv3x3"

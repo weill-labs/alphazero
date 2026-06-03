@@ -8,7 +8,12 @@ import sys
 import time
 from collections.abc import Mapping
 
-from jaxzero.game_specs import DEFAULT_GAME, resolve_game, supported_games
+from jaxzero.game_specs import (
+    DEFAULT_GAME,
+    resolve_game,
+    resolve_network_defaults,
+    supported_games,
+)
 
 WANDB_PROJECT_PREFIX = "alphazero"
 _DEFAULT_GPU = "A10G"
@@ -233,14 +238,14 @@ else:
         solver_rehearsal_hard_sims: int = 800,
         solver_rehearsal_anchor_positions: int = 0,
         weight_decay: float = 0.0,
-        arch: str = "resnet",
+        arch: str | None = None,
         d_model: int = 128,
         num_layers: int = 6,
         num_heads: int = 4,
         mlp_dim: int = 512,
-        use_value_cls_token: bool = False,
-        policy_head_style: str = "flatten",
-        input_embed_style: str = "linear",
+        use_value_cls_token: bool | None = None,
+        policy_head_style: str | None = None,
+        input_embed_style: str | None = None,
         solver_eval_positions: int = _AUTO_SOLVER_EVAL_POSITIONS,
         eval_sims: int = 64,
         seed: int = 0,
@@ -256,6 +261,17 @@ else:
         solver_eval_positions = _resolve_solver_eval_positions(
             game, solver_eval_positions
         )
+        network_defaults = resolve_network_defaults(
+            game,
+            arch=arch,
+            use_value_cls_token=use_value_cls_token,
+            policy_head_style=policy_head_style,
+            input_embed_style=input_embed_style,
+        )
+        arch = str(network_defaults["arch"])
+        use_value_cls_token = bool(network_defaults["use_value_cls_token"])
+        policy_head_style = str(network_defaults["policy_head_style"])
+        input_embed_style = str(network_defaults["input_embed_style"])
         run_config = {
             "game": game,
             "iterations": iterations,
@@ -482,14 +498,14 @@ else:
         solver_rehearsal_hard_sims: int = 800,
         solver_rehearsal_anchor_positions: int = 0,
         weight_decay: float = 0.0,
-        arch: str = "resnet",
+        arch: str | None = None,
         d_model: int = 128,
         num_layers: int = 6,
         num_heads: int = 4,
         mlp_dim: int = 512,
-        use_value_cls_token: bool = False,
-        policy_head_style: str = "flatten",
-        input_embed_style: str = "linear",
+        use_value_cls_token: bool | None = None,
+        policy_head_style: str | None = None,
+        input_embed_style: str | None = None,
         solver_eval_positions: int = _AUTO_SOLVER_EVAL_POSITIONS,
         eval_sims: int = 64,
         seed: int = 0,

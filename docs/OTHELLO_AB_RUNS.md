@@ -300,3 +300,21 @@ best individual ResNet seed that looked close under greedy Elo is not close
 under this 16-sim MCTS check. Remaining caveat: this is not a high-replication
 MCTS Elo study because the naive local MCTS evaluator is slow; further MCTS work
 should run on Modal or optimize pair evaluation before increasing seeds/games.
+
+## 2026-06-03 Default Direction
+
+Bead: `alphago-yn0`
+
+Decision: use the tested Othello transformer preset as the default Othello
+architecture direction. User-facing training entrypoints now resolve
+`--game othello` with no explicit architecture flags to:
+
+- `arch=transformer`
+- `d_model=128`, `num_layers=6`, `num_heads=4`, `mlp_dim=512`
+- `use_value_cls_token=true`
+- `input_embed_style=conv3x3`
+- `policy_head_style=flatten`
+
+Connect Four defaults remain ResNet/v1-compatible. Explicit Othello ResNet
+overrides are still supported, but future Othello training should treat ResNet
+as a control, not the default path.

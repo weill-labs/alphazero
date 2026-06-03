@@ -33,6 +33,9 @@ The network can already handle arbitrary observation shape and action size via
   rejects C4-only solver rehearsal, mirror augmentation, and per-column policy.
 - `jaxzero.cli` and `jaxzero.modal_train` default max steps and solver eval by
   game, so Othello does not import or run the C4 solver path by default.
+- After the matched A/B and 16-sim MCTS verification, Othello user-facing
+  entrypoints default to the tested transformer preset. C4 remains ResNet by
+  default.
 
 The fixed seams were:
 

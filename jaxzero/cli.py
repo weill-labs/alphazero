@@ -5,7 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 
-from jaxzero.game_specs import DEFAULT_GAME, resolve_game, supported_games
+from jaxzero.game_specs import (
+    DEFAULT_GAME,
+    resolve_game,
+    resolve_network_defaults,
+    supported_games,
+)
 from jaxzero.train import TrainingConfig, run_training
 
 
@@ -236,9 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arch",
         choices=("resnet", "transformer"),
-        default="resnet",
-        help="Network tower: 'resnet' (default, uses --channels/--num-res-blocks) "
-        "or 'transformer' (uses --d-model/--num-layers/--num-heads/--mlp-dim).",
+        help="Network tower. Default is game-specific: connectfour uses "
+        "resnet; othello uses the tested transformer preset.",
     )
     parser.add_argument(
         "--d-model",
@@ -267,28 +271,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--use-value-cls-token",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Transformer Tier 1: prepend a learnable cls token to the board "
         "sequence; value head reads the cls token only (vs the v1 mean-pool "
-        "value head). Fixes the value_mae plateau observed in alphago-6xn.",
+        "value head). Default is game-specific.",
     )
     parser.add_argument(
         "--policy-head-style",
         choices=("flatten", "per_column"),
-        default="flatten",
+        default=None,
         help="Transformer Tier 1: 'flatten' (v1: Linear(H*W*d_model -> action)) "
         "or 'per_column' (shared Linear over each column's H cells -> 1 logit "
-        "per column, requires action_size == width). Per-column has stronger "
-        "C4 inductive bias and fewer params.",
+        "per column, requires action_size == width). Default is game-specific.",
     )
     parser.add_argument(
         "--input-embed-style",
         choices=("linear", "conv3x3"),
-        default="linear",
+        default=None,
         help="Transformer Tier 1: 'linear' (v1: Linear(planes -> d_model) per "
         "cell) or 'conv3x3' (3x3 conv patch embedding before tokenization, "
-        "AlphaViT style). Conv gives each cell a local receptive field before "
-        "self-attention sees the tokens.",
+        "AlphaViT style). Default is game-specific.",
     )
     return parser
 
@@ -312,6 +315,13 @@ def main(argv: list[str] | None = None) -> None:
             f"--solver-eval-positions requires C4 solver support; "
             f"game {game_spec.name!r} has none"
         )
+    network_defaults = resolve_network_defaults(
+        game_spec.name,
+        arch=args.arch,
+        use_value_cls_token=args.use_value_cls_token,
+        policy_head_style=args.policy_head_style,
+        input_embed_style=args.input_embed_style,
+    )
     config = TrainingConfig(
         game=game_spec.name,
         iterations=args.iterations,
@@ -358,14 +368,14 @@ def main(argv: list[str] | None = None) -> None:
         solver_rehearsal_hard_sims=args.solver_rehearsal_hard_sims,
         solver_rehearsal_anchor_positions=args.solver_rehearsal_anchor_positions,
         weight_decay=args.weight_decay,
-        arch=args.arch,
+        arch=str(network_defaults["arch"]),
         d_model=args.d_model,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         mlp_dim=args.mlp_dim,
-        use_value_cls_token=args.use_value_cls_token,
-        policy_head_style=args.policy_head_style,
-        input_embed_style=args.input_embed_style,
+        use_value_cls_token=bool(network_defaults["use_value_cls_token"]),
+        policy_head_style=str(network_defaults["policy_head_style"]),
+        input_embed_style=str(network_defaults["input_embed_style"]),
     )
     extra_evaluator = None
     if solver_eval_positions > 0:

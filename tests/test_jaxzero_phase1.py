@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from jaxzero.game_specs import DEFAULT_GAME, resolve_game
+from jaxzero.game_specs import DEFAULT_GAME, resolve_game, resolve_network_defaults
 from jaxzero.net import AlphaZeroNetConfig, create_model
 from jaxzero.selfplay import (
     SelfPlayConfig,
@@ -132,6 +132,76 @@ def test_game_specs_resolve_canonical_names_and_aliases() -> None:
     assert resolve_game("c4").name == "connectfour"
     assert resolve_game("othello").env_id == "othello"
     assert resolve_game("othello").default_max_steps == 128
+
+
+def test_network_defaults_are_game_aware() -> None:
+    assert resolve_network_defaults("connectfour") == {
+        "arch": "resnet",
+        "use_value_cls_token": False,
+        "policy_head_style": "flatten",
+        "input_embed_style": "linear",
+    }
+    assert resolve_network_defaults("othello") == {
+        "arch": "transformer",
+        "use_value_cls_token": True,
+        "policy_head_style": "flatten",
+        "input_embed_style": "conv3x3",
+    }
+    assert resolve_network_defaults("othello", arch="resnet") == {
+        "arch": "resnet",
+        "use_value_cls_token": False,
+        "policy_head_style": "flatten",
+        "input_embed_style": "linear",
+    }
+    assert resolve_network_defaults(
+        "othello",
+        use_value_cls_token=False,
+        input_embed_style="linear",
+    ) == {
+        "arch": "transformer",
+        "use_value_cls_token": False,
+        "policy_head_style": "flatten",
+        "input_embed_style": "linear",
+    }
+
+
+def test_cli_applies_othello_transformer_defaults(monkeypatch) -> None:
+    import jaxzero.cli as cli_module
+
+    captured: dict[str, object] = {}
+
+    def fake_run_training(config, *, extra_evaluator=None):
+        captured["config"] = config
+        captured["extra_evaluator"] = extra_evaluator
+        return SimpleNamespace(metrics=[], checkpoint_path=None)
+
+    monkeypatch.setattr(cli_module, "run_training", fake_run_training)
+
+    cli_module.main(
+        [
+            "--game",
+            "othello",
+            "--iterations",
+            "1",
+            "--batch-size",
+            "1",
+            "--sims",
+            "1",
+            "--max-steps",
+            "1",
+            "--minibatch-size",
+            "1",
+        ]
+    )
+
+    config = captured["config"]
+    assert isinstance(config, TrainingConfig)
+    assert config.game == "othello"
+    assert config.arch == "transformer"
+    assert config.use_value_cls_token is True
+    assert config.policy_head_style == "flatten"
+    assert config.input_embed_style == "conv3x3"
+    assert captured["extra_evaluator"] is None
 
 
 def test_othello_selfplay_smoke_produces_training_data() -> None:
