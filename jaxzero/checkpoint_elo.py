@@ -1,4 +1,4 @@
-"""Greedy checkpoint Elo ladders for pgx-backed jaxzero games."""
+"""Checkpoint Elo ladders for pgx-backed jaxzero games."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import mctx
 import numpy as np
 import pgx
 from flax import nnx
@@ -23,12 +24,14 @@ from jaxzero.selfplay import initial_observation_shape, make_env
 from jaxzero.train import load_checkpoint
 
 PairingMode = Literal["anchored-sequential", "round-robin"]
-EvaluatorMode = Literal["greedy"]
+EvaluatorMode = Literal["greedy", "mcts"]
 
 DEFAULT_GAMES_PER_PAIRING = 8
 DEFAULT_FIT_ITERATIONS = 200
 DEFAULT_ELO_K = 16.0
 DEFAULT_EVALUATOR_MODE: EvaluatorMode = "greedy"
+DEFAULT_MCTS_SIMULATIONS = 32
+DEFAULT_GUMBEL_SCALE = 0.0
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,8 @@ class CheckpointEloResult:
     games_per_pairing: int
     max_steps: int
     seed: int
+    mcts_simulations: int | None
+    gumbel_scale: float | None
     ratings: dict[str, float]
     curve: list[EloPoint]
     pairings: list[PairingResult]
@@ -114,6 +119,8 @@ class CheckpointEloResult:
             "games_per_pairing": self.games_per_pairing,
             "max_steps": self.max_steps,
             "seed": self.seed,
+            "mcts_simulations": self.mcts_simulations,
+            "gumbel_scale": self.gumbel_scale,
             "ratings": dict(self.ratings),
             "curve": [point.as_dict() for point in self.curve],
             "pairings": [pairing.as_dict() for pairing in self.pairings],
@@ -204,19 +211,25 @@ def evaluate_checkpoint_ladder(
     max_steps: int | None = None,
     mode: PairingMode = "anchored-sequential",
     evaluator_mode: EvaluatorMode = DEFAULT_EVALUATOR_MODE,
+    mcts_simulations: int = DEFAULT_MCTS_SIMULATIONS,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
     seed: int = 0,
     fit_iterations: int = DEFAULT_FIT_ITERATIONS,
     elo_k: float = DEFAULT_ELO_K,
 ) -> CheckpointEloResult:
-    """Load checkpoints, run greedy pgx matches, and fit anchored Elo."""
+    """Load checkpoints, run pgx matches, and fit anchored Elo."""
 
     spec = resolve_game(game)
-    if evaluator_mode != "greedy":
-        raise ValueError("evaluator_mode must be 'greedy'")
+    if evaluator_mode not in ("greedy", "mcts"):
+        raise ValueError("evaluator_mode must be 'greedy' or 'mcts'")
     if games_per_pairing <= 0:
         raise ValueError("games_per_pairing must be positive")
     if games_per_pairing % 2 != 0:
         raise ValueError("games_per_pairing must be even to balance seats")
+    if mcts_simulations <= 0:
+        raise ValueError("mcts_simulations must be positive")
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
     if fit_iterations <= 0:
         raise ValueError("fit_iterations must be positive")
     if elo_k <= 0:
@@ -252,6 +265,9 @@ def evaluate_checkpoint_ladder(
                 game=spec.name,
                 games=games_per_pairing,
                 max_steps=max_steps,
+                evaluator_mode=evaluator_mode,
+                mcts_simulations=mcts_simulations,
+                gumbel_scale=gumbel_scale,
                 seed=_next_seed(rng),
             )
         )
@@ -281,6 +297,8 @@ def evaluate_checkpoint_ladder(
         games_per_pairing=games_per_pairing,
         max_steps=max_steps,
         seed=seed,
+        mcts_simulations=mcts_simulations if evaluator_mode == "mcts" else None,
+        gumbel_scale=float(gumbel_scale) if evaluator_mode == "mcts" else None,
         ratings=ratings,
         curve=curve,
         pairings=results,
@@ -295,8 +313,11 @@ def play_checkpoint_match(
     games: int,
     max_steps: int,
     seed: int,
+    evaluator_mode: EvaluatorMode = DEFAULT_EVALUATOR_MODE,
+    mcts_simulations: int = DEFAULT_MCTS_SIMULATIONS,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
 ) -> PairingResult:
-    """Play a balanced greedy match between two loaded checkpoints."""
+    """Play a balanced match between two loaded checkpoints."""
 
     if games <= 0:
         raise ValueError("games must be positive")
@@ -304,14 +325,31 @@ def play_checkpoint_match(
         raise ValueError("games must be even to balance seats")
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
+    if evaluator_mode not in ("greedy", "mcts"):
+        raise ValueError("evaluator_mode must be 'greedy' or 'mcts'")
+    if mcts_simulations <= 0:
+        raise ValueError("mcts_simulations must be positive")
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
 
-    play = _make_greedy_match(
-        player_a.graphdef,
-        player_b.graphdef,
-        game=game,
-        num_games=games,
-        max_steps=max_steps,
-    )
+    if evaluator_mode == "greedy":
+        play = _make_greedy_match(
+            player_a.graphdef,
+            player_b.graphdef,
+            game=game,
+            num_games=games,
+            max_steps=max_steps,
+        )
+    else:
+        play = _make_mcts_match(
+            player_a.graphdef,
+            player_b.graphdef,
+            game=game,
+            num_games=games,
+            max_steps=max_steps,
+            num_simulations=mcts_simulations,
+            gumbel_scale=gumbel_scale,
+        )
     counts = play(player_a.params, player_b.params, jax.random.PRNGKey(seed))
     wins_a, draws, wins_b = (int(v) for v in jax.device_get(counts).tolist())
     return PairingResult(
@@ -375,6 +413,143 @@ def _make_greedy_match(
         return jnp.stack([wins_a, draws, wins_b])
 
     return play
+
+
+def _make_mcts_match(
+    graphdef_a: nnx.GraphDef[Net],
+    graphdef_b: nnx.GraphDef[Net],
+    *,
+    game: str,
+    num_games: int,
+    max_steps: int,
+    num_simulations: int,
+    gumbel_scale: float,
+):
+    env = pgx.make(resolve_game(game).env_id)
+    player_a_seat = jnp.concatenate(
+        [
+            jnp.zeros(num_games // 2, dtype=jnp.int32),
+            jnp.ones(num_games // 2, dtype=jnp.int32),
+        ]
+    )
+    game_index = jnp.arange(num_games)
+    search_a = _make_mcts_search(
+        graphdef_a,
+        game=game,
+        num_simulations=num_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+    search_b = _make_mcts_search(
+        graphdef_b,
+        game=game,
+        num_simulations=num_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+
+    @jax.jit
+    def play(params_a: nnx.State, params_b: nnx.State, rng_key: jax.Array) -> jax.Array:
+        def step(carry, key):
+            state, return_a = carry
+            active = ~(state.terminated | state.truncated)
+            key_a, key_b = jax.random.split(key)
+            search_state = _replace_inactive_lanes(state, active, dummy_state)
+            action_a = search_a(params_a, search_state, key_a)
+            action_b = search_b(params_b, search_state, key_b)
+            action = jnp.where(
+                state.current_player == player_a_seat,
+                action_a,
+                action_b,
+            )
+            stepped_state = jax.vmap(env.step)(state, action)
+            state = _replace_inactive_lanes(stepped_state, active, state)
+            step_return = stepped_state.rewards[game_index, player_a_seat]
+            return_a = return_a + jnp.where(active, step_return, 0.0)
+            return (state, return_a), None
+
+        rng_key, init_key, scan_key = jax.random.split(rng_key, 3)
+        state = jax.vmap(env.init)(jax.random.split(init_key, num_games))
+        dummy_state = jax.vmap(env.init)(
+            jax.random.split(jax.random.PRNGKey(0), num_games)
+        )
+        (_, return_a), _ = jax.lax.scan(
+            step,
+            (state, jnp.zeros(num_games)),
+            xs=jax.random.split(scan_key, max_steps),
+        )
+        wins_a = jnp.sum(return_a == 1.0).astype(jnp.int32)
+        draws = jnp.sum(return_a == 0.0).astype(jnp.int32)
+        wins_b = jnp.sum(return_a == -1.0).astype(jnp.int32)
+        return jnp.stack([wins_a, draws, wins_b])
+
+    return play
+
+
+def _make_mcts_search(
+    graphdef: nnx.GraphDef[Net],
+    *,
+    game: str,
+    num_simulations: int,
+    gumbel_scale: float,
+):
+    env = pgx.make(resolve_game(game).env_id)
+
+    def recurrent_fn(params, rng_key, action, state):
+        del rng_key
+        current_player = state.current_player
+        state = jax.vmap(env.step)(state, action)
+        logits, value = apply_model(graphdef, params, state.observation)
+        logits = _mask_invalid_logits(logits, state.legal_action_mask)
+        done = state.terminated | state.truncated
+        reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
+        value = jnp.where(done, 0.0, value)
+        discount = jnp.where(done, 0.0, -jnp.ones_like(value))
+        out = mctx.RecurrentFnOutput(
+            reward=reward,
+            discount=discount,
+            prior_logits=logits,
+            value=value,
+        )
+        return out, state
+
+    @jax.jit
+    def search(params: nnx.State, state, rng_key: jax.Array) -> jax.Array:
+        logits, value = apply_model(graphdef, params, state.observation)
+        logits = _mask_invalid_logits(logits, state.legal_action_mask)
+        root = mctx.RootFnOutput(
+            prior_logits=logits,
+            value=value,
+            embedding=state,
+        )
+        policy_output = mctx.gumbel_muzero_policy(
+            params=params,
+            rng_key=rng_key,
+            root=root,
+            recurrent_fn=recurrent_fn,
+            num_simulations=num_simulations,
+            invalid_actions=~state.legal_action_mask,
+            qtransform=mctx.qtransform_completed_by_mix_value,
+            gumbel_scale=gumbel_scale,
+        )
+        return policy_output.action
+
+    return search
+
+
+def _replace_inactive_lanes(state, active: jax.Array, replacement):
+    """Select ``state`` for active batch lanes and ``replacement`` otherwise."""
+
+    def select(state_leaf, replacement_leaf):
+        condition = active
+        while condition.ndim < state_leaf.ndim:
+            condition = condition[..., None]
+        return jnp.where(condition, state_leaf, replacement_leaf)
+
+    return jax.tree.map(select, state, replacement)
+
+
+def _mask_invalid_logits(logits: jax.Array, legal_action_mask: jax.Array) -> jax.Array:
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    return jnp.where(legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
 
 def _load_checkpoint(path: Path, *, name: str, game: str) -> _LoadedCheckpoint:
@@ -494,9 +669,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
         "--evaluator-mode",
-        choices=("greedy",),
+        choices=("greedy", "mcts"),
         default=DEFAULT_EVALUATOR_MODE,
     )
+    parser.add_argument(
+        "--mcts-simulations", type=int, default=DEFAULT_MCTS_SIMULATIONS
+    )
+    parser.add_argument("--gumbel-scale", type=float, default=DEFAULT_GUMBEL_SCALE)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fit-iterations", type=int, default=DEFAULT_FIT_ITERATIONS)
     parser.add_argument("--elo-k", type=float, default=DEFAULT_ELO_K)
@@ -508,6 +687,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--games-per-pairing must be even to balance seats")
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error("--max-steps must be positive")
+    if args.mcts_simulations <= 0:
+        parser.error("--mcts-simulations must be positive")
+    if args.gumbel_scale < 0.0:
+        parser.error("--gumbel-scale must be non-negative")
     if args.fit_iterations <= 0:
         parser.error("--fit-iterations must be positive")
     if args.elo_k <= 0:
@@ -531,6 +714,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_steps=args.max_steps,
         mode=args.mode,
         evaluator_mode=args.evaluator_mode,
+        mcts_simulations=args.mcts_simulations,
+        gumbel_scale=args.gumbel_scale,
         seed=args.seed,
         fit_iterations=args.fit_iterations,
         elo_k=args.elo_k,

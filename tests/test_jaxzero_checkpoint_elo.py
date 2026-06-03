@@ -69,6 +69,32 @@ def test_othello_checkpoint_ladder_loads_and_matches(tmp_path) -> None:
     assert result.as_dict()["best_checkpoint"] in {str(early), str(late)}
 
 
+def test_othello_mcts_checkpoint_ladder_loads_and_matches(tmp_path) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    result = evaluate_checkpoint_ladder(
+        [early, late],
+        game="othello",
+        evaluator_mode="mcts",
+        mcts_simulations=1,
+        gumbel_scale=0.0,
+        games_per_pairing=2,
+        max_steps=2,
+        seed=7,
+        fit_iterations=1,
+    )
+
+    assert result.game == "othello"
+    assert result.evaluator_mode == "mcts"
+    assert result.mcts_simulations == 1
+    assert result.gumbel_scale == 0.0
+    assert len(result.pairings) == 1
+    assert result.pairings[0].games == 2
+
+
 def test_checkpoint_ladder_is_deterministic_for_fixed_seed(tmp_path) -> None:
     early = tmp_path / "early.msgpack"
     late = tmp_path / "late.msgpack"
@@ -164,6 +190,40 @@ def test_checkpoint_elo_cli_prints_json(tmp_path, capsys) -> None:
     assert payload["game"] == "othello"
     assert payload["evaluator_mode"] == "greedy"
     assert payload["pairings"][0]["games"] == 2
+
+
+def test_checkpoint_elo_cli_accepts_mcts_mode(tmp_path, capsys) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    exit_code = main(
+        [
+            str(early),
+            str(late),
+            "--game",
+            "othello",
+            "--evaluator-mode",
+            "mcts",
+            "--mcts-simulations",
+            "1",
+            "--gumbel-scale",
+            "0.0",
+            "--games-per-pairing",
+            "2",
+            "--max-steps",
+            "2",
+            "--fit-iterations",
+            "1",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["evaluator_mode"] == "mcts"
+    assert payload["mcts_simulations"] == 1
+    assert payload["gumbel_scale"] == 0.0
 
 
 def test_checkpoint_elo_imports_without_c4_solver_dependency() -> None:
