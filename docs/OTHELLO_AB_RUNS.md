@@ -428,3 +428,59 @@ Implication: fixed low MCTS budgets are not a neutral architecture comparator
 for these Othello checkpoints. The next evaluator should either use much higher
 budgets with uncertainty bars or compare models by policy/value calibration on
 the traced divergent states before treating MCTS Elo as architecture truth.
+
+## 2026-06-04 Ply-10 Probe Calibration
+
+Bead: `alphago-8bo`
+
+Added `jaxzero-checkpoint-elo --probe-ply` and the same Modal runner plumbing to
+replay a two-checkpoint match to a target ply, then probe both checkpoints'
+root MCTS choices at several simulation budgets. The probe uses
+`PolicyOutput.action` as the selected move because that is what the Elo evaluator
+plays. `PolicyOutput.action_weights` are also emitted, but they are MCTS policy
+training targets, not necessarily the selected move.
+
+Probe target:
+
+- Pairing: ResNet s102 `iter_0080` vs transformer s103 `final`
+- Seed: `1099128568`
+- Replay budget: 24 sims
+- Target ply: 10
+- Games: 32
+
+Selected action by budget at the exact ply-10 state:
+
+| Probe sims | ResNet-controlled lanes | Transformer-controlled lanes |
+| ---: | --- | --- |
+| 16 | `38` in 17 lanes | `60` in 15 lanes |
+| 24 | `38` in 17 lanes | `60` in 15 lanes |
+| 32 | `46` in 17 lanes | `60` in 15 lanes |
+| 64 | `46` in 17 lanes | `60` in 15 lanes |
+| 128 | `39` in 17 lanes | `60` in 15 lanes |
+| 256 | `39` in 17 lanes | `34` in 15 lanes |
+| 512 | `38` in 17 lanes | `34` in 15 lanes |
+| 1024 | `39` in 17 lanes | `34` in 15 lanes |
+
+Representative ResNet lane 2 action weights show why this state is a poor
+low-budget evaluator:
+
+| Probe sims | Selected action | Top action weights |
+| ---: | ---: | --- |
+| 24 | `38` | `38`: 0.489, `39`: 0.253, `46`: 0.248 |
+| 32 | `46` | `46`: 0.666, `39`: 0.227, `38`: 0.100 |
+| 64 | `46` | `46`: 0.583, `39`: 0.365, `38`: 0.041 |
+| 128 | `39` | `38`: 0.660, `23`: 0.149, `54`: 0.112 |
+| 256 | `39` | `39`: 0.670, `23`: 0.158, `38`: 0.113 |
+| 512 | `38` | `54`: 0.845, `39`: 0.106, `26`: 0.030 |
+| 1024 | `39` | `39`: 1.000 |
+
+Modal apps: `ap-mbwACiwCaXAn4rsgjn3RCf` for 16-256 sims and
+`ap-PrXen8rkfdz4Yno2Q2tBqQ` for 512-1024 sims.
+
+Calibration read: the original 32-sim ResNet action `46` is not a stable
+high-budget preference. At this state, both checkpoints' proposed moves change
+as the simulation budget increases, and `action` can differ from the largest
+`action_weights` entry because MCTX uses separate Gumbel/sequential-halving
+selection for the played move. The 32-sim ResNet sweep should therefore be
+treated as an evaluator artifact, not evidence that the ResNet checkpoint is
+better than the transformer checkpoint.
