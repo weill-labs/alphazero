@@ -539,6 +539,258 @@ def trace_checkpoint_match(
     return payload
 
 
+def probe_checkpoint_state(
+    checkpoint_paths: Sequence[str | Path],
+    *,
+    game: str = DEFAULT_GAME,
+    games: int = DEFAULT_GAMES_PER_PAIRING,
+    max_steps: int | None = None,
+    replay_simulations: int = DEFAULT_MCTS_SIMULATIONS,
+    probe_simulations: Sequence[int] = (DEFAULT_MCTS_SIMULATIONS,),
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    seed: int = 0,
+    target_ply: int = 0,
+    top_k: int = 5,
+) -> dict[str, object]:
+    """Probe MCTS policy choices at an exact batched-match ply."""
+
+    spec = resolve_game(game)
+    paths = [Path(path) for path in checkpoint_paths]
+    if len(paths) != 2:
+        raise ValueError("probe requires exactly two checkpoint paths")
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if games % 2 != 0:
+        raise ValueError("games must be even to balance seats")
+    if replay_simulations <= 0:
+        raise ValueError("replay_simulations must be positive")
+    probe_budgets = _validate_probe_simulations(probe_simulations)
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
+
+    max_steps = spec.default_max_steps if max_steps is None else max_steps
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if target_ply < 0 or target_ply >= max_steps:
+        raise ValueError("target_ply must be in [0, max_steps)")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    names = _checkpoint_names(paths)
+    player_a, player_b = (
+        _load_checkpoint(path, name=name, game=spec.name)
+        for name, path in zip(names, paths, strict=True)
+    )
+    return probe_checkpoint_match(
+        player_a,
+        player_b,
+        game=spec.name,
+        games=games,
+        max_steps=max_steps,
+        replay_simulations=replay_simulations,
+        probe_simulations=probe_budgets,
+        gumbel_scale=gumbel_scale,
+        seed=seed,
+        target_ply=target_ply,
+        top_k=top_k,
+    )
+
+
+def probe_checkpoint_match(
+    player_a: _LoadedCheckpoint,
+    player_b: _LoadedCheckpoint,
+    *,
+    game: str,
+    games: int,
+    max_steps: int,
+    replay_simulations: int,
+    probe_simulations: Sequence[int],
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    seed: int = 0,
+    target_ply: int = 0,
+    top_k: int = 5,
+) -> dict[str, object]:
+    """Replay a match to ``target_ply`` and probe policy choices there."""
+
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if games % 2 != 0:
+        raise ValueError("games must be even to balance seats")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if replay_simulations <= 0:
+        raise ValueError("replay_simulations must be positive")
+    probe_budgets = _validate_probe_simulations(probe_simulations)
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
+    if target_ply < 0 or target_ply >= max_steps:
+        raise ValueError("target_ply must be in [0, max_steps)")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    replay = _make_match_state_at_ply(
+        player_a.graphdef,
+        player_b.graphdef,
+        game=game,
+        num_games=games,
+        max_steps=max_steps,
+        target_ply=target_ply,
+        replay_simulations=replay_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+    state, return_a, target_key, player_a_seat = replay(
+        player_a.params,
+        player_b.params,
+        jax.random.PRNGKey(seed),
+    )
+    key_a, key_b = jax.random.split(target_key)
+
+    budget_outputs = {}
+    for budget in probe_budgets:
+        search_a = _make_mcts_search_details(
+            player_a.graphdef,
+            game=game,
+            num_simulations=budget,
+            gumbel_scale=gumbel_scale,
+        )
+        search_b = _make_mcts_search_details(
+            player_b.graphdef,
+            game=game,
+            num_simulations=budget,
+            gumbel_scale=gumbel_scale,
+        )
+        action_a, weights_a, value_a = search_a(player_a.params, state, key_a)
+        action_b, weights_b, value_b = search_b(player_b.params, state, key_b)
+        budget_outputs[budget] = {
+            "action_a": jax.device_get(action_a),
+            "action_b": jax.device_get(action_b),
+            "weights_a": jax.device_get(weights_a),
+            "weights_b": jax.device_get(weights_b),
+            "value_a": jax.device_get(value_a),
+            "value_b": jax.device_get(value_b),
+        }
+
+    current_player = np.asarray(jax.device_get(state.current_player))
+    legal_action_mask = np.asarray(jax.device_get(state.legal_action_mask))
+    active = np.asarray(jax.device_get(~(state.terminated | state.truncated)))
+    player_a_seat = np.asarray(jax.device_get(player_a_seat))
+    return_a = np.asarray(jax.device_get(return_a))
+
+    summaries: list[dict[str, object]] = []
+    for budget in probe_budgets:
+        output = budget_outputs[budget]
+        selected_by_actor: dict[str, dict[str, int]] = {}
+        for lane in range(games):
+            actor = (
+                player_a.name
+                if int(current_player[lane]) == int(player_a_seat[lane])
+                else player_b.name
+            )
+            action = (
+                int(output["action_a"][lane])
+                if actor == player_a.name
+                else int(output["action_b"][lane])
+            )
+            if bool(active[lane]):
+                _increment_nested_count(selected_by_actor, actor, action)
+        summaries.append(
+            {
+                "simulations": budget,
+                "selected_by_actor": selected_by_actor,
+            }
+        )
+
+    lanes = []
+    for lane in range(games):
+        actor = (
+            player_a.name
+            if int(current_player[lane]) == int(player_a_seat[lane])
+            else player_b.name
+        )
+        budget_entries = []
+        for budget in probe_budgets:
+            output = budget_outputs[budget]
+            if actor == player_a.name:
+                action = int(output["action_a"][lane])
+                weights = np.asarray(output["weights_a"][lane])
+                value = float(np.asarray(output["value_a"])[lane])
+            else:
+                action = int(output["action_b"][lane])
+                weights = np.asarray(output["weights_b"][lane])
+                value = float(np.asarray(output["value_b"])[lane])
+            budget_entries.append(
+                {
+                    "simulations": budget,
+                    "action": action,
+                    "root_value": value,
+                    "top_actions": _top_action_weights(
+                        weights,
+                        legal_action_mask[lane],
+                        top_k=top_k,
+                    ),
+                }
+            )
+        lanes.append(
+            {
+                "lane": lane,
+                "active": bool(active[lane]),
+                "player_a_seat": int(player_a_seat[lane]),
+                "current_player": int(current_player[lane]),
+                "actor": actor,
+                "return_a_before_ply": float(return_a[lane]),
+                "legal_actions": [
+                    int(action)
+                    for action in np.flatnonzero(legal_action_mask[lane]).tolist()
+                ],
+                "budgets": budget_entries,
+            }
+        )
+
+    return {
+        "game": resolve_game(game).name,
+        "games": games,
+        "max_steps": max_steps,
+        "seed": seed,
+        "target_ply": target_ply,
+        "replay_simulations": replay_simulations,
+        "probe_simulations": probe_budgets,
+        "gumbel_scale": float(gumbel_scale),
+        "player_a": player_a.name,
+        "player_b": player_b.name,
+        "summaries": summaries,
+        "lanes": lanes,
+    }
+
+
+def _validate_probe_simulations(probe_simulations: Sequence[int]) -> list[int]:
+    budgets = [int(value) for value in probe_simulations]
+    if not budgets:
+        raise ValueError("probe_simulations must not be empty")
+    if any(value <= 0 for value in budgets):
+        raise ValueError("probe_simulations values must be positive")
+    return budgets
+
+
+def _top_action_weights(
+    weights: np.ndarray,
+    legal_action_mask: np.ndarray,
+    *,
+    top_k: int,
+) -> list[dict[str, float | int]]:
+    legal_actions = np.flatnonzero(legal_action_mask)
+    if legal_actions.size == 0:
+        return []
+    legal_weights = weights[legal_actions]
+    order = np.argsort(-legal_weights, kind="stable")[:top_k]
+    return [
+        {
+            "action": int(legal_actions[index]),
+            "weight": float(legal_weights[index]),
+        }
+        for index in order
+    ]
+
+
 def _increment_count(counts: dict[str, int], key: int) -> None:
     counts[str(key)] = counts.get(str(key), 0) + 1
 
@@ -708,6 +960,78 @@ def _make_match_trace(
     return trace
 
 
+def _make_match_state_at_ply(
+    graphdef_a: nnx.GraphDef[Net],
+    graphdef_b: nnx.GraphDef[Net],
+    *,
+    game: str,
+    num_games: int,
+    max_steps: int,
+    target_ply: int,
+    replay_simulations: int,
+    gumbel_scale: float,
+):
+    env = pgx.make(resolve_game(game).env_id)
+    player_a_seat = jnp.concatenate(
+        [
+            jnp.zeros(num_games // 2, dtype=jnp.int32),
+            jnp.ones(num_games // 2, dtype=jnp.int32),
+        ]
+    )
+    game_index = jnp.arange(num_games)
+    search_a = _make_mcts_search(
+        graphdef_a,
+        game=game,
+        num_simulations=replay_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+    search_b = _make_mcts_search(
+        graphdef_b,
+        game=game,
+        num_simulations=replay_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+
+    @jax.jit
+    def replay(
+        params_a: nnx.State,
+        params_b: nnx.State,
+        rng_key: jax.Array,
+    ):
+        def step(carry, key):
+            state, return_a = carry
+            active = ~(state.terminated | state.truncated)
+            key_a, key_b = jax.random.split(key)
+            search_state = _replace_inactive_lanes(state, active, dummy_state)
+            action_a = search_a(params_a, search_state, key_a)
+            action_b = search_b(params_b, search_state, key_b)
+            action = jnp.where(
+                state.current_player == player_a_seat,
+                action_a,
+                action_b,
+            )
+            stepped_state = jax.vmap(env.step)(state, action)
+            state = _replace_inactive_lanes(stepped_state, active, state)
+            step_return = stepped_state.rewards[game_index, player_a_seat]
+            return_a = return_a + jnp.where(active, step_return, 0.0)
+            return (state, return_a), None
+
+        rng_key, init_key, scan_key = jax.random.split(rng_key, 3)
+        state = jax.vmap(env.init)(jax.random.split(init_key, num_games))
+        dummy_state = jax.vmap(env.init)(
+            jax.random.split(jax.random.PRNGKey(0), num_games)
+        )
+        scan_keys = jax.random.split(scan_key, max_steps)
+        (state, return_a), _ = jax.lax.scan(
+            step,
+            (state, jnp.zeros(num_games)),
+            xs=scan_keys[:target_ply],
+        )
+        return state, return_a, scan_keys[target_ply], player_a_seat
+
+    return replay
+
+
 def _make_mcts_match(
     graphdef_a: nnx.GraphDef[Net],
     graphdef_b: nnx.GraphDef[Net],
@@ -775,6 +1099,57 @@ def _make_mcts_match(
         return jnp.stack([wins_a, draws, wins_b])
 
     return play
+
+
+def _make_mcts_search_details(
+    graphdef: nnx.GraphDef[Net],
+    *,
+    game: str,
+    num_simulations: int,
+    gumbel_scale: float,
+):
+    env = pgx.make(resolve_game(game).env_id)
+
+    def recurrent_fn(params, rng_key, action, state):
+        del rng_key
+        current_player = state.current_player
+        state = jax.vmap(env.step)(state, action)
+        logits, value = apply_model(graphdef, params, state.observation)
+        logits = _mask_invalid_logits(logits, state.legal_action_mask)
+        done = state.terminated | state.truncated
+        reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
+        value = jnp.where(done, 0.0, value)
+        discount = jnp.where(done, 0.0, -jnp.ones_like(value))
+        out = mctx.RecurrentFnOutput(
+            reward=reward,
+            discount=discount,
+            prior_logits=logits,
+            value=value,
+        )
+        return out, state
+
+    @jax.jit
+    def search(params: nnx.State, state, rng_key: jax.Array):
+        logits, value = apply_model(graphdef, params, state.observation)
+        logits = _mask_invalid_logits(logits, state.legal_action_mask)
+        root = mctx.RootFnOutput(
+            prior_logits=logits,
+            value=value,
+            embedding=state,
+        )
+        policy_output = mctx.gumbel_muzero_policy(
+            params=params,
+            rng_key=rng_key,
+            root=root,
+            recurrent_fn=recurrent_fn,
+            num_simulations=num_simulations,
+            invalid_actions=~state.legal_action_mask,
+            qtransform=mctx.qtransform_completed_by_mix_value,
+            gumbel_scale=gumbel_scale,
+        )
+        return policy_output.action, policy_output.action_weights, value
+
+    return search
 
 
 def _make_mcts_search(
@@ -943,6 +1318,16 @@ def _next_seed(rng: np.random.Generator) -> int:
     return int(rng.integers(0, np.iinfo(np.int32).max))
 
 
+def _parse_probe_simulations(raw: str, *, fallback: int) -> list[int]:
+    if not raw:
+        return [fallback]
+    try:
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError("--probe-budgets must be comma-separated integers") from exc
+    return _validate_probe_simulations(values)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Evaluate a greedy Elo ladder across jaxzero checkpoints."
@@ -984,6 +1369,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="With --trace-plies, omit per-lane trace records and print only summaries.",
     )
+    parser.add_argument(
+        "--probe-ply",
+        type=int,
+        default=None,
+        help="Replay a two-checkpoint MCTS match to this ply and probe root policy "
+        "choices instead of fitting an Elo ladder.",
+    )
+    parser.add_argument(
+        "--probe-budgets",
+        default="",
+        help="Comma-separated MCTS simulation budgets for --probe-ply. Defaults to "
+        "--mcts-simulations.",
+    )
+    parser.add_argument(
+        "--probe-top-k",
+        type=int,
+        default=5,
+        help="Number of top action weights to emit per lane and probe budget.",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pairing <= 0:
@@ -1002,6 +1406,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--elo-k must be positive")
     if args.trace_plies < 0:
         parser.error("--trace-plies must be non-negative")
+    if args.probe_ply is not None and args.probe_ply < 0:
+        parser.error("--probe-ply must be non-negative")
+    if args.probe_top_k <= 0:
+        parser.error("--probe-top-k must be positive")
+    try:
+        probe_budgets = _parse_probe_simulations(
+            args.probe_budgets,
+            fallback=args.mcts_simulations,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     checkpoint_dir = args.checkpoint_dir
     if checkpoint_dir is None and not args.checkpoints:
@@ -1013,6 +1428,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if not checkpoint_paths:
         parser.error("no checkpoints found")
+    if args.trace_plies > 0 and args.probe_ply is not None:
+        parser.error("--trace-plies and --probe-ply are mutually exclusive")
     if args.trace_plies > 0:
         if len(checkpoint_paths) != 2:
             parser.error("--trace-plies requires exactly two checkpoints")
@@ -1029,6 +1446,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary_only=args.trace_summary_only,
         )
         print(json.dumps(trace, indent=2, sort_keys=True))
+        return 0
+    if args.probe_ply is not None:
+        if len(checkpoint_paths) != 2:
+            parser.error("--probe-ply requires exactly two checkpoints")
+        probe = probe_checkpoint_state(
+            checkpoint_paths,
+            game=args.game,
+            games=args.games_per_pairing,
+            max_steps=args.max_steps,
+            replay_simulations=args.mcts_simulations,
+            probe_simulations=probe_budgets,
+            gumbel_scale=args.gumbel_scale,
+            seed=args.seed,
+            target_ply=args.probe_ply,
+            top_k=args.probe_top_k,
+        )
+        print(json.dumps(probe, indent=2, sort_keys=True))
         return 0
 
     result = evaluate_checkpoint_ladder(

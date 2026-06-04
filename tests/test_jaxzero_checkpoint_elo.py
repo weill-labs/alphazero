@@ -312,6 +312,45 @@ def test_checkpoint_elo_cli_can_trace_summaries_only(tmp_path, capsys) -> None:
     assert "steps" not in payload
 
 
+def test_checkpoint_elo_cli_probes_match_state(tmp_path, capsys) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    exit_code = main(
+        [
+            str(early),
+            str(late),
+            "--game",
+            "othello",
+            "--mcts-simulations",
+            "1",
+            "--games-per-pairing",
+            "2",
+            "--max-steps",
+            "2",
+            "--probe-ply",
+            "1",
+            "--probe-budgets",
+            "1,2",
+            "--probe-top-k",
+            "3",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["game"] == "othello"
+    assert payload["target_ply"] == 1
+    assert payload["replay_simulations"] == 1
+    assert payload["probe_simulations"] == [1, 2]
+    assert len(payload["summaries"]) == 2
+    assert len(payload["lanes"]) == 2
+    assert len(payload["lanes"][0]["budgets"]) == 2
+    assert payload["lanes"][0]["budgets"][0]["top_actions"]
+
+
 def test_checkpoint_elo_imports_without_c4_solver_dependency() -> None:
     code = (
         "import sys, jaxzero.checkpoint_elo; "

@@ -288,6 +288,16 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
             "summaries": [],
         }
 
+    def fake_probe_checkpoint_state(paths, **kwargs):
+        captured["probe"] = {"paths": list(paths), **kwargs}
+        return {
+            "game": kwargs["game"],
+            "games": kwargs["games"],
+            "target_ply": kwargs["target_ply"],
+            "summaries": [],
+            "lanes": [],
+        }
+
     monkeypatch.setattr(
         checkpoint_elo_module, "resolve_checkpoint_paths", fake_resolve_checkpoint_paths
     )
@@ -300,6 +310,11 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
         checkpoint_elo_module,
         "trace_checkpoint_game",
         fake_trace_checkpoint_game,
+    )
+    monkeypatch.setattr(
+        checkpoint_elo_module,
+        "probe_checkpoint_state",
+        fake_probe_checkpoint_state,
     )
 
     result = module.checkpoint_elo_remote(
@@ -365,6 +380,28 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
     assert captured["trace"]["summary_only"] is True
     assert trace_result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 1
     assert trace_result["modal_metrics"]["modal_checkpoint_elo_games"] == 4
+
+    probe_result = module.checkpoint_elo_remote(
+        game="othello",
+        checkpoint_paths=[
+            "othello-resnet-s102/othello/iter_0080.msgpack",
+            "/checkpoints/othello-transformer-s102/othello/iter_0060.msgpack",
+        ],
+        games_per_pairing=4,
+        max_steps=module._AUTO_MAX_STEPS,
+        mcts_simulations=24,
+        probe_ply=10,
+        probe_budgets="24,32,64",
+        probe_top_k=4,
+    )
+
+    assert captured["probe"]["max_steps"] == 128
+    assert captured["probe"]["replay_simulations"] == 24
+    assert captured["probe"]["probe_simulations"] == [24, 32, 64]
+    assert captured["probe"]["target_ply"] == 10
+    assert captured["probe"]["top_k"] == 4
+    assert probe_result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 1
+    assert probe_result["modal_metrics"]["modal_checkpoint_elo_games"] == 4
 
 
 def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> None:

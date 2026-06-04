@@ -509,10 +509,15 @@ else:
         elo_k: float = 16.0,
         trace_plies: int = 0,
         trace_summary_only: bool = False,
+        probe_ply: int = -1,
+        probe_budgets: str = "",
+        probe_top_k: int = 5,
         requested_gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
     ) -> dict[str, object]:
         from jaxzero.checkpoint_elo import (
+            _parse_probe_simulations,
             evaluate_checkpoint_ladder,
+            probe_checkpoint_state,
             resolve_checkpoint_paths,
             trace_checkpoint_game,
         )
@@ -537,6 +542,8 @@ else:
             raise ValueError("no checkpoints found for Modal checkpoint Elo")
 
         started = time.perf_counter()
+        if trace_plies > 0 and probe_ply >= 0:
+            raise ValueError("trace_plies and probe_ply are mutually exclusive")
         if trace_plies > 0:
             if len(resolved_paths) != 2:
                 raise ValueError("trace_plies requires exactly two checkpoints")
@@ -554,6 +561,26 @@ else:
             )
             pairings = 1
             games = int(payload["pairing"]["games"])
+        elif probe_ply >= 0:
+            if len(resolved_paths) != 2:
+                raise ValueError("probe_ply requires exactly two checkpoints")
+            payload = probe_checkpoint_state(
+                resolved_paths,
+                game=game,
+                games=games_per_pairing,
+                max_steps=max_steps,
+                replay_simulations=mcts_simulations,
+                probe_simulations=_parse_probe_simulations(
+                    probe_budgets,
+                    fallback=mcts_simulations,
+                ),
+                gumbel_scale=gumbel_scale,
+                seed=seed,
+                target_ply=probe_ply,
+                top_k=probe_top_k,
+            )
+            pairings = 1
+            games = int(payload["games"])
         else:
             result = evaluate_checkpoint_ladder(
                 resolved_paths,
@@ -732,6 +759,9 @@ else:
         elo_k: float = 16.0,
         trace_plies: int = 0,
         trace_summary_only: bool = False,
+        probe_ply: int = -1,
+        probe_budgets: str = "",
+        probe_top_k: int = 5,
         gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
         spawn: bool = False,
     ) -> None:
@@ -759,6 +789,9 @@ else:
             elo_k=elo_k,
             trace_plies=trace_plies,
             trace_summary_only=trace_summary_only,
+            probe_ply=probe_ply,
+            probe_budgets=probe_budgets,
+            probe_top_k=probe_top_k,
             requested_gpu=gpu,
         )
         if spawn:
