@@ -507,11 +507,14 @@ else:
         seed: int = 0,
         fit_iterations: int = 200,
         elo_k: float = 16.0,
+        trace_plies: int = 0,
+        trace_summary_only: bool = False,
         requested_gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
     ) -> dict[str, object]:
         from jaxzero.checkpoint_elo import (
             evaluate_checkpoint_ladder,
             resolve_checkpoint_paths,
+            trace_checkpoint_game,
         )
 
         game = _validate_game(game)
@@ -534,27 +537,45 @@ else:
             raise ValueError("no checkpoints found for Modal checkpoint Elo")
 
         started = time.perf_counter()
-        result = evaluate_checkpoint_ladder(
-            resolved_paths,
-            game=game,
-            games_per_pairing=games_per_pairing,
-            max_steps=max_steps,
-            mode=mode,
-            evaluator_mode=evaluator_mode,
-            mcts_simulations=mcts_simulations,
-            gumbel_scale=gumbel_scale,
-            seed=seed,
-            fit_iterations=fit_iterations,
-            elo_k=elo_k,
-        )
+        if trace_plies > 0:
+            if len(resolved_paths) != 2:
+                raise ValueError("trace_plies requires exactly two checkpoints")
+            payload = trace_checkpoint_game(
+                resolved_paths,
+                game=game,
+                games=games_per_pairing,
+                max_steps=max_steps,
+                evaluator_mode=evaluator_mode,
+                mcts_simulations=mcts_simulations,
+                gumbel_scale=gumbel_scale,
+                seed=seed,
+                trace_plies=trace_plies,
+                summary_only=trace_summary_only,
+            )
+            pairings = 1
+            games = int(payload["pairing"]["games"])
+        else:
+            result = evaluate_checkpoint_ladder(
+                resolved_paths,
+                game=game,
+                games_per_pairing=games_per_pairing,
+                max_steps=max_steps,
+                mode=mode,
+                evaluator_mode=evaluator_mode,
+                mcts_simulations=mcts_simulations,
+                gumbel_scale=gumbel_scale,
+                seed=seed,
+                fit_iterations=fit_iterations,
+                elo_k=elo_k,
+            )
+            payload = result.as_dict()
+            pairings = len(result.pairings)
+            games = sum(pairing.games for pairing in result.pairings)
         elapsed = max(time.perf_counter() - started, 1e-12)
-        payload = result.as_dict()
         payload["modal_metrics"] = {
             "modal_checkpoint_elo_seconds": elapsed,
-            "modal_checkpoint_elo_pairings": len(result.pairings),
-            "modal_checkpoint_elo_games": sum(
-                pairing.games for pairing in result.pairings
-            ),
+            "modal_checkpoint_elo_pairings": pairings,
+            "modal_checkpoint_elo_games": games,
         }
         payload["checkpoint_volume"] = _CHECKPOINT_VOLUME_NAME
         payload["requested_gpu"] = requested_gpu
@@ -709,6 +730,8 @@ else:
         seed: int = 0,
         fit_iterations: int = 200,
         elo_k: float = 16.0,
+        trace_plies: int = 0,
+        trace_summary_only: bool = False,
         gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
         spawn: bool = False,
     ) -> None:
@@ -734,6 +757,8 @@ else:
             seed=seed,
             fit_iterations=fit_iterations,
             elo_k=elo_k,
+            trace_plies=trace_plies,
+            trace_summary_only=trace_summary_only,
             requested_gpu=gpu,
         )
         if spawn:

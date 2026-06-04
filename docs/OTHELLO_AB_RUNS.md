@@ -376,3 +376,55 @@ At 32 sims, the best ResNet wins the aggregate round-robin because it sweeps
 transformer s103, despite losing or tying head-to-head against transformer s102.
 Do not treat Othello architecture as settled until the 16-vs-32-sim flip is
 explained with a sim-budget sweep and/or action-level traces.
+
+## 2026-06-04 MCTS Budget Flip Trace
+
+Bead: `alphago-76r`
+
+Controlled top-contender sweep:
+
+- 16 sims, `--games-per-pairing 16`, evaluator seeds 1-4: ResNet s102 lost
+  every played game against both transformer s102 and transformer s103
+  (`0-64` aggregate against each transformer).
+- 24 sims, `--games-per-pairing 32`, evaluator seeds 1-4: transformer s103
+  swept ResNet s102 (`128-0`), while ResNet s102 narrowly beat transformer
+  s102 (`68-60`).
+- 32 sims, `--games-per-pairing 32`, evaluator seeds 1-4: ResNet s102 swept
+  transformer s103 (`128-0`) and narrowly lost to transformer s102 (`58-70`).
+
+The flip is therefore a deterministic search-budget bifurcation, not ordinary
+match seed noise. The clearest case is ResNet s102 `iter_0080` versus
+transformer s103 `final` with pair seed `1099128568`:
+
+| Sims | Pairing result | First selected-action difference |
+| ---: | --- | --- |
+| 24 | ResNet loses `0-32` | ply 10: ResNet lanes select action `38` |
+| 32 | ResNet wins `32-0` | ply 10: ResNet lanes select action `46` |
+
+For that exact pairing seed, selected actions are identical through plies 0-9.
+At ply 10, the transformer-controlled lanes still select action `60` in both
+runs, but the ResNet-controlled lanes switch from action `38` at 24 sims to
+action `46` at 32 sims. The later game branch then flips the full 32-game
+pairing.
+
+Trace commands used the Modal checkpoint runner:
+
+```bash
+uv run --extra modal modal run jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-resnet-s102/othello/iter_0080.msgpack,othello-transformer-s103/othello/final.msgpack" \
+  --games-per-pairing 32 \
+  --evaluator-mode mcts \
+  --mcts-simulations <24-or-32> \
+  --seed 1099128568 \
+  --trace-plies 20 \
+  --trace-summary-only
+```
+
+Modal apps: `ap-n2lcahVMh4wsjC2dUN9XDI` for 24 sims and
+`ap-DQssP8vfKA7F6G6oEbDlq7` for 32 sims.
+
+Implication: fixed low MCTS budgets are not a neutral architecture comparator
+for these Othello checkpoints. The next evaluator should either use much higher
+budgets with uncertainty bars or compare models by policy/value calibration on
+the traced divergent states before treating MCTS Elo as architecture truth.

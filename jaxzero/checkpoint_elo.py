@@ -361,6 +361,197 @@ def play_checkpoint_match(
     )
 
 
+def trace_checkpoint_game(
+    checkpoint_paths: Sequence[str | Path],
+    *,
+    game: str = DEFAULT_GAME,
+    games: int = DEFAULT_GAMES_PER_PAIRING,
+    max_steps: int | None = None,
+    evaluator_mode: EvaluatorMode = DEFAULT_EVALUATOR_MODE,
+    mcts_simulations: int = DEFAULT_MCTS_SIMULATIONS,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    seed: int = 0,
+    trace_plies: int = 8,
+    summary_only: bool = False,
+) -> dict[str, object]:
+    """Trace the first plies of a batched checkpoint match."""
+
+    spec = resolve_game(game)
+    paths = [Path(path) for path in checkpoint_paths]
+    if len(paths) != 2:
+        raise ValueError("trace requires exactly two checkpoint paths")
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if games % 2 != 0:
+        raise ValueError("games must be even to balance seats")
+    if trace_plies <= 0:
+        raise ValueError("trace_plies must be positive")
+    if evaluator_mode not in ("greedy", "mcts"):
+        raise ValueError("evaluator_mode must be 'greedy' or 'mcts'")
+    if mcts_simulations <= 0:
+        raise ValueError("mcts_simulations must be positive")
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
+
+    max_steps = spec.default_max_steps if max_steps is None else max_steps
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    names = _checkpoint_names(paths)
+    player_a, player_b = (
+        _load_checkpoint(path, name=name, game=spec.name)
+        for name, path in zip(names, paths, strict=True)
+    )
+    return trace_checkpoint_match(
+        player_a,
+        player_b,
+        game=spec.name,
+        games=games,
+        max_steps=max_steps,
+        evaluator_mode=evaluator_mode,
+        mcts_simulations=mcts_simulations,
+        gumbel_scale=gumbel_scale,
+        seed=seed,
+        trace_plies=trace_plies,
+        summary_only=summary_only,
+    )
+
+
+def trace_checkpoint_match(
+    player_a: _LoadedCheckpoint,
+    player_b: _LoadedCheckpoint,
+    *,
+    game: str,
+    games: int,
+    max_steps: int,
+    seed: int,
+    evaluator_mode: EvaluatorMode = DEFAULT_EVALUATOR_MODE,
+    mcts_simulations: int = DEFAULT_MCTS_SIMULATIONS,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    trace_plies: int = 8,
+    summary_only: bool = False,
+) -> dict[str, object]:
+    """Trace the exact batched match used by ``play_checkpoint_match``."""
+
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if games % 2 != 0:
+        raise ValueError("games must be even to balance seats")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if trace_plies <= 0:
+        raise ValueError("trace_plies must be positive")
+    if evaluator_mode not in ("greedy", "mcts"):
+        raise ValueError("evaluator_mode must be 'greedy' or 'mcts'")
+    if mcts_simulations <= 0:
+        raise ValueError("mcts_simulations must be positive")
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
+
+    trace = _make_match_trace(
+        player_a.graphdef,
+        player_b.graphdef,
+        game=game,
+        num_games=games,
+        max_steps=max_steps,
+        evaluator_mode=evaluator_mode,
+        num_simulations=mcts_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+    counts, records = trace(
+        player_a.params,
+        player_b.params,
+        jax.random.PRNGKey(seed),
+    )
+    counts = [int(v) for v in jax.device_get(counts).tolist()]
+    records = jax.device_get(records)
+    limit = min(trace_plies, max_steps)
+    player_a_seat = records["player_a_seat"][0]
+    steps = []
+    summaries = []
+    for ply in range(limit):
+        lanes = []
+        selected_counts: dict[str, int] = {}
+        selected_by_actor: dict[str, dict[str, int]] = {}
+        action_a_counts: dict[str, int] = {}
+        action_b_counts: dict[str, int] = {}
+        for lane in range(games):
+            current_player = int(records["current_player"][ply][lane])
+            seat = int(player_a_seat[lane])
+            actor = player_a.name if current_player == seat else player_b.name
+            active = bool(records["active"][ply][lane])
+            action = int(records["action"][ply][lane])
+            action_a = int(records["action_a"][ply][lane])
+            action_b = int(records["action_b"][ply][lane])
+            if active:
+                _increment_count(selected_counts, action)
+                _increment_nested_count(selected_by_actor, actor, action)
+                _increment_count(action_a_counts, action_a)
+                _increment_count(action_b_counts, action_b)
+            lanes.append(
+                {
+                    "lane": lane,
+                    "active": active,
+                    "player_a_seat": seat,
+                    "current_player": current_player,
+                    "actor": actor,
+                    "action_a": action_a,
+                    "action_b": action_b,
+                    "action": action,
+                    "reward_a": float(records["reward_a"][ply][lane]),
+                    "return_a": float(records["return_a"][ply][lane]),
+                }
+            )
+        summaries.append(
+            {
+                "ply": ply,
+                "active_lanes": int(np.sum(records["active"][ply])),
+                "selected_action_counts": selected_counts,
+                "selected_by_actor": selected_by_actor,
+                f"{player_a.name}_search_action_counts": action_a_counts,
+                f"{player_b.name}_search_action_counts": action_b_counts,
+            }
+        )
+        if not summary_only:
+            steps.append({"ply": ply, "lanes": lanes})
+
+    payload = {
+        "game": resolve_game(game).name,
+        "evaluator_mode": evaluator_mode,
+        "mcts_simulations": mcts_simulations if evaluator_mode == "mcts" else None,
+        "gumbel_scale": float(gumbel_scale) if evaluator_mode == "mcts" else None,
+        "games": games,
+        "max_steps": max_steps,
+        "seed": seed,
+        "trace_plies": limit,
+        "player_a": player_a.name,
+        "player_b": player_b.name,
+        "pairing": PairingResult(
+            player_a.name,
+            player_b.name,
+            wins_a=counts[0],
+            draws=counts[1],
+            wins_b=counts[2],
+        ).as_dict(),
+        "summaries": summaries,
+    }
+    if not summary_only:
+        payload["steps"] = steps
+    return payload
+
+
+def _increment_count(counts: dict[str, int], key: int) -> None:
+    counts[str(key)] = counts.get(str(key), 0) + 1
+
+
+def _increment_nested_count(
+    counts: dict[str, dict[str, int]],
+    outer_key: str,
+    inner_key: int,
+) -> None:
+    inner = counts.setdefault(outer_key, {})
+    _increment_count(inner, inner_key)
+
+
 def _make_greedy_match(
     graphdef_a: nnx.GraphDef[Net],
     graphdef_b: nnx.GraphDef[Net],
@@ -413,6 +604,108 @@ def _make_greedy_match(
         return jnp.stack([wins_a, draws, wins_b])
 
     return play
+
+
+def _make_match_trace(
+    graphdef_a: nnx.GraphDef[Net],
+    graphdef_b: nnx.GraphDef[Net],
+    *,
+    game: str,
+    num_games: int,
+    max_steps: int,
+    evaluator_mode: EvaluatorMode,
+    num_simulations: int,
+    gumbel_scale: float,
+):
+    env = pgx.make(resolve_game(game).env_id)
+    player_a_seat = jnp.concatenate(
+        [
+            jnp.zeros(num_games // 2, dtype=jnp.int32),
+            jnp.ones(num_games // 2, dtype=jnp.int32),
+        ]
+    )
+    game_index = jnp.arange(num_games)
+    neg_inf = jnp.finfo(jnp.float32).min
+    if evaluator_mode == "mcts":
+        search_a = _make_mcts_search(
+            graphdef_a,
+            game=game,
+            num_simulations=num_simulations,
+            gumbel_scale=gumbel_scale,
+        )
+        search_b = _make_mcts_search(
+            graphdef_b,
+            game=game,
+            num_simulations=num_simulations,
+            gumbel_scale=gumbel_scale,
+        )
+    else:
+        search_a = None
+        search_b = None
+
+    @jax.jit
+    def trace(
+        params_a: nnx.State,
+        params_b: nnx.State,
+        rng_key: jax.Array,
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
+        def step(carry, key):
+            state, return_a = carry
+            active = ~(state.terminated | state.truncated)
+            current_player = state.current_player
+            if evaluator_mode == "mcts":
+                key_a, key_b = jax.random.split(key)
+                search_state = _replace_inactive_lanes(state, active, dummy_state)
+                action_a = search_a(params_a, search_state, key_a)
+                action_b = search_b(params_b, search_state, key_b)
+            else:
+                logits_a, _ = apply_model(graphdef_a, params_a, state.observation)
+                logits_b, _ = apply_model(graphdef_b, params_b, state.observation)
+                action_a = jnp.argmax(
+                    jnp.where(state.legal_action_mask, logits_a, neg_inf),
+                    axis=-1,
+                )
+                action_b = jnp.argmax(
+                    jnp.where(state.legal_action_mask, logits_b, neg_inf),
+                    axis=-1,
+                )
+            action = jnp.where(
+                state.current_player == player_a_seat,
+                action_a,
+                action_b,
+            )
+            stepped_state = jax.vmap(env.step)(state, action)
+            state = _replace_inactive_lanes(stepped_state, active, state)
+            step_return = stepped_state.rewards[game_index, player_a_seat]
+            return_a = return_a + jnp.where(active, step_return, 0.0)
+            record = {
+                "active": active,
+                "current_player": current_player,
+                "player_a_seat": player_a_seat,
+                "action_a": action_a,
+                "action_b": action_b,
+                "action": action,
+                "reward_a": jnp.where(active, step_return, 0.0),
+                "return_a": return_a,
+            }
+            return (state, return_a), record
+
+        rng_key, init_key, scan_key = jax.random.split(rng_key, 3)
+        state = jax.vmap(env.init)(jax.random.split(init_key, num_games))
+        dummy_state = jax.vmap(env.init)(
+            jax.random.split(jax.random.PRNGKey(0), num_games)
+        )
+        (_, return_a), records = jax.lax.scan(
+            step,
+            (state, jnp.zeros(num_games)),
+            xs=jax.random.split(scan_key, max_steps),
+        )
+        wins_a = jnp.sum(return_a == 1.0).astype(jnp.int32)
+        draws = jnp.sum(return_a == 0.0).astype(jnp.int32)
+        wins_b = jnp.sum(return_a == -1.0).astype(jnp.int32)
+        return jnp.stack([wins_a, draws, wins_b]), records
+
+    return trace
 
 
 def _make_mcts_match(
@@ -679,6 +972,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fit-iterations", type=int, default=DEFAULT_FIT_ITERATIONS)
     parser.add_argument("--elo-k", type=float, default=DEFAULT_ELO_K)
+    parser.add_argument(
+        "--trace-plies",
+        type=int,
+        default=0,
+        help="When >0, trace this many opening plies for exactly two checkpoints "
+        "instead of fitting an Elo ladder.",
+    )
+    parser.add_argument(
+        "--trace-summary-only",
+        action="store_true",
+        help="With --trace-plies, omit per-lane trace records and print only summaries.",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pairing <= 0:
@@ -695,6 +1000,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--fit-iterations must be positive")
     if args.elo_k <= 0:
         parser.error("--elo-k must be positive")
+    if args.trace_plies < 0:
+        parser.error("--trace-plies must be non-negative")
 
     checkpoint_dir = args.checkpoint_dir
     if checkpoint_dir is None and not args.checkpoints:
@@ -706,6 +1013,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if not checkpoint_paths:
         parser.error("no checkpoints found")
+    if args.trace_plies > 0:
+        if len(checkpoint_paths) != 2:
+            parser.error("--trace-plies requires exactly two checkpoints")
+        trace = trace_checkpoint_game(
+            checkpoint_paths,
+            game=args.game,
+            games=args.games_per_pairing,
+            max_steps=args.max_steps,
+            evaluator_mode=args.evaluator_mode,
+            mcts_simulations=args.mcts_simulations,
+            gumbel_scale=args.gumbel_scale,
+            seed=args.seed,
+            trace_plies=args.trace_plies,
+            summary_only=args.trace_summary_only,
+        )
+        print(json.dumps(trace, indent=2, sort_keys=True))
+        return 0
 
     result = evaluate_checkpoint_ladder(
         checkpoint_paths,

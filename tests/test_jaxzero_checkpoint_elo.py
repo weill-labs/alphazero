@@ -226,6 +226,92 @@ def test_checkpoint_elo_cli_accepts_mcts_mode(tmp_path, capsys) -> None:
     assert payload["gumbel_scale"] == 0.0
 
 
+def test_checkpoint_elo_cli_traces_batched_match(tmp_path, capsys) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    exit_code = main(
+        [
+            str(early),
+            str(late),
+            "--game",
+            "othello",
+            "--evaluator-mode",
+            "mcts",
+            "--mcts-simulations",
+            "1",
+            "--gumbel-scale",
+            "0.0",
+            "--games-per-pairing",
+            "2",
+            "--max-steps",
+            "2",
+            "--trace-plies",
+            "2",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["game"] == "othello"
+    assert payload["evaluator_mode"] == "mcts"
+    assert payload["mcts_simulations"] == 1
+    assert payload["pairing"]["games"] == 2
+    assert len(payload["summaries"]) == 2
+    assert payload["summaries"][0]["active_lanes"] == 2
+    assert payload["summaries"][0]["selected_action_counts"]
+    assert len(payload["steps"]) == 2
+    assert payload["steps"][0]["ply"] == 0
+    assert len(payload["steps"][0]["lanes"]) == 2
+    assert {
+        "action",
+        "action_a",
+        "action_b",
+        "active",
+        "actor",
+        "current_player",
+        "lane",
+        "player_a_seat",
+        "return_a",
+        "reward_a",
+    } <= set(payload["steps"][0]["lanes"][0])
+
+
+def test_checkpoint_elo_cli_can_trace_summaries_only(tmp_path, capsys) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    exit_code = main(
+        [
+            str(early),
+            str(late),
+            "--game",
+            "othello",
+            "--evaluator-mode",
+            "mcts",
+            "--mcts-simulations",
+            "1",
+            "--games-per-pairing",
+            "2",
+            "--max-steps",
+            "2",
+            "--trace-plies",
+            "2",
+            "--trace-summary-only",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["pairing"]["games"] == 2
+    assert len(payload["summaries"]) == 2
+    assert "steps" not in payload
+
+
 def test_checkpoint_elo_imports_without_c4_solver_dependency() -> None:
     code = (
         "import sys, jaxzero.checkpoint_elo; "
