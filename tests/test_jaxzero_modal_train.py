@@ -307,6 +307,26 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
             "actions": [{"action": action} for action in kwargs["force_actions"]],
         }
 
+    def fake_evaluate_checkpoint_stability(paths, **kwargs):
+        captured["stability"] = {"paths": list(paths), **kwargs}
+        return {
+            "game": kwargs["game"],
+            "evaluator_mode": "mcts",
+            "runs": [
+                {
+                    "mcts_simulations": budget,
+                    "seed": seed,
+                    "pairings": [
+                        {"games": kwargs["games_per_pairing"]},
+                        {"games": kwargs["games_per_pairing"]},
+                    ],
+                }
+                for budget in kwargs["mcts_simulations_list"]
+                for seed in kwargs["seeds"]
+            ],
+            "pairing_summary": [],
+        }
+
     monkeypatch.setattr(
         checkpoint_elo_module, "resolve_checkpoint_paths", fake_resolve_checkpoint_paths
     )
@@ -329,6 +349,11 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
         checkpoint_elo_module,
         "evaluate_forced_actions",
         fake_evaluate_forced_actions,
+    )
+    monkeypatch.setattr(
+        checkpoint_elo_module,
+        "evaluate_checkpoint_stability",
+        fake_evaluate_checkpoint_stability,
     )
 
     result = module.checkpoint_elo_remote(
@@ -440,6 +465,30 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
     assert captured["force"]["target_ply"] == 10
     assert force_result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 1
     assert force_result["modal_metrics"]["modal_checkpoint_elo_games"] == 8
+
+    stability_result = module.checkpoint_elo_remote(
+        game="othello",
+        checkpoint_paths=[
+            "othello-resnet-s102/othello/iter_0080.msgpack",
+            "/checkpoints/othello-transformer-s102/othello/iter_0060.msgpack",
+        ],
+        mode="round-robin",
+        games_per_pairing=4,
+        max_steps=module._AUTO_MAX_STEPS,
+        fit_iterations=20,
+        elo_k=8.0,
+        stability_budgets="16,32",
+        stability_seeds="3,4",
+        stability_score_threshold=0.2,
+    )
+
+    assert captured["stability"]["max_steps"] == 128
+    assert captured["stability"]["mode"] == "round-robin"
+    assert captured["stability"]["mcts_simulations_list"] == [16, 32]
+    assert captured["stability"]["seeds"] == [3, 4]
+    assert captured["stability"]["instability_threshold"] == 0.2
+    assert stability_result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 8
+    assert stability_result["modal_metrics"]["modal_checkpoint_elo_games"] == 32
 
 
 def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> None:

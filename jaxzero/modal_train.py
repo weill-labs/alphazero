@@ -516,12 +516,18 @@ else:
         force_actions: str = "",
         force_actor: str = "",
         continuation_simulations: int = 32,
+        stability_budgets: str = "",
+        stability_seeds: str = "0",
+        stability_score_threshold: float = 0.25,
         requested_gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
     ) -> dict[str, object]:
         from jaxzero.checkpoint_elo import (
             _parse_force_actions,
             _parse_probe_simulations,
+            _parse_stability_budgets,
+            _parse_stability_seeds,
             evaluate_checkpoint_ladder,
+            evaluate_checkpoint_stability,
             evaluate_forced_actions,
             probe_checkpoint_state,
             resolve_checkpoint_paths,
@@ -548,10 +554,17 @@ else:
             raise ValueError("no checkpoints found for Modal checkpoint Elo")
 
         started = time.perf_counter()
-        active_modes = int(trace_plies > 0) + int(probe_ply >= 0) + int(force_ply >= 0)
+        stability_budget_values = _parse_stability_budgets(stability_budgets)
+        active_modes = (
+            int(trace_plies > 0)
+            + int(probe_ply >= 0)
+            + int(force_ply >= 0)
+            + int(bool(stability_budget_values))
+        )
         if active_modes > 1:
             raise ValueError(
-                "trace_plies, probe_ply, and force_ply are mutually exclusive"
+                "trace_plies, probe_ply, force_ply, and stability_budgets are "
+                "mutually exclusive"
             )
         if trace_plies > 0:
             if len(resolved_paths) != 2:
@@ -608,6 +621,26 @@ else:
             )
             pairings = 1
             games = int(payload["games"]) * len(payload["actions"])
+        elif stability_budget_values:
+            payload = evaluate_checkpoint_stability(
+                resolved_paths,
+                game=game,
+                games_per_pairing=games_per_pairing,
+                max_steps=max_steps,
+                mode=mode,
+                mcts_simulations_list=stability_budget_values,
+                seeds=_parse_stability_seeds(stability_seeds),
+                gumbel_scale=gumbel_scale,
+                fit_iterations=fit_iterations,
+                elo_k=elo_k,
+                instability_threshold=stability_score_threshold,
+            )
+            pairings = sum(len(run["pairings"]) for run in payload["runs"])
+            games = sum(
+                int(pairing["games"])
+                for run in payload["runs"]
+                for pairing in run["pairings"]
+            )
         else:
             result = evaluate_checkpoint_ladder(
                 resolved_paths,
@@ -793,6 +826,9 @@ else:
         force_actions: str = "",
         force_actor: str = "",
         continuation_simulations: int = 32,
+        stability_budgets: str = "",
+        stability_seeds: str = "0",
+        stability_score_threshold: float = 0.25,
         gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
         spawn: bool = False,
     ) -> None:
@@ -827,6 +863,9 @@ else:
             force_actions=force_actions,
             force_actor=force_actor,
             continuation_simulations=continuation_simulations,
+            stability_budgets=stability_budgets,
+            stability_seeds=stability_seeds,
+            stability_score_threshold=stability_score_threshold,
             requested_gpu=gpu,
         )
         if spawn:

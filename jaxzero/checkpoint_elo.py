@@ -305,6 +305,95 @@ def evaluate_checkpoint_ladder(
     )
 
 
+def evaluate_checkpoint_stability(
+    checkpoint_paths: Sequence[str | Path],
+    *,
+    game: str = DEFAULT_GAME,
+    games_per_pairing: int = DEFAULT_GAMES_PER_PAIRING,
+    max_steps: int | None = None,
+    mode: PairingMode = "anchored-sequential",
+    mcts_simulations_list: Sequence[int],
+    seeds: Sequence[int],
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    fit_iterations: int = DEFAULT_FIT_ITERATIONS,
+    elo_k: float = DEFAULT_ELO_K,
+    instability_threshold: float = 0.25,
+) -> dict[str, object]:
+    """Run MCTS checkpoint Elo across budgets/seeds and summarize sensitivity."""
+
+    budgets = _validate_positive_ints(
+        mcts_simulations_list,
+        name="mcts_simulations_list",
+    )
+    seed_values = _validate_ints(seeds, name="seeds")
+    if instability_threshold < 0.0:
+        raise ValueError("instability_threshold must be non-negative")
+
+    runs: list[dict[str, object]] = []
+    resolved_game = ""
+    resolved_max_steps = 0
+    for budget in budgets:
+        for run_seed in seed_values:
+            result = evaluate_checkpoint_ladder(
+                checkpoint_paths,
+                game=game,
+                games_per_pairing=games_per_pairing,
+                max_steps=max_steps,
+                mode=mode,
+                evaluator_mode="mcts",
+                mcts_simulations=budget,
+                gumbel_scale=gumbel_scale,
+                seed=run_seed,
+                fit_iterations=fit_iterations,
+                elo_k=elo_k,
+            )
+            if not resolved_game:
+                resolved_game = result.game
+                resolved_max_steps = result.max_steps
+            payload = result.as_dict()
+            runs.append(
+                {
+                    "mcts_simulations": budget,
+                    "seed": run_seed,
+                    "ratings": payload["ratings"],
+                    "pairings": payload["pairings"],
+                    "best_name": payload["best_name"],
+                    "best_elo": payload["best_elo"],
+                }
+            )
+
+    if not runs:
+        raise ValueError("stability sweep produced no runs")
+
+    rating_summary = _summarize_stability_ratings(runs)
+    pairing_summary = _summarize_stability_pairings(
+        runs,
+        instability_threshold=instability_threshold,
+    )
+    unstable_pairings = [
+        pairing
+        for pairing in pairing_summary
+        if bool(pairing["unstable_verdict"])
+        or float(pairing["score_a_range"]) >= instability_threshold
+    ]
+    return {
+        "game": resolved_game,
+        "evaluator_mode": "mcts",
+        "mode": mode,
+        "games_per_pairing": games_per_pairing,
+        "max_steps": resolved_max_steps,
+        "mcts_simulations": budgets,
+        "seeds": seed_values,
+        "gumbel_scale": float(gumbel_scale),
+        "instability_threshold": float(instability_threshold),
+        "stable": not unstable_pairings,
+        "runs": runs,
+        "rating_summary": rating_summary,
+        "pairing_summary": pairing_summary,
+        "unstable_pairings": unstable_pairings,
+    }
+
+
 def play_checkpoint_match(
     player_a: _LoadedCheckpoint,
     player_b: _LoadedCheckpoint,
@@ -979,13 +1068,109 @@ def _outcome_summary(
     }
 
 
+def _summarize_stability_ratings(
+    runs: Sequence[dict[str, object]],
+) -> dict[str, dict[str, float | int]]:
+    names = sorted(
+        {
+            name
+            for run in runs
+            for name in (run["ratings"]).keys()  # type: ignore[union-attr]
+        }
+    )
+    summary = {}
+    for name in names:
+        values = np.asarray(
+            [float((run["ratings"])[name]) for run in runs],  # type: ignore[index]
+            dtype=np.float64,
+        )
+        summary[name] = {
+            "mean_elo": float(np.mean(values)),
+            "std_elo": float(np.std(values)),
+            "min_elo": float(np.min(values)),
+            "max_elo": float(np.max(values)),
+            "elo_range": float(np.max(values) - np.min(values)),
+            "best_count": int(sum(run["best_name"] == name for run in runs)),
+        }
+    return summary
+
+
+def _summarize_stability_pairings(
+    runs: Sequence[dict[str, object]],
+    *,
+    instability_threshold: float,
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for run in runs:
+        for pairing in run["pairings"]:  # type: ignore[union-attr]
+            key = (str(pairing["player_a"]), str(pairing["player_b"]))
+            grouped.setdefault(key, []).append(
+                {
+                    "mcts_simulations": run["mcts_simulations"],
+                    "seed": run["seed"],
+                    "score_a": float(pairing["score_a"]),
+                    "wins_a": int(pairing["wins_a"]),
+                    "draws": int(pairing["draws"]),
+                    "wins_b": int(pairing["wins_b"]),
+                    "games": int(pairing["games"]),
+                }
+            )
+
+    summaries = []
+    for (player_a, player_b), entries in sorted(grouped.items()):
+        scores = np.asarray([entry["score_a"] for entry in entries], dtype=np.float64)
+        verdict_counts = {"player_a": 0, "tie": 0, "player_b": 0}
+        for score in scores:
+            verdict_counts[_score_verdict(float(score))] += 1
+        non_tie_verdicts = {
+            verdict
+            for verdict, count in verdict_counts.items()
+            if verdict != "tie" and count
+        }
+        score_range = float(np.max(scores) - np.min(scores))
+        summaries.append(
+            {
+                "player_a": player_a,
+                "player_b": player_b,
+                "mean_score_a": float(np.mean(scores)),
+                "min_score_a": float(np.min(scores)),
+                "max_score_a": float(np.max(scores)),
+                "score_a_range": score_range,
+                "unstable_verdict": len(non_tie_verdicts) > 1,
+                "exceeds_threshold": score_range >= instability_threshold,
+                "verdict_counts": verdict_counts,
+                "runs": entries,
+            }
+        )
+    return summaries
+
+
+def _score_verdict(score: float) -> str:
+    if score > 0.5:
+        return "player_a"
+    if score < 0.5:
+        return "player_b"
+    return "tie"
+
+
+def _validate_positive_ints(values: Sequence[int], *, name: str) -> list[int]:
+    parsed = [int(value) for value in values]
+    if not parsed:
+        raise ValueError(f"{name} must not be empty")
+    if any(value <= 0 for value in parsed):
+        raise ValueError(f"{name} values must be positive")
+    return parsed
+
+
+def _validate_ints(values: Sequence[int], *, name: str) -> list[int]:
+    parsed = [int(value) for value in values]
+    if not parsed:
+        raise ValueError(f"{name} must not be empty")
+    return parsed
+
+
 def _validate_probe_simulations(probe_simulations: Sequence[int]) -> list[int]:
-    budgets = [int(value) for value in probe_simulations]
-    if not budgets:
-        raise ValueError("probe_simulations must not be empty")
-    if any(value <= 0 for value in budgets):
-        raise ValueError("probe_simulations values must be positive")
-    return budgets
+    return _validate_positive_ints(probe_simulations, name="probe_simulations")
 
 
 def _top_action_weights(
@@ -1696,6 +1881,28 @@ def _parse_force_actions(raw: str) -> list[int]:
     return _validate_force_actions(values)
 
 
+def _parse_stability_budgets(raw: str) -> list[int]:
+    if not raw:
+        return []
+    try:
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError(
+            "--stability-budgets must be comma-separated integers"
+        ) from exc
+    return _validate_positive_ints(values, name="stability_budgets")
+
+
+def _parse_stability_seeds(raw: str) -> list[int]:
+    if not raw:
+        raise ValueError("--stability-seeds must not be empty")
+    try:
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError("--stability-seeds must be comma-separated integers") from exc
+    return _validate_ints(values, name="stability_seeds")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Evaluate a greedy Elo ladder across jaxzero checkpoints."
@@ -1779,6 +1986,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_MCTS_SIMULATIONS,
         help="MCTS simulations for the forced ply and remaining continuation.",
     )
+    parser.add_argument(
+        "--stability-budgets",
+        default="",
+        help="Comma-separated MCTS simulation budgets for a stability sweep. "
+        "When set, runs MCTS Elo once per budget/seed and reports sensitivity.",
+    )
+    parser.add_argument(
+        "--stability-seeds",
+        default="0",
+        help="Comma-separated evaluator seeds for --stability-budgets.",
+    )
+    parser.add_argument(
+        "--stability-score-threshold",
+        type=float,
+        default=0.25,
+        help="Pair score range that marks a stability-sweep pairing as unstable.",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pairing <= 0:
@@ -1805,6 +2029,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--force-ply must be non-negative")
     if args.continuation_simulations <= 0:
         parser.error("--continuation-simulations must be positive")
+    if args.stability_score_threshold < 0.0:
+        parser.error("--stability-score-threshold must be non-negative")
     try:
         probe_budgets = _parse_probe_simulations(
             args.probe_budgets,
@@ -1818,6 +2044,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.force_ply is not None
             else []
         )
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        stability_budgets = _parse_stability_budgets(args.stability_budgets)
+        stability_seeds = _parse_stability_seeds(args.stability_seeds)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -1836,11 +2067,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             int(args.trace_plies > 0),
             int(args.probe_ply is not None),
             int(args.force_ply is not None),
+            int(bool(stability_budgets)),
         ]
     )
     if active_modes > 1:
         parser.error(
-            "--trace-plies, --probe-ply, and --force-ply are mutually exclusive"
+            "--trace-plies, --probe-ply, --force-ply, and --stability-budgets "
+            "are mutually exclusive"
         )
     if args.trace_plies > 0:
         if len(checkpoint_paths) != 2:
@@ -1893,6 +2126,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_ply=args.force_ply,
         )
         print(json.dumps(forced, indent=2, sort_keys=True))
+        return 0
+    if stability_budgets:
+        stability = evaluate_checkpoint_stability(
+            checkpoint_paths,
+            game=args.game,
+            games_per_pairing=args.games_per_pairing,
+            max_steps=args.max_steps,
+            mode=args.mode,
+            mcts_simulations_list=stability_budgets,
+            seeds=stability_seeds,
+            gumbel_scale=args.gumbel_scale,
+            fit_iterations=args.fit_iterations,
+            elo_k=args.elo_k,
+            instability_threshold=args.stability_score_threshold,
+        )
+        print(json.dumps(stability, indent=2, sort_keys=True))
         return 0
 
     result = evaluate_checkpoint_ladder(
