@@ -512,11 +512,17 @@ else:
         probe_ply: int = -1,
         probe_budgets: str = "",
         probe_top_k: int = 5,
+        force_ply: int = -1,
+        force_actions: str = "",
+        force_actor: str = "",
+        continuation_simulations: int = 32,
         requested_gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
     ) -> dict[str, object]:
         from jaxzero.checkpoint_elo import (
+            _parse_force_actions,
             _parse_probe_simulations,
             evaluate_checkpoint_ladder,
+            evaluate_forced_actions,
             probe_checkpoint_state,
             resolve_checkpoint_paths,
             trace_checkpoint_game,
@@ -542,8 +548,11 @@ else:
             raise ValueError("no checkpoints found for Modal checkpoint Elo")
 
         started = time.perf_counter()
-        if trace_plies > 0 and probe_ply >= 0:
-            raise ValueError("trace_plies and probe_ply are mutually exclusive")
+        active_modes = int(trace_plies > 0) + int(probe_ply >= 0) + int(force_ply >= 0)
+        if active_modes > 1:
+            raise ValueError(
+                "trace_plies, probe_ply, and force_ply are mutually exclusive"
+            )
         if trace_plies > 0:
             if len(resolved_paths) != 2:
                 raise ValueError("trace_plies requires exactly two checkpoints")
@@ -581,6 +590,24 @@ else:
             )
             pairings = 1
             games = int(payload["games"])
+        elif force_ply >= 0:
+            if len(resolved_paths) != 2:
+                raise ValueError("force_ply requires exactly two checkpoints")
+            payload = evaluate_forced_actions(
+                resolved_paths,
+                game=game,
+                games=games_per_pairing,
+                max_steps=max_steps,
+                replay_simulations=mcts_simulations,
+                continuation_simulations=continuation_simulations,
+                force_actions=_parse_force_actions(force_actions),
+                force_actor=force_actor,
+                gumbel_scale=gumbel_scale,
+                seed=seed,
+                target_ply=force_ply,
+            )
+            pairings = 1
+            games = int(payload["games"]) * len(payload["actions"])
         else:
             result = evaluate_checkpoint_ladder(
                 resolved_paths,
@@ -762,6 +789,10 @@ else:
         probe_ply: int = -1,
         probe_budgets: str = "",
         probe_top_k: int = 5,
+        force_ply: int = -1,
+        force_actions: str = "",
+        force_actor: str = "",
+        continuation_simulations: int = 32,
         gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
         spawn: bool = False,
     ) -> None:
@@ -792,6 +823,10 @@ else:
             probe_ply=probe_ply,
             probe_budgets=probe_budgets,
             probe_top_k=probe_top_k,
+            force_ply=force_ply,
+            force_actions=force_actions,
+            force_actor=force_actor,
+            continuation_simulations=continuation_simulations,
             requested_gpu=gpu,
         )
         if spawn:

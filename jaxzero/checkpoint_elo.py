@@ -762,6 +762,223 @@ def probe_checkpoint_match(
     }
 
 
+def evaluate_forced_actions(
+    checkpoint_paths: Sequence[str | Path],
+    *,
+    game: str = DEFAULT_GAME,
+    games: int = DEFAULT_GAMES_PER_PAIRING,
+    max_steps: int | None = None,
+    replay_simulations: int = DEFAULT_MCTS_SIMULATIONS,
+    continuation_simulations: int = DEFAULT_MCTS_SIMULATIONS,
+    force_actions: Sequence[int] = (),
+    force_actor: str = "",
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    seed: int = 0,
+    target_ply: int = 0,
+) -> dict[str, object]:
+    """Force candidate actions at a match ply and continue to terminal states."""
+
+    spec = resolve_game(game)
+    paths = [Path(path) for path in checkpoint_paths]
+    if len(paths) != 2:
+        raise ValueError("forced-action eval requires exactly two checkpoint paths")
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if games % 2 != 0:
+        raise ValueError("games must be even to balance seats")
+    if replay_simulations <= 0:
+        raise ValueError("replay_simulations must be positive")
+    if continuation_simulations <= 0:
+        raise ValueError("continuation_simulations must be positive")
+    actions = _validate_force_actions(force_actions)
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
+
+    max_steps = spec.default_max_steps if max_steps is None else max_steps
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if target_ply < 0 or target_ply >= max_steps:
+        raise ValueError("target_ply must be in [0, max_steps)")
+
+    names = _checkpoint_names(paths)
+    player_a, player_b = (
+        _load_checkpoint(path, name=name, game=spec.name)
+        for name, path in zip(names, paths, strict=True)
+    )
+    return evaluate_forced_action_match(
+        player_a,
+        player_b,
+        game=spec.name,
+        games=games,
+        max_steps=max_steps,
+        replay_simulations=replay_simulations,
+        continuation_simulations=continuation_simulations,
+        force_actions=actions,
+        force_actor=force_actor,
+        gumbel_scale=gumbel_scale,
+        seed=seed,
+        target_ply=target_ply,
+    )
+
+
+def evaluate_forced_action_match(
+    player_a: _LoadedCheckpoint,
+    player_b: _LoadedCheckpoint,
+    *,
+    game: str,
+    games: int,
+    max_steps: int,
+    replay_simulations: int,
+    continuation_simulations: int,
+    force_actions: Sequence[int],
+    force_actor: str = "",
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    seed: int = 0,
+    target_ply: int = 0,
+) -> dict[str, object]:
+    """Evaluate terminal outcomes after forcing actions for one actor."""
+
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if games % 2 != 0:
+        raise ValueError("games must be even to balance seats")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if replay_simulations <= 0:
+        raise ValueError("replay_simulations must be positive")
+    if continuation_simulations <= 0:
+        raise ValueError("continuation_simulations must be positive")
+    actions = _validate_force_actions(force_actions)
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
+    if target_ply < 0 or target_ply >= max_steps:
+        raise ValueError("target_ply must be in [0, max_steps)")
+
+    force_player, force_actor_name = _resolve_force_actor(
+        force_actor,
+        player_a.name,
+        player_b.name,
+    )
+    continue_match = _make_forced_action_continuation(
+        player_a.graphdef,
+        player_b.graphdef,
+        game=game,
+        num_games=games,
+        max_steps=max_steps,
+        target_ply=target_ply,
+        replay_simulations=replay_simulations,
+        continuation_simulations=continuation_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+
+    action_results = []
+    for action in actions:
+        raw = continue_match(
+            player_a.params,
+            player_b.params,
+            jax.random.PRNGKey(seed),
+            jnp.asarray(action, dtype=jnp.int32),
+            jnp.asarray(force_player, dtype=jnp.int32),
+        )
+        result = {
+            name: np.asarray(jax.device_get(value)) for name, value in raw.items()
+        }
+        forced_mask = result["forced_mask"].astype(bool)
+        target_mask = result["target_mask"].astype(bool)
+        return_a = result["return_a"]
+        default_action = result["default_action"]
+        target_default_counts: dict[str, int] = {}
+        for lane in np.flatnonzero(target_mask):
+            _increment_count(target_default_counts, int(default_action[lane]))
+        forced_lanes = np.flatnonzero(forced_mask)
+        action_results.append(
+            {
+                "action": int(action),
+                "target_lanes": int(np.sum(target_mask)),
+                "forced_lanes": int(np.sum(forced_mask)),
+                "illegal_target_lanes": int(np.sum(target_mask & ~forced_mask)),
+                "target_default_action_counts": target_default_counts,
+                "forced_result": _outcome_summary(
+                    return_a[forced_mask],
+                    force_player=force_player,
+                ),
+                "all_result": _outcome_summary(return_a, force_player=force_player),
+                "forced_lane_returns_a": [
+                    {"lane": int(lane), "return_a": float(return_a[lane])}
+                    for lane in forced_lanes
+                ],
+            }
+        )
+
+    return {
+        "game": resolve_game(game).name,
+        "games": games,
+        "max_steps": max_steps,
+        "seed": seed,
+        "target_ply": target_ply,
+        "replay_simulations": replay_simulations,
+        "continuation_simulations": continuation_simulations,
+        "gumbel_scale": float(gumbel_scale),
+        "player_a": player_a.name,
+        "player_b": player_b.name,
+        "force_actor": force_actor_name,
+        "force_actor_role": "player_a" if force_player == 0 else "player_b",
+        "actions": action_results,
+    }
+
+
+def _validate_force_actions(force_actions: Sequence[int]) -> list[int]:
+    actions = [int(value) for value in force_actions]
+    if not actions:
+        raise ValueError("force_actions must not be empty")
+    if any(value < 0 for value in actions):
+        raise ValueError("force_actions values must be non-negative")
+    return actions
+
+
+def _resolve_force_actor(
+    force_actor: str,
+    player_a_name: str,
+    player_b_name: str,
+) -> tuple[int, str]:
+    if force_actor in ("", "player_a", player_a_name):
+        return 0, player_a_name
+    if force_actor in ("player_b", player_b_name):
+        return 1, player_b_name
+    msg = (
+        "force_actor must be empty, 'player_a', 'player_b', "
+        f"{player_a_name!r}, or {player_b_name!r}"
+    )
+    raise ValueError(msg)
+
+
+def _outcome_summary(
+    values: np.ndarray, *, force_player: int
+) -> dict[str, float | int]:
+    if values.size == 0:
+        return {
+            "games": 0,
+            "wins_a": 0,
+            "draws": 0,
+            "wins_b": 0,
+            "score_a": 0.0,
+            "force_actor_score": 0.0,
+        }
+    wins_a = int(np.sum(values == 1.0))
+    draws = int(np.sum(values == 0.0))
+    wins_b = int(np.sum(values == -1.0))
+    score_a = (wins_a + 0.5 * draws) / int(values.size)
+    force_actor_score = score_a if force_player == 0 else 1.0 - score_a
+    return {
+        "games": int(values.size),
+        "wins_a": wins_a,
+        "draws": draws,
+        "wins_b": wins_b,
+        "score_a": float(score_a),
+        "force_actor_score": float(force_actor_score),
+    }
+
+
 def _validate_probe_simulations(probe_simulations: Sequence[int]) -> list[int]:
     budgets = [int(value) for value in probe_simulations]
     if not budgets:
@@ -1030,6 +1247,147 @@ def _make_match_state_at_ply(
         return state, return_a, scan_keys[target_ply], player_a_seat
 
     return replay
+
+
+def _make_forced_action_continuation(
+    graphdef_a: nnx.GraphDef[Net],
+    graphdef_b: nnx.GraphDef[Net],
+    *,
+    game: str,
+    num_games: int,
+    max_steps: int,
+    target_ply: int,
+    replay_simulations: int,
+    continuation_simulations: int,
+    gumbel_scale: float,
+):
+    env = pgx.make(resolve_game(game).env_id)
+    player_a_seat = jnp.concatenate(
+        [
+            jnp.zeros(num_games // 2, dtype=jnp.int32),
+            jnp.ones(num_games // 2, dtype=jnp.int32),
+        ]
+    )
+    game_index = jnp.arange(num_games)
+    replay_search_a = _make_mcts_search(
+        graphdef_a,
+        game=game,
+        num_simulations=replay_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+    replay_search_b = _make_mcts_search(
+        graphdef_b,
+        game=game,
+        num_simulations=replay_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+    continuation_search_a = _make_mcts_search(
+        graphdef_a,
+        game=game,
+        num_simulations=continuation_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+    continuation_search_b = _make_mcts_search(
+        graphdef_b,
+        game=game,
+        num_simulations=continuation_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+
+    @jax.jit
+    def continue_match(
+        params_a: nnx.State,
+        params_b: nnx.State,
+        rng_key: jax.Array,
+        forced_action: jax.Array,
+        force_player: jax.Array,
+    ) -> dict[str, jax.Array]:
+        def replay_step(carry, key):
+            state, return_a = carry
+            active = ~(state.terminated | state.truncated)
+            key_a, key_b = jax.random.split(key)
+            search_state = _replace_inactive_lanes(state, active, dummy_state)
+            action_a = replay_search_a(params_a, search_state, key_a)
+            action_b = replay_search_b(params_b, search_state, key_b)
+            action = jnp.where(
+                state.current_player == player_a_seat,
+                action_a,
+                action_b,
+            )
+            stepped_state = jax.vmap(env.step)(state, action)
+            state = _replace_inactive_lanes(stepped_state, active, state)
+            step_return = stepped_state.rewards[game_index, player_a_seat]
+            return_a = return_a + jnp.where(active, step_return, 0.0)
+            return (state, return_a), None
+
+        def continuation_step(carry, key):
+            state, return_a = carry
+            active = ~(state.terminated | state.truncated)
+            key_a, key_b = jax.random.split(key)
+            search_state = _replace_inactive_lanes(state, active, dummy_state)
+            action_a = continuation_search_a(params_a, search_state, key_a)
+            action_b = continuation_search_b(params_b, search_state, key_b)
+            action = jnp.where(
+                state.current_player == player_a_seat,
+                action_a,
+                action_b,
+            )
+            stepped_state = jax.vmap(env.step)(state, action)
+            state = _replace_inactive_lanes(stepped_state, active, state)
+            step_return = stepped_state.rewards[game_index, player_a_seat]
+            return_a = return_a + jnp.where(active, step_return, 0.0)
+            return (state, return_a), None
+
+        rng_key, init_key, scan_key = jax.random.split(rng_key, 3)
+        state = jax.vmap(env.init)(jax.random.split(init_key, num_games))
+        dummy_state = jax.vmap(env.init)(
+            jax.random.split(jax.random.PRNGKey(0), num_games)
+        )
+        scan_keys = jax.random.split(scan_key, max_steps)
+        (state, return_a), _ = jax.lax.scan(
+            replay_step,
+            (state, jnp.zeros(num_games)),
+            xs=scan_keys[:target_ply],
+        )
+
+        target_active = ~(state.terminated | state.truncated)
+        key_a, key_b = jax.random.split(scan_keys[target_ply])
+        search_state = _replace_inactive_lanes(state, target_active, dummy_state)
+        action_a = continuation_search_a(params_a, search_state, key_a)
+        action_b = continuation_search_b(params_b, search_state, key_b)
+        default_action = jnp.where(
+            state.current_player == player_a_seat,
+            action_a,
+            action_b,
+        )
+        actor_is_a = state.current_player == player_a_seat
+        target_actor_mask = jnp.where(force_player == 0, actor_is_a, ~actor_is_a)
+        target_mask = target_active & target_actor_mask
+        forced_legal = state.legal_action_mask[
+            jnp.arange(state.legal_action_mask.shape[0]),
+            forced_action,
+        ]
+        forced_mask = target_mask & forced_legal
+        target_action = jnp.where(forced_mask, forced_action, default_action)
+        stepped_state = jax.vmap(env.step)(state, target_action)
+        state = _replace_inactive_lanes(stepped_state, target_active, state)
+        step_return = stepped_state.rewards[game_index, player_a_seat]
+        return_a = return_a + jnp.where(target_active, step_return, 0.0)
+
+        (state, return_a), _ = jax.lax.scan(
+            continuation_step,
+            (state, return_a),
+            xs=scan_keys[target_ply + 1 :],
+        )
+        return {
+            "return_a": return_a,
+            "target_mask": target_mask,
+            "forced_mask": forced_mask,
+            "default_action": default_action,
+            "target_action": target_action,
+        }
+
+    return continue_match
 
 
 def _make_mcts_match(
@@ -1328,6 +1686,16 @@ def _parse_probe_simulations(raw: str, *, fallback: int) -> list[int]:
     return _validate_probe_simulations(values)
 
 
+def _parse_force_actions(raw: str) -> list[int]:
+    if not raw:
+        raise ValueError("--force-actions is required with --force-ply")
+    try:
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError("--force-actions must be comma-separated integers") from exc
+    return _validate_force_actions(values)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Evaluate a greedy Elo ladder across jaxzero checkpoints."
@@ -1388,6 +1756,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=5,
         help="Number of top action weights to emit per lane and probe budget.",
     )
+    parser.add_argument(
+        "--force-ply",
+        type=int,
+        default=None,
+        help="Replay a two-checkpoint MCTS match to this ply, force each action "
+        "from --force-actions on --force-actor lanes, and continue to terminal.",
+    )
+    parser.add_argument(
+        "--force-actions",
+        default="",
+        help="Comma-separated action ids to evaluate with --force-ply.",
+    )
+    parser.add_argument(
+        "--force-actor",
+        default="",
+        help="Actor to force: empty/player_a, player_b, or a checkpoint name.",
+    )
+    parser.add_argument(
+        "--continuation-simulations",
+        type=int,
+        default=DEFAULT_MCTS_SIMULATIONS,
+        help="MCTS simulations for the forced ply and remaining continuation.",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pairing <= 0:
@@ -1410,10 +1801,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--probe-ply must be non-negative")
     if args.probe_top_k <= 0:
         parser.error("--probe-top-k must be positive")
+    if args.force_ply is not None and args.force_ply < 0:
+        parser.error("--force-ply must be non-negative")
+    if args.continuation_simulations <= 0:
+        parser.error("--continuation-simulations must be positive")
     try:
         probe_budgets = _parse_probe_simulations(
             args.probe_budgets,
             fallback=args.mcts_simulations,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        force_actions = (
+            _parse_force_actions(args.force_actions)
+            if args.force_ply is not None
+            else []
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -1428,8 +1831,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if not checkpoint_paths:
         parser.error("no checkpoints found")
-    if args.trace_plies > 0 and args.probe_ply is not None:
-        parser.error("--trace-plies and --probe-ply are mutually exclusive")
+    active_modes = sum(
+        [
+            int(args.trace_plies > 0),
+            int(args.probe_ply is not None),
+            int(args.force_ply is not None),
+        ]
+    )
+    if active_modes > 1:
+        parser.error(
+            "--trace-plies, --probe-ply, and --force-ply are mutually exclusive"
+        )
     if args.trace_plies > 0:
         if len(checkpoint_paths) != 2:
             parser.error("--trace-plies requires exactly two checkpoints")
@@ -1463,6 +1875,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             top_k=args.probe_top_k,
         )
         print(json.dumps(probe, indent=2, sort_keys=True))
+        return 0
+    if args.force_ply is not None:
+        if len(checkpoint_paths) != 2:
+            parser.error("--force-ply requires exactly two checkpoints")
+        forced = evaluate_forced_actions(
+            checkpoint_paths,
+            game=args.game,
+            games=args.games_per_pairing,
+            max_steps=args.max_steps,
+            replay_simulations=args.mcts_simulations,
+            continuation_simulations=args.continuation_simulations,
+            force_actions=force_actions,
+            force_actor=args.force_actor,
+            gumbel_scale=args.gumbel_scale,
+            seed=args.seed,
+            target_ply=args.force_ply,
+        )
+        print(json.dumps(forced, indent=2, sort_keys=True))
         return 0
 
     result = evaluate_checkpoint_ladder(

@@ -351,6 +351,45 @@ def test_checkpoint_elo_cli_probes_match_state(tmp_path, capsys) -> None:
     assert payload["lanes"][0]["budgets"][0]["top_actions"]
 
 
+def test_checkpoint_elo_cli_evaluates_forced_actions(tmp_path, capsys) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    exit_code = main(
+        [
+            str(early),
+            str(late),
+            "--game",
+            "othello",
+            "--mcts-simulations",
+            "1",
+            "--continuation-simulations",
+            "1",
+            "--games-per-pairing",
+            "2",
+            "--max-steps",
+            "3",
+            "--force-ply",
+            "1",
+            "--force-actions",
+            "0,1",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["game"] == "othello"
+    assert payload["target_ply"] == 1
+    assert payload["replay_simulations"] == 1
+    assert payload["continuation_simulations"] == 1
+    assert payload["force_actor_role"] == "player_a"
+    assert [entry["action"] for entry in payload["actions"]] == [0, 1]
+    assert "forced_result" in payload["actions"][0]
+    assert "target_default_action_counts" in payload["actions"][0]
+
+
 def test_checkpoint_elo_imports_without_c4_solver_dependency() -> None:
     code = (
         "import sys, jaxzero.checkpoint_elo; "
