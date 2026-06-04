@@ -484,3 +484,35 @@ as the simulation budget increases, and `action` can differ from the largest
 selection for the played move. The 32-sim ResNet sweep should therefore be
 treated as an evaluator artifact, not evidence that the ResNet checkpoint is
 better than the transformer checkpoint.
+
+## 2026-06-04 Forced-Action Continuation
+
+Bead: `alphago-ski`
+
+Added `jaxzero-checkpoint-elo --force-ply` and Modal runner support to replay to
+a target ply, force candidate moves on one actor's lanes, then continue to
+terminal states with a separate MCTS budget.
+
+Target was the same ResNet s102 `iter_0080` versus transformer s103 `final`
+state: seed `1099128568`, replay budget 24 sims, target ply 10, force actor
+`iter_0080`, 17 ResNet-controlled lanes.
+
+Forced candidates: `38`, `46`, `39`, `54`, `23`.
+
+| Continuation sims | Action 38 | Action 46 | Action 39 | Action 54 | Action 23 | Default target action |
+| ---: | --- | --- | --- | --- | --- | --- |
+| 64 | `0-17` | `0-17` | `0-17` | `0-17` | `0-17` | `46` |
+| 256 | `17-0` | `0-17` | `0-17` | `0-17` | `0-17` | `39` |
+
+Scores are from ResNet/player-a perspective on the 17 forced lanes only. Modal
+apps: `ap-od8aBwpHXafrvVbRG5gJQD` for 64-sim continuation and
+`ap-imuxBWKWUofLSOxyC6VCDe` for 256-sim continuation.
+
+Read: the 32-sim action `46` is bad under both continuation checks. The 24-sim
+action `38` is the only tested action that wins under the higher 256-sim
+continuation, but it loses under the 64-sim continuation. This reinforces that
+the Othello evaluator is not stable enough for architecture decisions: even the
+post-forced continuation result depends sharply on MCTS budget. A useful next
+step is to stop using raw low-budget Gumbel action as the model-selection metric
+and build a stabilized evaluator around repeated high-budget continuations or a
+different deterministic root decision rule.
