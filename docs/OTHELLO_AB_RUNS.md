@@ -516,3 +516,51 @@ post-forced continuation result depends sharply on MCTS budget. A useful next
 step is to stop using raw low-budget Gumbel action as the model-selection metric
 and build a stabilized evaluator around repeated high-budget continuations or a
 different deterministic root decision rule.
+
+## 2026-06-04 Checkpoint Stability Sweep
+
+Bead: `alphago-fuf`
+
+Added `jaxzero-checkpoint-elo --stability-budgets`,
+`--stability-seeds`, and `--stability-score-threshold`, plus Modal runner
+plumbing. Stability mode repeats the same checkpoint ladder across MCTS budgets
+and seeds, then flags pairings whose match-score verdict flips or whose score
+range exceeds the configured threshold.
+
+Top-contender stability command:
+
+```bash
+uv run --extra modal modal run jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-resnet-s102/othello/iter_0080.msgpack,othello-transformer-s102/othello/iter_0060.msgpack,othello-transformer-s103/othello/final.msgpack" \
+  --mode round-robin \
+  --games-per-pairing 32 \
+  --fit-iterations 300 \
+  --stability-budgets "16,24,32" \
+  --stability-seeds "1" \
+  --stability-score-threshold 0.25
+```
+
+Modal app: `ap-KbeAhwTKlbLSRnaPcbT3gZ`. Runtime was 351.4 seconds for
+288 games across 9 pairing runs.
+
+| Pairing | 16 sims | 24 sims | 32 sims | Score range | Stability read |
+| --- | --- | --- | --- | ---: | --- |
+| `resnet-s102 iter_0080` vs `transformer-s103 final` | `0-32` | `0-32` | `32-0` | 1.000 | Verdict flip |
+| `resnet-s102 iter_0080` vs `transformer-s102 iter_0060` | `0-32` | `16-16` | `16-16` | 0.500 | Exceeds threshold |
+| `transformer-s102 iter_0060` vs `transformer-s103 final` | `15-17` | `17-15` | `15-17` | 0.062 | Verdict flip |
+
+Best checkpoint by budget:
+
+| MCTS sims | Best checkpoint | Elo |
+| ---: | --- | ---: |
+| 16 | `transformer-s103 final` | 771.8 |
+| 24 | `transformer-s103 final` | 251.7 |
+| 32 | `resnet-s102 iter_0080` | 0.0 |
+
+Read: the evaluator is explicitly unstable on the top Othello contenders. The
+old 32-sim result favoring ResNet is not a reliable architecture verdict,
+because the same pairing is a transformer sweep at 16 and 24 sims. Do not move
+Othello model selection forward on single-budget MCTS Elo. The next decision
+gate should use stability sweeps with more seeds and/or a higher-budget
+deterministic decision rule before any architecture switch is treated as real.
