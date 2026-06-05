@@ -37,7 +37,11 @@ def test_jaxzero_modal_train_imports_without_modal_installed(monkeypatch) -> Non
     with pytest.raises(RuntimeError, match="uv sync --extra modal"):
         module.checkpoint_elo_remote()
     with pytest.raises(RuntimeError, match="uv sync --extra modal"):
+        module.c4_certify_remote()
+    with pytest.raises(RuntimeError, match="uv sync --extra modal"):
         module.checkpoint_elo()
+    with pytest.raises(RuntimeError, match="uv sync --extra modal"):
+        module.c4_certify()
 
 
 def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
@@ -46,6 +50,7 @@ def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
             self.python_version = python_version
             self.packages: tuple[str, ...] = ()
             self.modules: tuple[str, ...] = ()
+            self.local_files: tuple[tuple[str, str], ...] = ()
 
         def pip_install(self, *packages: str):
             self.packages = packages
@@ -53,6 +58,10 @@ def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
 
         def add_local_python_source(self, *modules: str):
             self.modules = modules
+            return self
+
+        def add_local_file(self, local_path: str, *, remote_path: str):
+            self.local_files = (*self.local_files, (local_path, remote_path))
             return self
 
     class FakeImageFactory:
@@ -126,7 +135,10 @@ def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
         "wandb>=0.27.0",
     )
     assert module.image.modules == ("jaxzero", "alphazero")
-    assert len(module.app.functions) == 2
+    assert module.image.local_files == (
+        ("evalset.labels.json", "/root/evalset.labels.json"),
+    )
+    assert len(module.app.functions) == 3
     train_options = module.app.functions[0].options
     assert train_options["image"] is module.image
     assert train_options["gpu"] == "A10G"
@@ -139,6 +151,12 @@ def test_jaxzero_modal_train_registers_gpu_function(monkeypatch) -> None:
     assert elo_options["timeout"] == 6 * 60 * 60
     assert "secrets" not in elo_options
     assert elo_options["volumes"]["/checkpoints"].name == "alphazero-checkpoints"
+    cert_options = module.app.functions[2].options
+    assert cert_options["image"] is module.image
+    assert cert_options["gpu"] == "A100-40GB"
+    assert cert_options["timeout"] == 6 * 60 * 60
+    assert "secrets" not in cert_options
+    assert cert_options["volumes"]["/checkpoints"].name == "alphazero-checkpoints"
     assert module.app.entrypoint is not None
 
 
@@ -208,6 +226,9 @@ def test_jaxzero_modal_train_checkpoint_paths(monkeypatch) -> None:
 def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> None:
     class FakeImage:
         def pip_install(self, *packages: str):
+            return self
+
+        def add_local_file(self, local_path: str, *, remote_path: str):
             return self
 
         def add_local_python_source(self, *modules: str):
@@ -491,9 +512,175 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
     assert stability_result["modal_metrics"]["modal_checkpoint_elo_games"] == 32
 
 
+def test_jaxzero_modal_c4_certify_remote_uses_cached_labels_and_volume(
+    monkeypatch,
+) -> None:
+    class FakeImage:
+        def pip_install(self, *packages: str):
+            return self
+
+        def add_local_file(self, local_path: str, *, remote_path: str):
+            return self
+
+        def add_local_python_source(self, *modules: str):
+            return self
+
+    class FakeImageFactory:
+        @staticmethod
+        def debian_slim(python_version: str | None = None) -> FakeImage:
+            return FakeImage()
+
+    class FakeApp:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def function(self, **options):
+            def decorate(func):
+                return func
+
+            return decorate
+
+        def local_entrypoint(self):
+            def decorate(func):
+                return func
+
+            return decorate
+
+    class FakeSecret:
+        @staticmethod
+        def from_name(name: str) -> SimpleNamespace:
+            return SimpleNamespace(name=name)
+
+    class FakeVolume:
+        @staticmethod
+        def from_name(name: str, create_if_missing: bool = False) -> "FakeVolume":
+            return FakeVolume()
+
+    fake_modal = SimpleNamespace(
+        App=FakeApp,
+        Image=FakeImageFactory,
+        Secret=FakeSecret,
+        Volume=FakeVolume,
+    )
+    monkeypatch.setitem(sys.modules, "modal", fake_modal)
+    module = load_jax_modal_train()
+
+    import alphazero.c4_certify as c4_certify_module
+
+    positions = [SimpleNamespace(id="p0"), SimpleNamespace(id="p1")]
+    labels = [{"id": "l0"}, {"id": "l1"}]
+    captured: dict[str, object] = {}
+
+    def fake_load_eval_labels(path):
+        captured["eval_labels"] = path
+        return positions, labels
+
+    class FakeReport:
+        def as_dict(self):
+            return {
+                "evaluated_positions": 2,
+                "blunders": 1,
+                "mean_wdl_regret": 0.5,
+            }
+
+    def fake_certify_checkpoint_batched(checkpoint, cert_positions, **kwargs):
+        captured["single"] = {
+            "checkpoint": checkpoint,
+            "positions": cert_positions,
+            **kwargs,
+        }
+        return FakeReport()
+
+    class FakeLadder:
+        def as_dict(self):
+            return {
+                "best_checkpoint": "/checkpoints/run/connectfour/iter_0010.msgpack",
+                "checkpoints": [],
+            }
+
+    def fake_resolve_checkpoint_ladder_paths(checkpoint_dir):
+        captured["checkpoint_dir"] = checkpoint_dir
+        return [
+            Path("/checkpoints/run/connectfour/iter_0010.msgpack"),
+            Path("/checkpoints/run/connectfour/final.msgpack"),
+            Path("/checkpoints/run/connectfour/notes.txt"),
+        ]
+
+    def fake_certify_checkpoint_ladder(checkpoints, cert_positions, **kwargs):
+        captured["ladder"] = {
+            "checkpoints": list(checkpoints),
+            "positions": cert_positions,
+            **kwargs,
+        }
+        return FakeLadder()
+
+    monkeypatch.setattr(c4_certify_module, "load_eval_labels", fake_load_eval_labels)
+    monkeypatch.setattr(
+        c4_certify_module, "certify_checkpoint_batched", fake_certify_checkpoint_batched
+    )
+    monkeypatch.setattr(
+        c4_certify_module,
+        "resolve_checkpoint_ladder_paths",
+        fake_resolve_checkpoint_ladder_paths,
+    )
+    monkeypatch.setattr(
+        c4_certify_module, "certify_checkpoint_ladder", fake_certify_checkpoint_ladder
+    )
+
+    single = module.c4_certify_remote(
+        checkpoint_path="run/connectfour/final.msgpack",
+        eval_labels="/root/evalset.labels.json",
+        sims=800,
+        seed=7,
+        gumbel_scale=0.0,
+        requested_gpu="A100-40GB",
+    )
+
+    assert captured["eval_labels"] == "/root/evalset.labels.json"
+    assert captured["single"]["checkpoint"] == (
+        "/checkpoints/run/connectfour/final.msgpack"
+    )
+    assert captured["single"]["positions"] is positions
+    assert captured["single"]["labels"] is labels
+    assert captured["single"]["sims"] == 800
+    assert captured["single"]["seed"] == 7
+    assert captured["single"]["gumbel_scale"] == 0.0
+    assert single["checkpoint"] == "/checkpoints/run/connectfour/final.msgpack"
+    assert single["checkpoint_volume"] == "alphazero-checkpoints"
+    assert single["requested_gpu"] == "A100-40GB"
+    assert single["modal_metrics"]["modal_c4_certify_checkpoints"] == 1
+    assert single["modal_metrics"]["modal_c4_certify_positions"] == 2
+    assert single["eval_labels"] == "/root/evalset.labels.json"
+
+    ladder = module.c4_certify_remote(
+        checkpoint_dir="run/connectfour",
+        pattern="iter_*.msgpack",
+        sims=400,
+        seed=3,
+    )
+
+    assert captured["checkpoint_dir"] == "/checkpoints/run/connectfour"
+    assert captured["ladder"]["checkpoints"] == [
+        Path("/checkpoints/run/connectfour/iter_0010.msgpack")
+    ]
+    assert captured["ladder"]["positions"] is positions
+    assert captured["ladder"]["labels"] is labels
+    assert captured["ladder"]["sims"] == 400
+    assert captured["ladder"]["seed"] == 3
+    assert captured["ladder"]["batched"] is True
+    assert ladder["best_checkpoint"] == "/checkpoints/run/connectfour/iter_0010.msgpack"
+    assert ladder["modal_metrics"]["modal_c4_certify_checkpoints"] == 1
+    assert ladder["checkpoint_paths"] == [
+        "/checkpoints/run/connectfour/iter_0010.msgpack"
+    ]
+
+
 def test_jaxzero_modal_remote_runs_training_and_commits_volume(monkeypatch) -> None:
     class FakeImage:
         def pip_install(self, *packages: str):
+            return self
+
+        def add_local_file(self, local_path: str, *, remote_path: str):
             return self
 
         def add_local_python_source(self, *modules: str):

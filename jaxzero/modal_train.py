@@ -19,8 +19,10 @@ from jaxzero.game_specs import (
 WANDB_PROJECT_PREFIX = "alphazero"
 _DEFAULT_GPU = "A10G"
 _DEFAULT_CHECKPOINT_ELO_GPU = "A100-40GB"
+_DEFAULT_C4_CERTIFY_GPU = "A100-40GB"
 _CHECKPOINT_VOLUME_NAME = "alphazero-checkpoints"
 _CHECKPOINT_MOUNT = "/checkpoints"
+_C4_EVAL_LABELS_IMAGE_PATH = "/root/evalset.labels.json"
 _AUTO_MAX_STEPS = -1
 _AUTO_SOLVER_EVAL_POSITIONS = -1
 
@@ -194,10 +196,16 @@ if modal is None:
     def checkpoint_elo_remote(*args, **kwargs):
         raise _modal_missing()
 
+    def c4_certify_remote(*args, **kwargs):
+        raise _modal_missing()
+
     def main(*args, **kwargs) -> None:
         raise _modal_missing()
 
     def checkpoint_elo(*args, **kwargs) -> None:
+        raise _modal_missing()
+
+    def c4_certify(*args, **kwargs) -> None:
         raise _modal_missing()
 
 else:
@@ -215,6 +223,7 @@ else:
             "optax>=0.2.8",
             "wandb>=0.27.0",
         )
+        .add_local_file("evalset.labels.json", remote_path=_C4_EVAL_LABELS_IMAGE_PATH)
         .add_local_python_source("jaxzero", "alphazero")
     )
 
@@ -669,6 +678,97 @@ else:
         payload["checkpoint_paths"] = [str(path) for path in resolved_paths]
         return payload
 
+    @app.function(
+        image=image,
+        gpu=_DEFAULT_C4_CERTIFY_GPU,
+        timeout=6 * 60 * 60,
+        volumes={_CHECKPOINT_MOUNT: checkpoint_volume},
+    )
+    def c4_certify_remote(
+        checkpoint_path: str | None = None,
+        checkpoint_dir: str | None = None,
+        pattern: str = "*.msgpack",
+        eval_labels: str = _C4_EVAL_LABELS_IMAGE_PATH,
+        sims: int = 800,
+        seed: int = 0,
+        gumbel_scale: float = 0.0,
+        solver_max_nodes: int = 250_000,
+        requested_gpu: str = _DEFAULT_C4_CERTIFY_GPU,
+    ) -> dict[str, object]:
+        from alphazero.c4_certify import (
+            certify_checkpoint_batched,
+            certify_checkpoint_ladder,
+            load_eval_labels,
+            resolve_checkpoint_ladder_paths,
+        )
+
+        if checkpoint_path is not None and checkpoint_dir is not None:
+            raise ValueError(
+                "checkpoint_path and checkpoint_dir are mutually exclusive"
+            )
+        if checkpoint_path is None and checkpoint_dir is None:
+            raise ValueError("checkpoint_path or checkpoint_dir is required")
+
+        positions, labels = load_eval_labels(eval_labels)
+        started = time.perf_counter()
+        if checkpoint_dir is not None:
+            volume_checkpoint_dir = _checkpoint_volume_path(checkpoint_dir)
+            checkpoint_paths = [
+                path
+                for path in resolve_checkpoint_ladder_paths(volume_checkpoint_dir)
+                if path.match(pattern)
+            ]
+            if not checkpoint_paths:
+                raise ValueError(
+                    f"no checkpoints matching {pattern!r} found in "
+                    f"{volume_checkpoint_dir}"
+                )
+            ladder = certify_checkpoint_ladder(
+                checkpoint_paths,
+                positions,
+                labels=labels,
+                sims=sims,
+                seed=seed,
+                solver_max_nodes=solver_max_nodes,
+                gumbel_scale=gumbel_scale,
+                batched=True,
+            )
+            payload = ladder.as_dict()
+            checkpoint_count = len(checkpoint_paths)
+            resolved_paths = [str(path) for path in checkpoint_paths]
+        else:
+            volume_checkpoint_path = _checkpoint_volume_path(checkpoint_path)
+            report = certify_checkpoint_batched(
+                volume_checkpoint_path,
+                positions,
+                labels=labels,
+                sims=sims,
+                seed=seed,
+                solver_max_nodes=solver_max_nodes,
+                gumbel_scale=gumbel_scale,
+            )
+            payload = {
+                "checkpoint": volume_checkpoint_path,
+                **report.as_dict(),
+            }
+            checkpoint_count = 1
+            resolved_paths = [volume_checkpoint_path]
+
+        elapsed = max(time.perf_counter() - started, 1e-12)
+        payload["modal_metrics"] = {
+            "modal_c4_certify_seconds": elapsed,
+            "modal_c4_certify_checkpoints": checkpoint_count,
+            "modal_c4_certify_positions": len(positions),
+        }
+        payload["checkpoint_volume"] = _CHECKPOINT_VOLUME_NAME
+        payload["requested_gpu"] = requested_gpu
+        payload["checkpoint_paths"] = resolved_paths
+        payload["eval_labels"] = eval_labels
+        payload["sims"] = sims
+        payload["seed"] = seed
+        payload["gumbel_scale"] = gumbel_scale
+        return payload
+
     @app.local_entrypoint()
     def main(
         game: str = DEFAULT_GAME,
@@ -885,4 +985,57 @@ else:
             return
 
         result = remote_elo.remote(**kwargs)
+        print(json.dumps(result, indent=2, sort_keys=True))
+
+    @app.local_entrypoint()
+    def c4_certify(
+        checkpoint: str = "",
+        checkpoint_dir: str | None = None,
+        pattern: str = "*.msgpack",
+        eval_labels: str = _C4_EVAL_LABELS_IMAGE_PATH,
+        sims: int = 800,
+        seed: int = 0,
+        gumbel_scale: float = 0.0,
+        solver_max_nodes: int = 250_000,
+        gpu: str = _DEFAULT_C4_CERTIFY_GPU,
+        spawn: bool = False,
+    ) -> None:
+        checkpoint_ref = checkpoint or None
+        if checkpoint_ref is not None and checkpoint_dir is not None:
+            raise ValueError("--checkpoint and --checkpoint-dir are mutually exclusive")
+        if checkpoint_ref is None and checkpoint_dir is None:
+            raise ValueError("--checkpoint or --checkpoint-dir is required")
+
+        remote_certify = (
+            c4_certify_remote.with_options(gpu=gpu)
+            if gpu != _DEFAULT_C4_CERTIFY_GPU
+            else c4_certify_remote
+        )
+        kwargs = dict(
+            checkpoint_path=checkpoint_ref,
+            checkpoint_dir=checkpoint_dir,
+            pattern=pattern,
+            eval_labels=eval_labels,
+            sims=sims,
+            seed=seed,
+            gumbel_scale=gumbel_scale,
+            solver_max_nodes=solver_max_nodes,
+            requested_gpu=gpu,
+        )
+        if spawn:
+            function_call = remote_certify.spawn(**kwargs)
+            print(
+                json.dumps(
+                    {
+                        "function_call_id": _function_call_id(function_call),
+                        "checkpoint": checkpoint_ref,
+                        "checkpoint_dir": checkpoint_dir,
+                        "gpu": gpu,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
+
+        result = remote_certify.remote(**kwargs)
         print(json.dumps(result, indent=2, sort_keys=True))

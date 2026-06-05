@@ -161,10 +161,18 @@ python -m alphazero.c4_certify --checkpoint final.msgpack --eval-set evalset.jso
 python -m alphazero.c4_certify --checkpoint final.msgpack --eval-set evalset.json \
   --sims 800 --batched --eval-labels evalset.labels.json
 
+# Or certify a checkpoint directly on the Modal checkpoint Volume with an A100.
+uv run --extra modal modal run jaxzero/modal_train.py::c4_certify \
+  --checkpoint run-tag/connectfour/final.msgpack --sims 800
+
 # Certify every periodic checkpoint in a local directory and pick the best
 # solver-scored checkpoint (mean_wdl_regret, then weak blunder).
 python -m alphazero.c4_certify --checkpoint-dir checkpoints/run/connectfour \
   --eval-labels evalset.labels.json --batched --sims 800
+
+# The same checkpoint-ladder cert can run on Modal without downloading the run.
+uv run --extra modal modal run jaxzero/modal_train.py::c4_certify \
+  --checkpoint-dir run-tag/connectfour --sims 800
 ```
 
 Train with solver-supervised hard-position rehearsal:
