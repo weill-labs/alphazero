@@ -14,6 +14,7 @@ from alphazero.elo_ladder import (
     evaluate_player_ladder,
     fit_elo_ratings,
     play_match,
+    resolve_checkpoint_paths,
 )
 from alphazero.games.connectfour import ConnectFour, ConnectFourState
 from jaxzero.net import AlphaZeroNetConfig, create_model
@@ -125,6 +126,27 @@ def test_play_match_uses_agent_move_on_connect_four() -> None:
     )
 
     assert (wins_a, draws, wins_b) == (1, 0, 0)
+
+
+def test_resolve_checkpoint_paths_sorts_final_after_iter_checkpoints(
+    tmp_path,
+) -> None:
+    for name in [
+        "final.msgpack",
+        "iter_0010.msgpack",
+        "iter_0002.msgpack",
+        "iter_0100.msgpack",
+    ]:
+        (tmp_path / name).touch()
+
+    paths = resolve_checkpoint_paths(checkpoint_dir=tmp_path)
+
+    assert [path.name for path in paths] == [
+        "iter_0002.msgpack",
+        "iter_0010.msgpack",
+        "iter_0100.msgpack",
+        "final.msgpack",
+    ]
 
 
 def test_checkpoint_ladder_loads_jax_agents(tmp_path) -> None:

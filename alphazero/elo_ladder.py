@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -373,11 +374,12 @@ def resolve_checkpoint_paths(
     checkpoint_dir: str | Path | None = None,
     pattern: str = "*.msgpack",
 ) -> list[Path]:
-    """Resolve explicit checkpoint paths plus an optional sorted directory glob."""
+    """Resolve explicit checkpoint paths plus an optional training-order glob."""
 
     paths = [Path(path) for path in checkpoints]
     if checkpoint_dir is not None:
-        paths.extend(sorted(Path(checkpoint_dir).glob(pattern)))
+        root = Path(checkpoint_dir).expanduser()
+        paths.extend(sorted(root.glob(pattern), key=_checkpoint_ladder_sort_key))
 
     unique_paths: list[Path] = []
     seen: set[Path] = set()
@@ -388,6 +390,15 @@ def resolve_checkpoint_paths(
         unique_paths.append(normalized)
         seen.add(normalized)
     return unique_paths
+
+
+def _checkpoint_ladder_sort_key(path: Path) -> tuple[int, int, str]:
+    match = re.fullmatch(r"iter_(\d+)\.msgpack", path.name)
+    if match is not None:
+        return (0, int(match.group(1)), path.name)
+    if path.name == "final.msgpack":
+        return (1, 0, path.name)
+    return (2, 0, path.name)
 
 
 def log_elo_curve(
