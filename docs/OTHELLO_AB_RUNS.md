@@ -564,3 +564,48 @@ because the same pairing is a transformer sweep at 16 and 24 sims. Do not move
 Othello model selection forward on single-budget MCTS Elo. The next decision
 gate should use stability sweeps with more seeds and/or a higher-budget
 deterministic decision rule before any architecture switch is treated as real.
+
+## 2026-06-05 High-Confidence Stability Gate
+
+Bead: `alphago-2eu`
+
+Repeated the top-contender gate with three evaluator seeds and higher budgets:
+
+```bash
+uv run --extra modal modal run jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-resnet-s102/othello/iter_0080.msgpack,othello-transformer-s102/othello/iter_0060.msgpack,othello-transformer-s103/othello/final.msgpack" \
+  --mode round-robin \
+  --games-per-pairing 32 \
+  --fit-iterations 300 \
+  --stability-budgets "24,32,64,128" \
+  --stability-seeds "1,2,3" \
+  --stability-score-threshold 0.25
+```
+
+Modal app: `ap-rA6ltbvAYaiEfPh3h3asrt`. Runtime was 1724.5 seconds for
+1152 games across 36 pairing runs. Overall stability verdict was `false`.
+
+Per-seed pairing scores:
+
+| Pairing | 24 sims | 32 sims | 64 sims | 128 sims | Score range | Verdict counts |
+| --- | --- | --- | --- | --- | ---: | --- |
+| `resnet-s102 iter_0080` vs `transformer-s103 final` | `0-32`, `0-32`, `0-32` | `32-0`, `32-0`, `32-0` | `0-32`, `0-32`, `0-32` | `0-32`, `0-32`, `0-32` | 1.000 | ResNet 3, transformer 9 |
+| `resnet-s102 iter_0080` vs `transformer-s102 iter_0060` | `16-16`, `19-13`, `19-13` | `16-16`, `13-19`, `13-19` | `0-32`, `0-32`, `0-32` | `0-32`, `0-32`, `0-32` | 0.594 | ResNet 2, transformer 8, tie 2 |
+| `transformer-s102 iter_0060` vs `transformer-s103 final` | `17-15`, `18-14`, `16-16` | `15-17`, `14-18`, `16-16` | `0-32`, `0-32`, `0-32` | `15-17`, `14-18`, `16-16` | 0.562 | `iter_0060` 2, `final` 7, tie 3 |
+
+Best checkpoint counts across the 12 budget/seed runs:
+
+| Checkpoint | Best-count | Mean Elo | Elo range |
+| --- | ---: | ---: | ---: |
+| `transformer-s103 final` | 8 | 485.8 | 1423.1 |
+| `resnet-s102 iter_0080` | 3 | 0.0 | 0.0 |
+| `transformer-s102 iter_0060` | 1 | 334.0 | 902.3 |
+
+Read: the full grid is still unstable, but it isolates the problem. The
+32-sim row is a pathological outlier: ResNet sweeps `transformer-s103 final`
+only at 32 sims, while 24, 64, and 128 sims all sweep the same pairing for the
+transformer across every seed. The architecture recommendation is therefore to
+keep the Othello transformer default and discard the 32-sim ResNet verdict as
+an evaluator artifact. The remaining instability is within transformer
+checkpoint ranking and evaluator design, not ResNet versus transformer.
