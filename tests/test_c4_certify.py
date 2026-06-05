@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -12,6 +13,7 @@ from alphazero.c4_certify import (
     certify_checkpoint_ladder,
     certify_checkpoint_batched,
     certify_connect_four,
+    load_eval_set,
     load_eval_labels,
     pgx_state_to_solver_state,
     precompute_solver_labels,
@@ -322,13 +324,25 @@ def test_eval_set_roundtrip_and_paired_certification(tmp_path) -> None:
 
 def test_build_eval_set_cli_creates_loadable_file(tmp_path) -> None:
     """The --build-eval-set CLI path writes a file that load_eval_set accepts."""
-    from alphazero.c4_certify import load_eval_set, main
+    from alphazero.c4_certify import main
 
     path = tmp_path / "set.json"
     rc = main(["--build-eval-set", str(path), "--sample-size", "5", "--seed", "1"])
     assert rc == 0
     assert path.exists()
     assert len(load_eval_set(path)) == 5
+
+
+def test_committed_canonical_eval_artifacts_load() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+
+    positions = load_eval_set(repo_root / "evalset.json")
+    label_positions, labels = load_eval_labels(repo_root / "evalset.labels.json")
+
+    assert len(positions) == 1024
+    assert len(label_positions) == 851
+    assert len(labels) == 851
+    assert label_positions[0] in positions
 
 
 def test_parallel_certify_matches_serial(tmp_path) -> None:

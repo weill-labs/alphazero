@@ -135,9 +135,19 @@ run), not the 30-min experiment budget used for the lever sweeps.
 
 ## Using the tools
 
+The repo includes canonical C4 certification artifacts built with
+`--sample-size 1024 --seed 0`:
+
+- `evalset.json`: 1024 sampled positions.
+- `evalset.labels.json`: 851 kept solver-labeled positions; 173 sampled
+  positions were skipped by the solver/terminal filters.
+
+Use these files for cross-run comparisons unless a bead explicitly calls for a
+new held-out set.
+
 ```bash
 # Build a fixed eval set once (reused for paired comparison across runs).
-python -m alphazero.c4_certify --build-eval-set evalset.json --sample-size 256 --seed 0
+python -m alphazero.c4_certify --build-eval-set evalset.json --sample-size 1024 --seed 0
 
 # Precompute + cache solver labels for that set once (removes the solver
 # bottleneck from every later cert).
