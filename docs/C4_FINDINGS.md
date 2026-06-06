@@ -187,6 +187,34 @@ still a material improvement over both final checkpoints and should be treated
 as the current best known C4 model. The main lesson is operational: **certify the
 checkpoint ladder before declaring the run's quality.**
 
+### Canonical-label Modal recert
+
+After committing the canonical cached labels (`evalset.labels.json`), we
+recertified the capstone `trjd57fm` ladder on Modal A100 with zero solver calls
+at cert time:
+
+```bash
+uv run --extra modal modal run jaxzero/modal_train.py::c4_certify \
+  --checkpoint-dir trjd57fm/connectfour --sims 800
+```
+
+Modal app: `ap-7fH6GkY1SCH84wZDsG0Zuu`. Runtime was 163.9 seconds for seven
+checkpoints over the 851 cached labels.
+
+| Checkpoint | Weak blunders | Mean WDL regret | Policy match | Value MAE |
+| --- | ---: | ---: | ---: | ---: |
+| `iter_0025` | 29/851 = 0.0341 | 0.0541 | 96.59% | 0.940 |
+| `iter_0050` | **20/851 = 0.0235** | **0.0411** | **97.65%** | 0.946 |
+| `iter_0075` | **20/851 = 0.0235** | **0.0411** | **97.65%** | 0.946 |
+| `iter_0100` | **20/851 = 0.0235** | **0.0411** | **97.65%** | 0.946 |
+| `iter_0125` | 27/851 = 0.0317 | 0.0505 | 96.83% | 0.941 |
+| `iter_0150` | 29/851 = 0.0341 | 0.0576 | 96.59% | 0.946 |
+| `final` | 29/851 = 0.0341 | 0.0576 | 96.59% | 0.946 |
+
+This confirms the previous 1024-sample verdict under the new paired canonical
+set: the `iter_0050`/`iter_0075`/`iter_0100` plateau is best, and the ladder
+selection rule reports `iter_0050` as the first best checkpoint.
+
 ## The central scientific finding: value/policy decoupling
 
 Three independent results point at the same conclusion:

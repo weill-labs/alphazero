@@ -109,15 +109,17 @@ reliably. A later deterministic checkpoint ladder found a free checkpoint
 selection win: the capstone ResNet `trjd57fm/iter_0050` certified at
 **20/856 = 0.023** on a larger 1024-sample cert, better than both the same run's
 final checkpoint (**29/857 = 0.034**) and the sims=600 final (**30/859 =
-0.035**). This does not mean compute scale solved C4; it means periodic
-checkpoint selection matters, and final checkpoint metrics can hide the best
-model. The remaining bottleneck is still **policy fidelity on sharp tactical
-positions**, not value calibration. The hard-archive rehearsal follow-up
-improved the frozen-193 ladder but failed the 1024 cert (`rd6in41i/final`:
-`23/858 = 0.0268`), confirming that small-set wins can still trade failures.
-See the full **[C4_FINDINGS.md](C4_FINDINGS.md)** report for the complete
-results, the capstone, the sims=600 residual-gap test, the checkpoint ladder,
-and the value/policy decoupling/failure-overlap findings.
+0.035**). The later Modal canonical-label recert on the committed 851-label set
+confirmed the same result: `trjd57fm/iter_0050` scored **20/851 = 0.0235** with
+mean WDL regret **0.0411**. This does not mean compute scale solved C4; it means
+periodic checkpoint selection matters, and final checkpoint metrics can hide the
+best model. The remaining bottleneck is still **policy fidelity on sharp
+tactical positions**, not value calibration. The hard-archive rehearsal
+follow-up improved the frozen-193 ladder but failed the 1024 cert
+(`rd6in41i/final`: `23/858 = 0.0268`), confirming that small-set wins can still
+trade failures. See the full **[C4_FINDINGS.md](C4_FINDINGS.md)** report for the
+complete results, the capstone, the sims=600 residual-gap test, the checkpoint
+ladder, and the value/policy decoupling/failure-overlap findings.
 
 ## SOTA-scale run: cost
 
