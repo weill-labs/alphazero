@@ -648,3 +648,39 @@ Evaluation plan: once checkpoints are present, compare this run's ladder against
 the existing top Othello transformers with the stability sweep, not single-row
 MCTS Elo. Use `--stability-budgets "24,32,64,128"` and at least seeds `1,2,3`
 before making any model-selection claim.
+
+Training completed on 2026-06-07. W&B final state: `finished`, summary
+iteration `79`, `eval/vs_random_win_rate=0.96875`, `loss=1.2407180070877075`.
+Published checkpoints:
+
+- `othello-transformer-s201/othello/iter_0020.msgpack`
+- `othello-transformer-s201/othello/iter_0040.msgpack`
+- `othello-transformer-s201/othello/iter_0060.msgpack`
+- `othello-transformer-s201/othello/iter_0080.msgpack`
+- `othello-transformer-s201/othello/final.msgpack`
+
+Launched targeted high-confidence stability gate against the prior top
+transformers and mature `s201` checkpoints:
+
+```bash
+setsid bash -c 'uv run --extra modal modal run --detach jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-transformer-s103/othello/final.msgpack,othello-transformer-s102/othello/iter_0060.msgpack,othello-transformer-s201/othello/iter_0060.msgpack,othello-transformer-s201/othello/iter_0080.msgpack,othello-transformer-s201/othello/final.msgpack" \
+  --mode round-robin \
+  --games-per-pairing 32 \
+  --fit-iterations 300 \
+  --stability-budgets "24,32,64,128" \
+  --stability-seeds "1,2,3" \
+  --stability-score-threshold 0.25 \
+  --gpu A100-40GB' < /dev/null > /tmp/othello-s201-stability-20260607-0202.modal.log 2>&1 &
+```
+
+Launch identifiers:
+
+- Modal app: `ap-LNtCL9x3478TMht17wAtnx`
+- Local log: `/tmp/othello-s201-stability-20260607-0202.modal.log`
+- Scope: 5 checkpoints, round-robin, 10 pairings per budget/seed, 3840 games
+  total across 12 budget/seed rows.
+- Note: a preceding `--spawn` attempt returned
+  `fc-01KTFWX2YTY49W9XY4TMXCFDZE` and then `RemoteError`; ignore it for
+  verdict purposes.
