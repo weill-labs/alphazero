@@ -609,3 +609,42 @@ transformer across every seed. The architecture recommendation is therefore to
 keep the Othello transformer default and discard the 32-sim ResNet verdict as
 an evaluator artifact. The remaining instability is within transformer
 checkpoint ranking and evaluator design, not ResNet versus transformer.
+
+## 2026-06-07 Othello Transformer Pivot Run
+
+Bead: `alphago-wwx`
+
+Launched the first post-C4 Othello track run using the current default Othello
+transformer architecture. This is intentionally not a C4 follow-up and not a
+new architecture sweep; it is a fresh default-transformer run to move the active
+workstream back to bigger boards.
+
+```bash
+setsid bash -c 'uv run --extra modal modal run --detach jaxzero/modal_train.py::main \
+  --game othello \
+  --iterations 80 \
+  --batch-size 128 \
+  --num-simulations 64 \
+  --checkpoint-every 20 \
+  --eval-interval 20 \
+  --eval-games 64 \
+  --replay-capacity 65536 \
+  --minibatch-size 2048 \
+  --learning-rate 0.001 \
+  --solver-eval-positions 0 \
+  --seed 201 \
+  --run-tag othello-transformer-s201 \
+  --gpu A100-40GB' < /dev/null > /tmp/othello-transformer-s201.modal.log 2>&1 &
+```
+
+Launch identifiers:
+
+- Modal app: `ap-BD4WRPdfIO8dvwzeQ763dm`
+- W&B run: `cg5cg3fm`
+- Checkpoint dir: `/checkpoints/othello-transformer-s201/othello/`
+- Local log: `/tmp/othello-transformer-s201.modal.log`
+
+Evaluation plan: once checkpoints are present, compare this run's ladder against
+the existing top Othello transformers with the stability sweep, not single-row
+MCTS Elo. Use `--stability-budgets "24,32,64,128"` and at least seeds `1,2,3`
+before making any model-selection claim.
