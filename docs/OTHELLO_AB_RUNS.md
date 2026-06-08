@@ -684,3 +684,55 @@ Launch identifiers:
 - Note: a preceding `--spawn` attempt returned
   `fc-01KTFWX2YTY49W9XY4TMXCFDZE` and then `RemoteError`; ignore it for
   verdict purposes.
+
+Result: completed on 2026-06-08. Runtime was 4740.7 seconds for 3840 games
+across 120 pairing runs. Overall stability verdict was `false`.
+
+Best checkpoint counts across the 12 budget/seed runs:
+
+| Checkpoint | Best-count | Mean Elo | Elo range |
+| --- | ---: | ---: | ---: |
+| `s201/iter_0060` | 6 | 161.8 | 841.5 |
+| `s201/iter_0080` | 3 | 143.9 | 1104.2 |
+| `s201/final` | 2 | 129.3 | 1082.0 |
+| `transformer-s103/final` | 1 | 0.0 | 0.0 |
+| `transformer-s102/iter_0060` | 0 | -281.8 | 474.9 |
+
+Best checkpoint counts by MCTS budget:
+
+| MCTS sims | Best-counts |
+| ---: | --- |
+| 24 | `s201/iter_0060`: 3 |
+| 32 | `s201/iter_0060`: 3 |
+| 64 | `s201/final`: 2, `transformer-s103/final`: 1 |
+| 128 | `s201/iter_0080`: 3 |
+
+Stable pairings:
+
+| Pairing | Score range | Verdict counts | Read |
+| --- | ---: | --- | --- |
+| `transformer-s102/iter_0060` vs `s201/iter_0080` | 0.000 | `s201/iter_0080`: 12 | `s201/iter_0080` swept old `s102` |
+| `transformer-s102/iter_0060` vs `s201/final` | 0.000 | `s201/final`: 12 | `s201/final` swept old `s102` |
+
+Unstable pairings:
+
+| Pairing | Score range | Verdict counts |
+| --- | ---: | --- |
+| `transformer-s103/final` vs `transformer-s102/iter_0060` | 0.594 | `s103`: 5, `s102`: 4, tie: 3 |
+| `transformer-s103/final` vs `s201/iter_0060` | 1.000 | `s103`: 7, `s201/iter_0060`: 5 |
+| `transformer-s103/final` vs `s201/iter_0080` | 1.000 | `s103`: 3, `s201/iter_0080`: 7, tie: 2 |
+| `transformer-s103/final` vs `s201/final` | 1.000 | `s103`: 5, `s201/final`: 3, tie: 4 |
+| `transformer-s102/iter_0060` vs `s201/iter_0060` | 0.734 | `s102`: 3, `s201/iter_0060`: 9 |
+| `s201/iter_0060` vs `s201/iter_0080` | 1.000 | `iter_0060`: 7, `iter_0080`: 4, tie: 1 |
+| `s201/iter_0060` vs `s201/final` | 1.000 | `iter_0060`: 6, `final`: 5, tie: 1 |
+| `s201/iter_0080` vs `s201/final` | 0.250 | `iter_0080`: 6, `final`: 6 |
+
+Read: `s201` is directionally better than the older `s102` checkpoint, because
+both `s201/iter_0080` and `s201/final` sweep `transformer-s102/iter_0060`
+across every budget/seed row. It is not a clean replacement for
+`transformer-s103/final`: every `s103` vs `s201` pairing is unstable with
+score range 1.0. Within `s201`, checkpoint selection is also unstable:
+`iter_0060` wins most often overall, `final` is strongest at 64 sims, and
+`iter_0080` is strongest at 128 sims. The model-training run is complete, but
+the current Othello evaluator is still the bottleneck for deciding the next
+checkpoint.
