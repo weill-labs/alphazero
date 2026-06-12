@@ -939,3 +939,51 @@ incumbent's high-budget search, not absolute move quality. The useful next
 question is the subset of positions where `s103` and `s201` disagree; those
 need forced-action continuations or an external/stronger teacher to determine
 whether `s201` is actually finding better moves or only disagreeing.
+
+## 2026-06-12 Forced-Action Disagreement Continuations
+
+Bead: `alphago-7qq`
+
+Added an optional fixed-position continuation scorer to the checkpoint Elo
+tool. It uses the same fixed random-position batch and checkpoint MCTS action
+grid, then compares each candidate's majority action against a reference
+checkpoint's majority action only on positions where they disagree. For each
+disagreement, it forces the reference action and the candidate action once,
+then lets a chosen continuation checkpoint play both sides to terminal with
+MCTS. Reported returns are from the original side-to-move's perspective, so
+`candidate_minus_reference_mean_return > 0` means the candidate action produced
+better continuations under that evaluator.
+
+Launched the first forced-continuation gate on the current `s103`/`s201`
+question:
+
+```bash
+setsid bash -c 'uv run --extra modal modal run --detach jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-transformer-s103/othello/final.msgpack,othello-transformer-s201/othello/iter_0060.msgpack,othello-transformer-s201/othello/iter_0080.msgpack,othello-transformer-s201/othello/final.msgpack,othello-transformer-s102/othello/iter_0060.msgpack" \
+  --position-samples 256 \
+  --position-min-ply 8 \
+  --position-max-ply 56 \
+  --position-budgets "24,32,64,128" \
+  --position-seeds "1,2,3" \
+  --position-seed 20260612 \
+  --position-teacher-index 0 \
+  --position-teacher-simulations 512 \
+  --position-teacher-seed 0 \
+  --position-force-reference-index 0 \
+  --position-force-candidate-indices "1,2,3" \
+  --position-force-continuation-index 0 \
+  --position-force-continuation-simulations 128 \
+  --position-force-continuation-seeds "1,2" \
+  --mcts-simulations 32 \
+  --gpu A100-40GB' < /dev/null > /tmp/othello-forced-continuation-20260612.modal.log 2>&1 &
+```
+
+Launch identifiers:
+
+- Modal app: `ap-bfzfNBe5kN8HJJo5sb0f1D`
+- Local log: `/tmp/othello-forced-continuation-20260612.modal.log`
+- Reference checkpoint: `othello-transformer-s103/othello/final.msgpack`
+- Candidate checkpoints: `s201/iter_0060`, `s201/iter_0080`, `s201/final`
+- Continuation checkpoint: `othello-transformer-s103/othello/final.msgpack`
+- Continuation budget: 128 MCTS simulations, seeds 1 and 2
