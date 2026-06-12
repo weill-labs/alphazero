@@ -779,3 +779,27 @@ is designed to attack the observed Othello failure mode where pairwise MCTS Elo
 flips because each budget row reaches different states. If a challenger cannot
 look stable and competitive on the same fixed state batch, it should not replace
 the incumbent based on pairwise match Elo.
+
+Launched the first fixed-position gate on the current transformer contenders:
+
+```bash
+setsid bash -c 'uv run --extra modal modal run --detach jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-transformer-s103/othello/final.msgpack,othello-transformer-s201/othello/iter_0060.msgpack,othello-transformer-s201/othello/iter_0080.msgpack,othello-transformer-s201/othello/final.msgpack,othello-transformer-s102/othello/iter_0060.msgpack" \
+  --position-samples 256 \
+  --position-min-ply 8 \
+  --position-max-ply 56 \
+  --position-budgets "24,32,64,128" \
+  --position-seeds "1,2,3" \
+  --position-seed 20260612 \
+  --mcts-simulations 32 \
+  --gpu A100-40GB' < /dev/null > /tmp/othello-fixed-position-20260612.modal.log 2>&1 &
+```
+
+Launch identifiers:
+
+- Modal app: `ap-zy2Ql7Kt0PtSCCfNCNVyWR`
+- Local log: `/tmp/othello-fixed-position-20260612.modal.log`
+- Reference checkpoint: `othello-transformer-s103/othello/final.msgpack`
+- Scope: 5 checkpoints, 256 fixed positions, 4 budgets, 3 evaluator seeds,
+  15360 fixed-state search evaluations.
