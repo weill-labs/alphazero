@@ -361,6 +361,18 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
                 "mcts_simulations": kwargs["teacher_simulations"],
                 "seed": kwargs["teacher_seed"],
             },
+            "forced_continuations": {
+                "continuation_simulations": kwargs["force_continuation_simulations"],
+                "seeds": kwargs["force_continuation_seeds"],
+                "comparisons": [
+                    {
+                        "runs": [
+                            {"evaluated_disagreements": 2},
+                            {"evaluated_disagreements": 1},
+                        ]
+                    }
+                ],
+            },
             "checkpoint_summary": {},
             "runs": [],
         }
@@ -551,6 +563,11 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
         position_teacher_index=1,
         position_teacher_simulations=512,
         position_teacher_seed=7,
+        position_force_reference_index=0,
+        position_force_candidate_indices="1",
+        position_force_continuation_index=1,
+        position_force_continuation_simulations=256,
+        position_force_continuation_seeds="8,9",
     )
 
     assert captured["positions"]["max_steps"] == 128
@@ -563,11 +580,23 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
     assert captured["positions"]["teacher_index"] == 1
     assert captured["positions"]["teacher_simulations"] == 512
     assert captured["positions"]["teacher_seed"] == 7
+    assert captured["positions"]["force_reference_index"] == 0
+    assert captured["positions"]["force_candidate_indices"] == [1]
+    assert captured["positions"]["force_continuation_index"] == 1
+    assert captured["positions"]["force_continuation_simulations"] == 256
+    assert captured["positions"]["force_continuation_seeds"] == [8, 9]
     assert position_result["evaluator_mode"] == "fixed-position-mcts"
     assert position_result["teacher"]["mcts_simulations"] == 512
+    assert position_result["forced_continuations"]["continuation_simulations"] == 256
     assert position_result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 8
     assert position_result["modal_metrics"]["modal_checkpoint_elo_games"] == 0
     assert position_result["modal_metrics"]["modal_checkpoint_elo_position_evals"] == 32
+    assert (
+        position_result["modal_metrics"][
+            "modal_checkpoint_elo_forced_continuation_evals"
+        ]
+        == 6
+    )
 
 
 def test_jaxzero_modal_c4_certify_remote_uses_cached_labels_and_volume(

@@ -537,11 +537,18 @@ else:
         position_teacher_index: int = 0,
         position_teacher_simulations: int = 0,
         position_teacher_seed: int = 0,
+        position_force_reference_index: int = 0,
+        position_force_candidate_indices: str = "",
+        position_force_continuation_index: int = 0,
+        position_force_continuation_simulations: int = 0,
+        position_force_continuation_seeds: str = "0",
         requested_gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
     ) -> dict[str, object]:
         from jaxzero.checkpoint_elo import (
             _parse_force_actions,
             _parse_position_budgets,
+            _parse_position_force_candidate_indices,
+            _parse_position_force_seeds,
             _parse_position_seeds,
             _parse_probe_simulations,
             _parse_stability_budgets,
@@ -681,6 +688,17 @@ else:
                 teacher_index=position_teacher_index,
                 teacher_simulations=position_teacher_simulations,
                 teacher_seed=position_teacher_seed,
+                force_reference_index=position_force_reference_index,
+                force_candidate_indices=_parse_position_force_candidate_indices(
+                    position_force_candidate_indices
+                ),
+                force_continuation_index=position_force_continuation_index,
+                force_continuation_simulations=(
+                    position_force_continuation_simulations
+                ),
+                force_continuation_seeds=_parse_position_force_seeds(
+                    position_force_continuation_seeds
+                ),
             )
             pairings = (
                 len(resolved_paths)
@@ -715,6 +733,15 @@ else:
             payload["modal_metrics"]["modal_checkpoint_elo_position_evals"] = (
                 pairings * int(payload["num_positions"])
             )
+            forced = payload.get("forced_continuations")
+            if isinstance(forced, dict):
+                payload["modal_metrics"][
+                    "modal_checkpoint_elo_forced_continuation_evals"
+                ] = sum(
+                    int(run["evaluated_disagreements"]) * 2
+                    for comparison in forced.get("comparisons", [])
+                    for run in comparison.get("runs", [])
+                )
         payload["checkpoint_volume"] = _CHECKPOINT_VOLUME_NAME
         payload["requested_gpu"] = requested_gpu
         payload["checkpoint_paths"] = [str(path) for path in resolved_paths]
@@ -980,6 +1007,11 @@ else:
         position_teacher_index: int = 0,
         position_teacher_simulations: int = 0,
         position_teacher_seed: int = 0,
+        position_force_reference_index: int = 0,
+        position_force_candidate_indices: str = "",
+        position_force_continuation_index: int = 0,
+        position_force_continuation_simulations: int = 0,
+        position_force_continuation_seeds: str = "0",
         gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
         spawn: bool = False,
     ) -> None:
@@ -1026,6 +1058,13 @@ else:
             position_teacher_index=position_teacher_index,
             position_teacher_simulations=position_teacher_simulations,
             position_teacher_seed=position_teacher_seed,
+            position_force_reference_index=position_force_reference_index,
+            position_force_candidate_indices=position_force_candidate_indices,
+            position_force_continuation_index=position_force_continuation_index,
+            position_force_continuation_simulations=(
+                position_force_continuation_simulations
+            ),
+            position_force_continuation_seeds=position_force_continuation_seeds,
             requested_gpu=gpu,
         )
         if spawn:

@@ -409,6 +409,11 @@ def evaluate_fixed_position_search(
     teacher_index: int = 0,
     teacher_simulations: int = 0,
     teacher_seed: int = 0,
+    force_reference_index: int = 0,
+    force_candidate_indices: Sequence[int] = (),
+    force_continuation_index: int = 0,
+    force_continuation_simulations: int = 0,
+    force_continuation_seeds: Sequence[int] = (0,),
 ) -> dict[str, object]:
     """Compare checkpoint search choices on one fixed random-position batch.
 
@@ -439,12 +444,34 @@ def evaluate_fixed_position_search(
         raise ValueError("gumbel_scale must be non-negative")
     if teacher_simulations < 0:
         raise ValueError("teacher_simulations must be non-negative")
+    if force_continuation_simulations < 0:
+        raise ValueError("force_continuation_simulations must be non-negative")
+    force_seed_values = _validate_ints(
+        force_continuation_seeds,
+        name="force_continuation_seeds",
+    )
 
     paths = [Path(path) for path in checkpoint_paths]
     if not paths:
         raise ValueError("checkpoint_paths must not be empty")
     if teacher_index < 0 or teacher_index >= len(paths):
         raise ValueError("teacher_index must select a checkpoint")
+    if force_reference_index < 0 or force_reference_index >= len(paths):
+        raise ValueError("force_reference_index must select a checkpoint")
+    if force_continuation_index < 0 or force_continuation_index >= len(paths):
+        raise ValueError("force_continuation_index must select a checkpoint")
+    force_candidates = [
+        int(index)
+        for index in force_candidate_indices
+        if int(index) != force_reference_index
+    ]
+    if not force_candidates:
+        force_candidates = [
+            index for index in range(len(paths)) if index != force_reference_index
+        ]
+    for index in force_candidates:
+        if index < 0 or index >= len(paths):
+            raise ValueError("force_candidate_indices must select checkpoints")
     names = _checkpoint_names(paths)
     checkpoints = [
         _load_checkpoint(path, name=name, game=spec.name)
@@ -508,6 +535,17 @@ def evaluate_fixed_position_search(
         actions[0].reshape((-1, num_positions)),
         action_size=legal_action_mask.shape[1],
     )
+    checkpoint_majority_actions = []
+    checkpoint_majority_votes = []
+    for checkpoint_index in range(len(checkpoints)):
+        majority_actions, majority_votes = _majority_actions(
+            actions[checkpoint_index].reshape((-1, num_positions)),
+            action_size=legal_action_mask.shape[1],
+        )
+        checkpoint_majority_actions.append(majority_actions)
+        checkpoint_majority_votes.append(majority_votes)
+    checkpoint_majority_actions_np = np.stack(checkpoint_majority_actions, axis=0)
+    checkpoint_majority_votes_np = np.stack(checkpoint_majority_votes, axis=0)
     unique_group_indices = _unique_action_profile_indices(actions)
     deduplicated_consensus_actions, deduplicated_consensus_votes = _majority_actions(
         actions[unique_group_indices].reshape((-1, num_positions)),
@@ -659,6 +697,22 @@ def evaluate_fixed_position_search(
         }
         payload["position_summary"]["teacher_action_counts"] = _value_counts(
             teacher_actions
+        )
+    if force_continuation_simulations > 0:
+        payload["forced_continuations"] = _evaluate_fixed_position_forced_continuations(
+            checkpoints,
+            sampled_state=sampled_state,
+            checkpoint_majority_actions=checkpoint_majority_actions_np,
+            checkpoint_majority_votes=checkpoint_majority_votes_np,
+            action_source_runs=actions.shape[1] * actions.shape[2],
+            reference_index=force_reference_index,
+            candidate_indices=force_candidates,
+            continuation_index=force_continuation_index,
+            continuation_simulations=force_continuation_simulations,
+            continuation_seeds=force_seed_values,
+            max_steps=max_steps,
+            game=spec.name,
+            gumbel_scale=gumbel_scale,
         )
     return payload
 
@@ -1283,6 +1337,168 @@ def evaluate_forced_action_match(
         "force_actor_role": "player_a" if force_player == 0 else "player_b",
         "actions": action_results,
     }
+
+
+def _evaluate_fixed_position_forced_continuations(
+    checkpoints: Sequence[_LoadedCheckpoint],
+    *,
+    sampled_state,
+    checkpoint_majority_actions: np.ndarray,
+    checkpoint_majority_votes: np.ndarray,
+    action_source_runs: int,
+    reference_index: int,
+    candidate_indices: Sequence[int],
+    continuation_index: int,
+    continuation_simulations: int,
+    continuation_seeds: Sequence[int],
+    max_steps: int,
+    game: str,
+    gumbel_scale: float,
+) -> dict[str, object]:
+    continuation_checkpoint = checkpoints[continuation_index]
+    continue_positions = _make_fixed_position_forced_continuation(
+        continuation_checkpoint.graphdef,
+        game=game,
+        max_steps=max_steps,
+        continuation_simulations=continuation_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+    reference_actions = checkpoint_majority_actions[reference_index]
+    comparisons = []
+    for candidate_index in candidate_indices:
+        candidate_actions = checkpoint_majority_actions[candidate_index]
+        disagreement_mask = reference_actions != candidate_actions
+        seed_results = []
+        reference_returns = []
+        candidate_returns = []
+        for seed in continuation_seeds:
+            reference_raw = continue_positions(
+                continuation_checkpoint.params,
+                sampled_state,
+                jax.random.PRNGKey(seed),
+                jnp.asarray(reference_actions, dtype=jnp.int32),
+                jnp.asarray(disagreement_mask, dtype=jnp.bool_),
+            )
+            candidate_raw = continue_positions(
+                continuation_checkpoint.params,
+                sampled_state,
+                jax.random.PRNGKey(seed),
+                jnp.asarray(candidate_actions, dtype=jnp.int32),
+                jnp.asarray(disagreement_mask, dtype=jnp.bool_),
+            )
+            reference_result = {
+                name: np.asarray(jax.device_get(value))
+                for name, value in reference_raw.items()
+            }
+            candidate_result = {
+                name: np.asarray(jax.device_get(value))
+                for name, value in candidate_raw.items()
+            }
+            valid_mask = (
+                disagreement_mask
+                & reference_result["forced_mask"].astype(bool)
+                & candidate_result["forced_mask"].astype(bool)
+            )
+            seed_reference_returns = reference_result["return_actor"][valid_mask]
+            seed_candidate_returns = candidate_result["return_actor"][valid_mask]
+            reference_returns.append(seed_reference_returns)
+            candidate_returns.append(seed_candidate_returns)
+            seed_results.append(
+                {
+                    "seed": int(seed),
+                    "evaluated_disagreements": int(np.sum(valid_mask)),
+                    **_summarize_return_pairs(
+                        seed_reference_returns,
+                        seed_candidate_returns,
+                    ),
+                }
+            )
+
+        if reference_returns:
+            all_reference_returns = np.concatenate(reference_returns)
+            all_candidate_returns = np.concatenate(candidate_returns)
+        else:
+            all_reference_returns = np.asarray([], dtype=np.float32)
+            all_candidate_returns = np.asarray([], dtype=np.float32)
+        disagreements = int(np.sum(disagreement_mask))
+        comparisons.append(
+            {
+                "reference_checkpoint": checkpoints[reference_index].name,
+                "reference_index": int(reference_index),
+                "candidate_checkpoint": checkpoints[candidate_index].name,
+                "candidate_index": int(candidate_index),
+                "positions": int(reference_actions.shape[0]),
+                "disagreements": disagreements,
+                "disagreement_fraction": float(
+                    disagreements / max(reference_actions.shape[0], 1)
+                ),
+                "evaluated_disagreements": int(all_reference_returns.size),
+                "reference_action_counts": _value_counts(
+                    reference_actions[disagreement_mask]
+                ),
+                "candidate_action_counts": _value_counts(
+                    candidate_actions[disagreement_mask]
+                ),
+                "reference_mean_vote_fraction": _mean_or_none(
+                    checkpoint_majority_votes[reference_index][disagreement_mask]
+                    / action_source_runs
+                ),
+                "candidate_mean_vote_fraction": _mean_or_none(
+                    checkpoint_majority_votes[candidate_index][disagreement_mask]
+                    / action_source_runs
+                ),
+                "summary": _summarize_return_pairs(
+                    all_reference_returns,
+                    all_candidate_returns,
+                ),
+                "runs": seed_results,
+            }
+        )
+
+    return {
+        "reference_checkpoint": checkpoints[reference_index].name,
+        "reference_index": int(reference_index),
+        "continuation_checkpoint": continuation_checkpoint.name,
+        "continuation_index": int(continuation_index),
+        "continuation_simulations": int(continuation_simulations),
+        "seeds": [int(seed) for seed in continuation_seeds],
+        "action_source": "checkpoint_majority_across_position_budgets_and_seeds",
+        "comparisons": comparisons,
+    }
+
+
+def _summarize_return_pairs(
+    reference_returns: np.ndarray,
+    candidate_returns: np.ndarray,
+) -> dict[str, float | int | None]:
+    if reference_returns.size != candidate_returns.size:
+        raise ValueError("return arrays must have matching sizes")
+    if reference_returns.size == 0:
+        return {
+            "samples": 0,
+            "reference_mean_return": None,
+            "candidate_mean_return": None,
+            "candidate_minus_reference_mean_return": None,
+            "candidate_better_fraction": None,
+            "reference_better_fraction": None,
+            "equal_fraction": None,
+        }
+    delta = candidate_returns - reference_returns
+    return {
+        "samples": int(reference_returns.size),
+        "reference_mean_return": float(np.mean(reference_returns)),
+        "candidate_mean_return": float(np.mean(candidate_returns)),
+        "candidate_minus_reference_mean_return": float(np.mean(delta)),
+        "candidate_better_fraction": float(np.mean(delta > 0.0)),
+        "reference_better_fraction": float(np.mean(delta < 0.0)),
+        "equal_fraction": float(np.mean(delta == 0.0)),
+    }
+
+
+def _mean_or_none(values: np.ndarray) -> float | None:
+    if values.size == 0:
+        return None
+    return float(np.mean(values))
 
 
 def _validate_force_actions(force_actions: Sequence[int]) -> list[int]:
@@ -1989,6 +2205,70 @@ def _make_forced_action_continuation(
     return continue_match
 
 
+def _make_fixed_position_forced_continuation(
+    graphdef: nnx.GraphDef[Net],
+    *,
+    game: str,
+    max_steps: int,
+    continuation_simulations: int,
+    gumbel_scale: float,
+):
+    env = pgx.make(resolve_game(game).env_id)
+    search = _make_mcts_search(
+        graphdef,
+        game=game,
+        num_simulations=continuation_simulations,
+        gumbel_scale=gumbel_scale,
+    )
+
+    @jax.jit
+    def continue_positions(
+        params: nnx.State,
+        state,
+        rng_key: jax.Array,
+        forced_actions: jax.Array,
+        evaluate_mask: jax.Array,
+    ) -> dict[str, jax.Array]:
+        lane_index = jnp.arange(state.current_player.shape[0])
+        original_player = state.current_player
+        dummy_state = jax.vmap(env.init)(
+            jax.random.split(jax.random.PRNGKey(0), state.current_player.shape[0])
+        )
+        legal_fallback = jnp.argmax(state.legal_action_mask, axis=1).astype(jnp.int32)
+        active = evaluate_mask & ~(state.terminated | state.truncated)
+        forced_legal = state.legal_action_mask[lane_index, forced_actions]
+        forced_mask = active & forced_legal
+        target_action = jnp.where(forced_mask, forced_actions, legal_fallback)
+        stepped_state = jax.vmap(env.step)(state, target_action)
+        state = _replace_inactive_lanes(stepped_state, forced_mask, state)
+        step_return = stepped_state.rewards[lane_index, original_player]
+        return_actor = jnp.where(forced_mask, step_return, 0.0)
+
+        def continuation_step(carry, key):
+            state, return_actor = carry
+            active = forced_mask & ~(state.terminated | state.truncated)
+            search_state = _replace_inactive_lanes(state, active, dummy_state)
+            action = search(params, search_state, key)
+            stepped_state = jax.vmap(env.step)(state, action)
+            state = _replace_inactive_lanes(stepped_state, active, state)
+            step_return = stepped_state.rewards[lane_index, original_player]
+            return_actor = return_actor + jnp.where(active, step_return, 0.0)
+            return (state, return_actor), None
+
+        scan_keys = jax.random.split(rng_key, max_steps)
+        (_, return_actor), _ = jax.lax.scan(
+            continuation_step,
+            (state, return_actor),
+            xs=scan_keys,
+        )
+        return {
+            "return_actor": return_actor,
+            "forced_mask": forced_mask,
+        }
+
+    return continue_positions
+
+
 def _make_mcts_match(
     graphdef_a: nnx.GraphDef[Net],
     graphdef_b: nnx.GraphDef[Net],
@@ -2337,6 +2617,32 @@ def _parse_position_seeds(raw: str) -> list[int]:
     return _validate_ints(values, name="position_seeds")
 
 
+def _parse_position_force_candidate_indices(raw: str) -> list[int]:
+    if not raw:
+        return []
+    try:
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError(
+            "--position-force-candidate-indices must be comma-separated integers"
+        ) from exc
+    if any(value < 0 for value in values):
+        raise ValueError("--position-force-candidate-indices must be non-negative")
+    return values
+
+
+def _parse_position_force_seeds(raw: str) -> list[int]:
+    if not raw:
+        raise ValueError("--position-force-continuation-seeds must not be empty")
+    try:
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError(
+            "--position-force-continuation-seeds must be comma-separated integers"
+        ) from exc
+    return _validate_ints(values, name="position_force_continuation_seeds")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Evaluate a greedy Elo ladder across jaxzero checkpoints."
@@ -2494,6 +2800,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=0,
         help="Evaluator seed for --position-teacher-simulations.",
     )
+    parser.add_argument(
+        "--position-force-reference-index",
+        type=int,
+        default=0,
+        help="Checkpoint index whose majority fixed-position actions are the "
+        "reference side for forced-continuation disagreement scoring.",
+    )
+    parser.add_argument(
+        "--position-force-candidate-indices",
+        default="",
+        help="Comma-separated checkpoint indices to compare against "
+        "--position-force-reference-index. Defaults to every non-reference "
+        "checkpoint when forced continuations are enabled.",
+    )
+    parser.add_argument(
+        "--position-force-continuation-index",
+        type=int,
+        default=0,
+        help="Checkpoint index used to play both sides after each forced action.",
+    )
+    parser.add_argument(
+        "--position-force-continuation-simulations",
+        type=int,
+        default=0,
+        help="When >0, force reference/candidate majority actions on their "
+        "fixed-position disagreement subset and continue with this MCTS budget.",
+    )
+    parser.add_argument(
+        "--position-force-continuation-seeds",
+        default="0",
+        help="Comma-separated evaluator seeds for forced continuations.",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pairing <= 0:
@@ -2532,6 +2870,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--position-teacher-index must be non-negative")
     if args.position_teacher_simulations < 0:
         parser.error("--position-teacher-simulations must be non-negative")
+    if args.position_force_reference_index < 0:
+        parser.error("--position-force-reference-index must be non-negative")
+    if args.position_force_continuation_index < 0:
+        parser.error("--position-force-continuation-index must be non-negative")
+    if args.position_force_continuation_simulations < 0:
+        parser.error("--position-force-continuation-simulations must be non-negative")
     try:
         probe_budgets = _parse_probe_simulations(
             args.probe_budgets,
@@ -2558,6 +2902,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             fallback=args.mcts_simulations,
         )
         position_seeds = _parse_position_seeds(args.position_seeds)
+        position_force_candidate_indices = _parse_position_force_candidate_indices(
+            args.position_force_candidate_indices
+        )
+        position_force_continuation_seeds = _parse_position_force_seeds(
+            args.position_force_continuation_seeds
+        )
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -2584,6 +2934,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(
             "--trace-plies, --probe-ply, --force-ply, and --stability-budgets "
             "are mutually exclusive with --position-samples"
+        )
+    if args.position_force_continuation_simulations > 0 and args.position_samples <= 0:
+        parser.error(
+            "--position-force-continuation-simulations requires --position-samples"
         )
     if args.trace_plies > 0:
         if len(checkpoint_paths) != 2:
@@ -2668,6 +3022,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             teacher_index=args.position_teacher_index,
             teacher_simulations=args.position_teacher_simulations,
             teacher_seed=args.position_teacher_seed,
+            force_reference_index=args.position_force_reference_index,
+            force_candidate_indices=position_force_candidate_indices,
+            force_continuation_index=args.position_force_continuation_index,
+            force_continuation_simulations=(
+                args.position_force_continuation_simulations
+            ),
+            force_continuation_seeds=position_force_continuation_seeds,
         )
         print(json.dumps(fixed_positions, indent=2, sort_keys=True))
         return 0

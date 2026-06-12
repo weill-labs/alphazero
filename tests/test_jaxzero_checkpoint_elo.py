@@ -143,6 +143,9 @@ def test_fixed_position_search_scores_shared_position_batch(tmp_path) -> None:
         position_seed=5,
         teacher_simulations=2,
         teacher_seed=6,
+        force_candidate_indices=[1],
+        force_continuation_simulations=1,
+        force_continuation_seeds=[7],
     )
 
     assert result["game"] == "othello"
@@ -156,6 +159,14 @@ def test_fixed_position_search_scores_shared_position_batch(tmp_path) -> None:
     assert result["position_summary"]["reached_positions"] == 4
     assert result["teacher"]["checkpoint"] == "early"
     assert result["teacher"]["mcts_simulations"] == 2
+    forced = result["forced_continuations"]
+    assert forced["reference_checkpoint"] == "early"
+    assert forced["continuation_checkpoint"] == "early"
+    assert forced["continuation_simulations"] == 1
+    assert forced["seeds"] == [7]
+    assert len(forced["comparisons"]) == 1
+    assert forced["comparisons"][0]["candidate_checkpoint"] == "late"
+    assert "summary" in forced["comparisons"][0]
 
     early_summary = result["checkpoint_summary"]["early"]
     assert 0.0 <= early_summary["action_stability"] <= 1.0
@@ -530,6 +541,12 @@ def test_checkpoint_elo_cli_runs_fixed_position_search(tmp_path, capsys) -> None
             "2",
             "--position-teacher-seed",
             "6",
+            "--position-force-candidate-indices",
+            "1",
+            "--position-force-continuation-simulations",
+            "1",
+            "--position-force-continuation-seeds",
+            "7,8",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
@@ -540,6 +557,9 @@ def test_checkpoint_elo_cli_runs_fixed_position_search(tmp_path, capsys) -> None
     assert payload["mcts_simulations"] == [1, 2]
     assert payload["seeds"] == [3, 4]
     assert payload["teacher"]["mcts_simulations"] == 2
+    assert payload["forced_continuations"]["continuation_simulations"] == 1
+    assert payload["forced_continuations"]["seeds"] == [7, 8]
+    assert len(payload["forced_continuations"]["comparisons"]) == 1
     assert set(payload["checkpoint_summary"]) == {"early", "late"}
 
 
