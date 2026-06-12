@@ -348,6 +348,18 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
             "pairing_summary": [],
         }
 
+    def fake_evaluate_fixed_position_search(paths, **kwargs):
+        captured["positions"] = {"paths": list(paths), **kwargs}
+        return {
+            "game": kwargs["game"],
+            "evaluator_mode": "fixed-position-mcts",
+            "num_positions": kwargs["num_positions"],
+            "mcts_simulations": kwargs["mcts_simulations_list"],
+            "seeds": kwargs["seeds"],
+            "checkpoint_summary": {},
+            "runs": [],
+        }
+
     monkeypatch.setattr(
         checkpoint_elo_module, "resolve_checkpoint_paths", fake_resolve_checkpoint_paths
     )
@@ -375,6 +387,11 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
         checkpoint_elo_module,
         "evaluate_checkpoint_stability",
         fake_evaluate_checkpoint_stability,
+    )
+    monkeypatch.setattr(
+        checkpoint_elo_module,
+        "evaluate_fixed_position_search",
+        fake_evaluate_fixed_position_search,
     )
 
     result = module.checkpoint_elo_remote(
@@ -510,6 +527,35 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
     assert captured["stability"]["instability_threshold"] == 0.2
     assert stability_result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 8
     assert stability_result["modal_metrics"]["modal_checkpoint_elo_games"] == 32
+
+    position_result = module.checkpoint_elo_remote(
+        game="othello",
+        checkpoint_paths=[
+            "othello-resnet-s102/othello/iter_0080.msgpack",
+            "/checkpoints/othello-transformer-s102/othello/iter_0060.msgpack",
+        ],
+        max_steps=module._AUTO_MAX_STEPS,
+        mcts_simulations=24,
+        gumbel_scale=0.0,
+        position_samples=4,
+        position_min_ply=6,
+        position_max_ply=40,
+        position_budgets="24,32",
+        position_seeds="3,4",
+        position_seed=99,
+    )
+
+    assert captured["positions"]["max_steps"] == 128
+    assert captured["positions"]["num_positions"] == 4
+    assert captured["positions"]["min_ply"] == 6
+    assert captured["positions"]["max_ply"] == 40
+    assert captured["positions"]["mcts_simulations_list"] == [24, 32]
+    assert captured["positions"]["seeds"] == [3, 4]
+    assert captured["positions"]["position_seed"] == 99
+    assert position_result["evaluator_mode"] == "fixed-position-mcts"
+    assert position_result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 8
+    assert position_result["modal_metrics"]["modal_checkpoint_elo_games"] == 0
+    assert position_result["modal_metrics"]["modal_checkpoint_elo_position_evals"] == 32
 
 
 def test_jaxzero_modal_c4_certify_remote_uses_cached_labels_and_volume(

@@ -736,3 +736,46 @@ score range 1.0. Within `s201`, checkpoint selection is also unstable:
 `iter_0080` is strongest at 128 sims. The model-training run is complete, but
 the current Othello evaluator is still the bottleneck for deciding the next
 checkpoint.
+
+## 2026-06-12 Fixed-Position Search Gate
+
+Bead: `alphago-7np`
+
+Added a fixed-position MCTS selection gate to `jaxzero-checkpoint-elo` and the
+Modal `checkpoint_elo` entrypoint:
+
+```bash
+uv run jaxzero-checkpoint-elo \
+  --game othello \
+  --position-samples 256 \
+  --position-min-ply 8 \
+  --position-max-ply 56 \
+  --position-budgets "24,32,64,128" \
+  --position-seeds "1,2,3" \
+  --position-seed 20260612 \
+  <checkpoint-a> <checkpoint-b> ...
+```
+
+For checkpoints on the Modal volume, use the Modal entrypoint's comma-separated
+`--checkpoints` argument instead.
+
+The mode samples one deterministic random-position batch and evaluates every
+checkpoint on those same states across budgets and seeds. It reports:
+
+- `action_stability`: within-checkpoint majority-action agreement across the
+  budget/seed grid.
+- `budget_sensitive_fraction`: share of position/seed cases where changing only
+  the MCTS budget changes the selected action.
+- `seed_sensitive_fraction`: share of position/budget cases where changing only
+  the evaluator seed changes the selected action.
+- `consensus_match`: agreement with the majority action across all checkpoints,
+  budgets, and seeds for each fixed position.
+- `reference_match`: agreement with the first checkpoint's majority action for
+  each fixed position, so put the current champion first when using this as a
+  challenger gate.
+
+This is not a solver oracle and should not be read as proof of optimal play. It
+is designed to attack the observed Othello failure mode where pairwise MCTS Elo
+flips because each budget row reaches different states. If a challenger cannot
+look stable and competitive on the same fixed state batch, it should not replace
+the incumbent based on pairwise match Elo.

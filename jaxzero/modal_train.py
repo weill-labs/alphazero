@@ -528,15 +528,24 @@ else:
         stability_budgets: str = "",
         stability_seeds: str = "0",
         stability_score_threshold: float = 0.25,
+        position_samples: int = 0,
+        position_min_ply: int = 4,
+        position_max_ply: int = -1,
+        position_budgets: str = "",
+        position_seeds: str = "0",
+        position_seed: int = 0,
         requested_gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
     ) -> dict[str, object]:
         from jaxzero.checkpoint_elo import (
             _parse_force_actions,
+            _parse_position_budgets,
+            _parse_position_seeds,
             _parse_probe_simulations,
             _parse_stability_budgets,
             _parse_stability_seeds,
             evaluate_checkpoint_ladder,
             evaluate_checkpoint_stability,
+            evaluate_fixed_position_search,
             evaluate_forced_actions,
             probe_checkpoint_state,
             resolve_checkpoint_paths,
@@ -569,11 +578,12 @@ else:
             + int(probe_ply >= 0)
             + int(force_ply >= 0)
             + int(bool(stability_budget_values))
+            + int(position_samples > 0)
         )
         if active_modes > 1:
             raise ValueError(
-                "trace_plies, probe_ply, force_ply, and stability_budgets are "
-                "mutually exclusive"
+                "trace_plies, probe_ply, force_ply, stability_budgets, and "
+                "position_samples are mutually exclusive"
             )
         if trace_plies > 0:
             if len(resolved_paths) != 2:
@@ -650,6 +660,28 @@ else:
                 for run in payload["runs"]
                 for pairing in run["pairings"]
             )
+        elif position_samples > 0:
+            payload = evaluate_fixed_position_search(
+                resolved_paths,
+                game=game,
+                max_steps=max_steps,
+                num_positions=position_samples,
+                min_ply=position_min_ply,
+                max_ply=position_max_ply if position_max_ply >= 0 else None,
+                mcts_simulations_list=_parse_position_budgets(
+                    position_budgets,
+                    fallback=mcts_simulations,
+                ),
+                seeds=_parse_position_seeds(position_seeds),
+                position_seed=position_seed,
+                gumbel_scale=gumbel_scale,
+            )
+            pairings = (
+                len(resolved_paths)
+                * len(payload["mcts_simulations"])
+                * len(payload["seeds"])
+            )
+            games = 0
         else:
             result = evaluate_checkpoint_ladder(
                 resolved_paths,
@@ -673,6 +705,10 @@ else:
             "modal_checkpoint_elo_pairings": pairings,
             "modal_checkpoint_elo_games": games,
         }
+        if position_samples > 0:
+            payload["modal_metrics"]["modal_checkpoint_elo_position_evals"] = (
+                pairings * int(payload["num_positions"])
+            )
         payload["checkpoint_volume"] = _CHECKPOINT_VOLUME_NAME
         payload["requested_gpu"] = requested_gpu
         payload["checkpoint_paths"] = [str(path) for path in resolved_paths]
@@ -929,6 +965,12 @@ else:
         stability_budgets: str = "",
         stability_seeds: str = "0",
         stability_score_threshold: float = 0.25,
+        position_samples: int = 0,
+        position_min_ply: int = 4,
+        position_max_ply: int = -1,
+        position_budgets: str = "",
+        position_seeds: str = "0",
+        position_seed: int = 0,
         gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
         spawn: bool = False,
     ) -> None:
@@ -966,6 +1008,12 @@ else:
             stability_budgets=stability_budgets,
             stability_seeds=stability_seeds,
             stability_score_threshold=stability_score_threshold,
+            position_samples=position_samples,
+            position_min_ply=position_min_ply,
+            position_max_ply=position_max_ply,
+            position_budgets=position_budgets,
+            position_seeds=position_seeds,
+            position_seed=position_seed,
             requested_gpu=gpu,
         )
         if spawn:

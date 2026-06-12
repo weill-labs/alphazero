@@ -394,6 +394,204 @@ def evaluate_checkpoint_stability(
     }
 
 
+def evaluate_fixed_position_search(
+    checkpoint_paths: Sequence[str | Path],
+    *,
+    game: str = DEFAULT_GAME,
+    max_steps: int | None = None,
+    num_positions: int,
+    min_ply: int = 4,
+    max_ply: int | None = None,
+    mcts_simulations_list: Sequence[int],
+    seeds: Sequence[int],
+    position_seed: int = 0,
+    gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+) -> dict[str, object]:
+    """Compare checkpoint search choices on one fixed random-position batch.
+
+    This is a selection-gate diagnostic, not a solver verdict. It removes the
+    largest source of noise in pairwise Elo sweeps by holding evaluated states
+    fixed while varying checkpoints, search budgets, and evaluator seeds.
+    """
+
+    spec = resolve_game(game)
+    if num_positions <= 0:
+        raise ValueError("num_positions must be positive")
+    max_steps = spec.default_max_steps if max_steps is None else max_steps
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if min_ply < 0:
+        raise ValueError("min_ply must be non-negative")
+    max_ply = max_steps - 1 if max_ply is None else max_ply
+    if max_ply < min_ply:
+        raise ValueError("max_ply must be greater than or equal to min_ply")
+    if max_ply >= max_steps:
+        raise ValueError("max_ply must be less than max_steps")
+    budgets = _validate_positive_ints(
+        mcts_simulations_list,
+        name="mcts_simulations_list",
+    )
+    seed_values = _validate_ints(seeds, name="seeds")
+    if gumbel_scale < 0.0:
+        raise ValueError("gumbel_scale must be non-negative")
+
+    paths = [Path(path) for path in checkpoint_paths]
+    if not paths:
+        raise ValueError("checkpoint_paths must not be empty")
+    names = _checkpoint_names(paths)
+    checkpoints = [
+        _load_checkpoint(path, name=name, game=spec.name)
+        for name, path in zip(names, paths, strict=True)
+    ]
+
+    rng = np.random.default_rng(position_seed)
+    target_plies = rng.integers(
+        min_ply,
+        max_ply + 1,
+        size=num_positions,
+        dtype=np.int32,
+    )
+    sampler = _make_random_position_sampler(
+        game=spec.name,
+        num_positions=num_positions,
+        max_sample_ply=max_ply,
+    )
+    sampled_state, reached = sampler(
+        jax.random.PRNGKey(position_seed),
+        jnp.asarray(target_plies, dtype=jnp.int32),
+    )
+    sampled_state = jax.device_get(sampled_state)
+    reached = np.asarray(jax.device_get(reached), dtype=bool)
+    legal_action_mask = np.asarray(sampled_state.legal_action_mask, dtype=bool)
+    legal_action_counts = np.sum(legal_action_mask, axis=1).astype(np.int32)
+
+    run_shape = (len(budgets), len(seed_values), num_positions)
+    actions = np.empty((len(checkpoints), *run_shape), dtype=np.int32)
+    selected_weights = np.empty((len(checkpoints), *run_shape), dtype=np.float32)
+    root_values = np.empty((len(checkpoints), *run_shape), dtype=np.float32)
+
+    for checkpoint_index, checkpoint in enumerate(checkpoints):
+        for budget_index, budget in enumerate(budgets):
+            search = _make_mcts_search_details(
+                checkpoint.graphdef,
+                game=spec.name,
+                num_simulations=budget,
+                gumbel_scale=gumbel_scale,
+            )
+            for seed_index, search_seed in enumerate(seed_values):
+                action, weights, value = search(
+                    checkpoint.params,
+                    sampled_state,
+                    jax.random.PRNGKey(search_seed),
+                )
+                action_np = np.asarray(jax.device_get(action), dtype=np.int32)
+                weights_np = np.asarray(jax.device_get(weights), dtype=np.float32)
+                values_np = np.asarray(jax.device_get(value), dtype=np.float32)
+                actions[checkpoint_index, budget_index, seed_index] = action_np
+                selected_weights[checkpoint_index, budget_index, seed_index] = (
+                    weights_np[np.arange(num_positions), action_np]
+                )
+                root_values[checkpoint_index, budget_index, seed_index] = values_np
+
+    consensus_actions, consensus_votes = _majority_actions(
+        actions.reshape((-1, num_positions)),
+        action_size=legal_action_mask.shape[1],
+    )
+    reference_actions, reference_votes = _majority_actions(
+        actions[0].reshape((-1, num_positions)),
+        action_size=legal_action_mask.shape[1],
+    )
+
+    checkpoint_summary = {}
+    for checkpoint_index, checkpoint in enumerate(checkpoints):
+        checkpoint_summary[checkpoint.name] = _summarize_fixed_position_checkpoint(
+            actions[checkpoint_index],
+            selected_weights[checkpoint_index],
+            root_values[checkpoint_index],
+            consensus_actions=consensus_actions,
+            reference_actions=reference_actions,
+            action_size=legal_action_mask.shape[1],
+        )
+
+    runs = []
+    for checkpoint_index, checkpoint in enumerate(checkpoints):
+        for budget_index, budget in enumerate(budgets):
+            for seed_index, search_seed in enumerate(seed_values):
+                run_actions = actions[checkpoint_index, budget_index, seed_index]
+                runs.append(
+                    {
+                        "checkpoint": checkpoint.name,
+                        "mcts_simulations": int(budget),
+                        "seed": int(search_seed),
+                        "positions": int(num_positions),
+                        "consensus_match": float(
+                            np.mean(run_actions == consensus_actions)
+                        ),
+                        "reference_match": float(
+                            np.mean(run_actions == reference_actions)
+                        ),
+                        "mean_selected_weight": float(
+                            np.mean(
+                                selected_weights[
+                                    checkpoint_index,
+                                    budget_index,
+                                    seed_index,
+                                ]
+                            )
+                        ),
+                        "mean_root_value": float(
+                            np.mean(
+                                root_values[
+                                    checkpoint_index,
+                                    budget_index,
+                                    seed_index,
+                                ]
+                            )
+                        ),
+                        "action_counts": _value_counts(run_actions),
+                    }
+                )
+
+    return {
+        "game": spec.name,
+        "evaluator_mode": "fixed-position-mcts",
+        "num_positions": int(num_positions),
+        "max_steps": int(max_steps),
+        "min_ply": int(min_ply),
+        "max_ply": int(max_ply),
+        "position_seed": int(position_seed),
+        "mcts_simulations": budgets,
+        "seeds": seed_values,
+        "gumbel_scale": float(gumbel_scale),
+        "reference_checkpoint": checkpoints[0].name,
+        "checkpoints": [
+            {
+                "name": checkpoint.name,
+                "path": str(checkpoint.path),
+            }
+            for checkpoint in checkpoints
+        ],
+        "position_summary": {
+            "reached_positions": int(np.sum(reached)),
+            "target_ply_counts": _value_counts(target_plies),
+            "mean_target_ply": float(np.mean(target_plies)),
+            "mean_legal_actions": float(np.mean(legal_action_counts)),
+            "consensus_action_counts": _value_counts(consensus_actions),
+            "mean_consensus_vote_fraction": float(
+                np.mean(consensus_votes / actions.reshape((-1, num_positions)).shape[0])
+            ),
+            "reference_action_counts": _value_counts(reference_actions),
+            "mean_reference_vote_fraction": float(
+                np.mean(
+                    reference_votes / actions[0].reshape((-1, num_positions)).shape[0]
+                )
+            ),
+        },
+        "checkpoint_summary": checkpoint_summary,
+        "runs": runs,
+    }
+
+
 def play_checkpoint_match(
     player_a: _LoadedCheckpoint,
     player_b: _LoadedCheckpoint,
@@ -1068,6 +1266,53 @@ def _outcome_summary(
     }
 
 
+def _summarize_fixed_position_checkpoint(
+    actions: np.ndarray,
+    selected_weights: np.ndarray,
+    root_values: np.ndarray,
+    *,
+    consensus_actions: np.ndarray,
+    reference_actions: np.ndarray,
+    action_size: int,
+) -> dict[str, float | int | dict[str, int]]:
+    budget_count, seed_count, num_positions = actions.shape
+    flat_actions = actions.reshape((budget_count * seed_count, num_positions))
+    majority_actions, majority_votes = _majority_actions(
+        flat_actions,
+        action_size=action_size,
+    )
+    budget_sensitive = []
+    for seed_index in range(seed_count):
+        for position_index in range(num_positions):
+            budget_actions = {
+                int(actions[budget_index, seed_index, position_index])
+                for budget_index in range(budget_count)
+            }
+            budget_sensitive.append(len(budget_actions) > 1)
+
+    seed_sensitive = []
+    for budget_index in range(budget_count):
+        for position_index in range(num_positions):
+            seed_actions = {
+                int(actions[budget_index, seed_index, position_index])
+                for seed_index in range(seed_count)
+            }
+            seed_sensitive.append(len(seed_actions) > 1)
+    return {
+        "action_stability": float(np.mean(majority_votes / flat_actions.shape[0])),
+        "stable_position_fraction": float(
+            np.mean(majority_votes == flat_actions.shape[0])
+        ),
+        "budget_sensitive_fraction": float(np.mean(budget_sensitive)),
+        "seed_sensitive_fraction": float(np.mean(seed_sensitive)),
+        "consensus_match": float(np.mean(flat_actions == consensus_actions)),
+        "reference_match": float(np.mean(flat_actions == reference_actions)),
+        "mean_selected_weight": float(np.mean(selected_weights)),
+        "mean_root_value": float(np.mean(root_values)),
+        "majority_action_counts": _value_counts(majority_actions),
+    }
+
+
 def _summarize_stability_ratings(
     runs: Sequence[dict[str, object]],
 ) -> dict[str, dict[str, float | int]]:
@@ -1193,6 +1438,30 @@ def _top_action_weights(
     ]
 
 
+def _majority_actions(
+    actions: np.ndarray,
+    *,
+    action_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if actions.ndim != 2:
+        raise ValueError("actions must have shape [runs, positions]")
+    if action_size <= 0:
+        raise ValueError("action_size must be positive")
+    counts = np.zeros((actions.shape[1], action_size), dtype=np.int32)
+    for run_actions in actions:
+        np.add.at(counts, (np.arange(actions.shape[1]), run_actions), 1)
+    majority_actions = np.argmax(counts, axis=1).astype(np.int32)
+    majority_votes = np.max(counts, axis=1).astype(np.int32)
+    return majority_actions, majority_votes
+
+
+def _value_counts(values: np.ndarray | Sequence[int]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in np.asarray(values).reshape(-1):
+        _increment_count(counts, int(value))
+    return counts
+
+
 def _increment_count(counts: dict[str, int], key: int) -> None:
     counts[str(key)] = counts.get(str(key), 0) + 1
 
@@ -1258,6 +1527,52 @@ def _make_greedy_match(
         return jnp.stack([wins_a, draws, wins_b])
 
     return play
+
+
+def _make_random_position_sampler(
+    *,
+    game: str,
+    num_positions: int,
+    max_sample_ply: int,
+):
+    env = pgx.make(resolve_game(game).env_id)
+    neg_inf = jnp.finfo(jnp.float32).min
+
+    @jax.jit
+    def sample(rng_key: jax.Array, target_plies: jax.Array):
+        def step(carry, inputs):
+            state, sampled_state, reached = carry
+            ply, key = inputs
+            active = ~(state.terminated | state.truncated)
+            capture = (target_plies == ply) & active
+            sampled_state = _replace_inactive_lanes(state, capture, sampled_state)
+            reached = reached | capture
+
+            scores = jax.random.uniform(key, state.legal_action_mask.shape)
+            action = jnp.argmax(
+                jnp.where(state.legal_action_mask, scores, neg_inf),
+                axis=-1,
+            )
+            stepped_state = jax.vmap(env.step)(state, action)
+            state = _replace_inactive_lanes(stepped_state, active, state)
+            return (state, sampled_state, reached), None
+
+        rng_key, init_key, scan_key = jax.random.split(rng_key, 3)
+        state = jax.vmap(env.init)(jax.random.split(init_key, num_positions))
+        sampled_state = state
+        reached = target_plies == 0
+        scan_inputs = (
+            jnp.arange(max_sample_ply + 1, dtype=jnp.int32),
+            jax.random.split(scan_key, max_sample_ply + 1),
+        )
+        (_, sampled_state, reached), _ = jax.lax.scan(
+            step,
+            (state, sampled_state, reached),
+            scan_inputs,
+        )
+        return sampled_state, reached
+
+    return sample
 
 
 def _make_match_trace(
@@ -1903,6 +2218,26 @@ def _parse_stability_seeds(raw: str) -> list[int]:
     return _validate_ints(values, name="stability_seeds")
 
 
+def _parse_position_budgets(raw: str, *, fallback: int) -> list[int]:
+    if not raw:
+        return [fallback]
+    try:
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError("--position-budgets must be comma-separated integers") from exc
+    return _validate_positive_ints(values, name="position_budgets")
+
+
+def _parse_position_seeds(raw: str) -> list[int]:
+    if not raw:
+        raise ValueError("--position-seeds must not be empty")
+    try:
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError("--position-seeds must be comma-separated integers") from exc
+    return _validate_ints(values, name="position_seeds")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Evaluate a greedy Elo ladder across jaxzero checkpoints."
@@ -2003,6 +2338,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=0.25,
         help="Pair score range that marks a stability-sweep pairing as unstable.",
     )
+    parser.add_argument(
+        "--position-samples",
+        type=int,
+        default=0,
+        help="When >0, sample this many fixed random positions and compare "
+        "checkpoint MCTS action stability/agreement on that shared state batch.",
+    )
+    parser.add_argument(
+        "--position-min-ply",
+        type=int,
+        default=4,
+        help="Earliest random-play ply to sample for --position-samples.",
+    )
+    parser.add_argument(
+        "--position-max-ply",
+        type=int,
+        default=None,
+        help="Latest random-play ply to sample for --position-samples. Defaults "
+        "to max_steps - 1.",
+    )
+    parser.add_argument(
+        "--position-budgets",
+        default="",
+        help="Comma-separated MCTS simulation budgets for --position-samples. "
+        "Defaults to --mcts-simulations.",
+    )
+    parser.add_argument(
+        "--position-seeds",
+        default="0",
+        help="Comma-separated evaluator seeds for --position-samples.",
+    )
+    parser.add_argument(
+        "--position-seed",
+        type=int,
+        default=0,
+        help="Seed for the fixed random-position batch.",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pairing <= 0:
@@ -2031,6 +2403,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--continuation-simulations must be positive")
     if args.stability_score_threshold < 0.0:
         parser.error("--stability-score-threshold must be non-negative")
+    if args.position_samples < 0:
+        parser.error("--position-samples must be non-negative")
+    if args.position_min_ply < 0:
+        parser.error("--position-min-ply must be non-negative")
+    if args.position_max_ply is not None and args.position_max_ply < 0:
+        parser.error("--position-max-ply must be non-negative")
     try:
         probe_budgets = _parse_probe_simulations(
             args.probe_budgets,
@@ -2051,6 +2429,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         stability_seeds = _parse_stability_seeds(args.stability_seeds)
     except ValueError as exc:
         parser.error(str(exc))
+    try:
+        position_budgets = _parse_position_budgets(
+            args.position_budgets,
+            fallback=args.mcts_simulations,
+        )
+        position_seeds = _parse_position_seeds(args.position_seeds)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     checkpoint_dir = args.checkpoint_dir
     if checkpoint_dir is None and not args.checkpoints:
@@ -2068,12 +2454,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             int(args.probe_ply is not None),
             int(args.force_ply is not None),
             int(bool(stability_budgets)),
+            int(args.position_samples > 0),
         ]
     )
     if active_modes > 1:
         parser.error(
             "--trace-plies, --probe-ply, --force-ply, and --stability-budgets "
-            "are mutually exclusive"
+            "are mutually exclusive with --position-samples"
         )
     if args.trace_plies > 0:
         if len(checkpoint_paths) != 2:
@@ -2142,6 +2529,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             instability_threshold=args.stability_score_threshold,
         )
         print(json.dumps(stability, indent=2, sort_keys=True))
+        return 0
+    if args.position_samples > 0:
+        fixed_positions = evaluate_fixed_position_search(
+            checkpoint_paths,
+            game=args.game,
+            max_steps=args.max_steps,
+            num_positions=args.position_samples,
+            min_ply=args.position_min_ply,
+            max_ply=args.position_max_ply,
+            mcts_simulations_list=position_budgets,
+            seeds=position_seeds,
+            position_seed=args.position_seed,
+            gumbel_scale=args.gumbel_scale,
+        )
+        print(json.dumps(fixed_positions, indent=2, sort_keys=True))
         return 0
 
     result = evaluate_checkpoint_ladder(

@@ -12,6 +12,7 @@ from jaxzero.checkpoint_elo import (
     PairingResult,
     evaluate_checkpoint_ladder,
     evaluate_checkpoint_stability,
+    evaluate_fixed_position_search,
     fit_elo_ratings,
     main,
     resolve_checkpoint_paths,
@@ -122,6 +123,41 @@ def test_checkpoint_stability_sweeps_budgets_and_seeds(tmp_path) -> None:
     assert result["pairing_summary"][0]["player_a"] == "early"
     assert result["pairing_summary"][0]["player_b"] == "late"
     assert len(result["pairing_summary"][0]["runs"]) == 4
+
+
+def test_fixed_position_search_scores_shared_position_batch(tmp_path) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    result = evaluate_fixed_position_search(
+        [early, late],
+        game="othello",
+        num_positions=4,
+        min_ply=0,
+        max_ply=1,
+        max_steps=3,
+        mcts_simulations_list=[1, 2],
+        seeds=[3, 4],
+        position_seed=5,
+    )
+
+    assert result["game"] == "othello"
+    assert result["evaluator_mode"] == "fixed-position-mcts"
+    assert result["num_positions"] == 4
+    assert result["mcts_simulations"] == [1, 2]
+    assert result["seeds"] == [3, 4]
+    assert result["reference_checkpoint"] == "early"
+    assert set(result["checkpoint_summary"]) == {"early", "late"}
+    assert len(result["runs"]) == 8
+    assert result["position_summary"]["reached_positions"] == 4
+
+    early_summary = result["checkpoint_summary"]["early"]
+    assert 0.0 <= early_summary["action_stability"] <= 1.0
+    assert 0.0 <= early_summary["consensus_match"] <= 1.0
+    assert 0.0 <= early_summary["reference_match"] <= 1.0
+    assert "majority_action_counts" in early_summary
 
 
 def test_checkpoint_ladder_is_deterministic_for_fixed_seed(tmp_path) -> None:
@@ -453,6 +489,46 @@ def test_checkpoint_elo_cli_runs_stability_sweep(tmp_path, capsys) -> None:
     assert payload["seeds"] == [3, 4]
     assert len(payload["runs"]) == 4
     assert payload["pairing_summary"][0]["runs"][0]["games"] == 2
+
+
+def test_checkpoint_elo_cli_runs_fixed_position_search(tmp_path, capsys) -> None:
+    early = tmp_path / "early.msgpack"
+    late = tmp_path / "late.msgpack"
+    _save_checkpoint(early, seed=0)
+    _save_checkpoint(late, seed=1)
+
+    exit_code = main(
+        [
+            str(early),
+            str(late),
+            "--game",
+            "othello",
+            "--max-steps",
+            "3",
+            "--mcts-simulations",
+            "1",
+            "--position-samples",
+            "2",
+            "--position-min-ply",
+            "0",
+            "--position-max-ply",
+            "1",
+            "--position-budgets",
+            "1,2",
+            "--position-seeds",
+            "3,4",
+            "--position-seed",
+            "5",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["evaluator_mode"] == "fixed-position-mcts"
+    assert payload["num_positions"] == 2
+    assert payload["mcts_simulations"] == [1, 2]
+    assert payload["seeds"] == [3, 4]
+    assert set(payload["checkpoint_summary"]) == {"early", "late"}
 
 
 def test_checkpoint_elo_imports_without_c4_solver_dependency() -> None:
