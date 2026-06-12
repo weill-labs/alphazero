@@ -872,3 +872,32 @@ Interpretation: this is still not a solver oracle, but it is a stronger gate
 than raw fixed-position consensus. Use the incumbent or an explicitly chosen
 teacher checkpoint first, then ask whether challengers match the high-budget
 teacher actions while staying less budget-sensitive than the incumbent.
+
+Launched the first teacher-action gate using `transformer-s103/final` as the
+high-budget teacher:
+
+```bash
+setsid bash -c 'uv run --extra modal modal run --detach jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-transformer-s103/othello/final.msgpack,othello-transformer-s201/othello/iter_0060.msgpack,othello-transformer-s201/othello/iter_0080.msgpack,othello-transformer-s201/othello/final.msgpack,othello-transformer-s102/othello/iter_0060.msgpack" \
+  --position-samples 256 \
+  --position-min-ply 8 \
+  --position-max-ply 56 \
+  --position-budgets "24,32,64,128" \
+  --position-seeds "1,2,3" \
+  --position-seed 20260612 \
+  --position-teacher-index 0 \
+  --position-teacher-simulations 512 \
+  --position-teacher-seed 0 \
+  --mcts-simulations 32 \
+  --gpu A100-40GB' < /dev/null > /tmp/othello-teacher-position-20260612.modal.log 2>&1 &
+```
+
+Launch identifiers:
+
+- Modal app: `ap-vva4jZLPXnjInC8PP26EK7`
+- Local log: `/tmp/othello-teacher-position-20260612.modal.log`
+- Teacher checkpoint: `othello-transformer-s103/othello/final.msgpack`
+- Teacher budget: 512 MCTS simulations
+- Scope: 5 checkpoints, 256 fixed positions, 4 candidate budgets, 3 evaluator
+  seeds, plus one 512-sim teacher action per position.
