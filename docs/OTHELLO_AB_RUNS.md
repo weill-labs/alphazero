@@ -803,3 +803,40 @@ Launch identifiers:
 - Reference checkpoint: `othello-transformer-s103/othello/final.msgpack`
 - Scope: 5 checkpoints, 256 fixed positions, 4 budgets, 3 evaluator seeds,
   15360 fixed-state search evaluations.
+
+Result: completed on 2026-06-12. Runtime was 331.5 seconds for 15360
+fixed-state search evaluations. The fixed position batch reached all 256
+target positions, with mean target ply 32.3 and mean legal actions 9.34.
+Because `gumbel_scale=0.0`, evaluator seed did not affect action choices
+(`seed_sensitive_fraction=0.0` for every checkpoint); remaining variation is
+budget sensitivity.
+
+Checkpoint summary:
+
+| Checkpoint | Action stability | Stable-position frac | Budget-sensitive frac | Consensus match | Reference match | Mean root value |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transformer-s103/final` | 0.906 | 0.723 | 0.277 | 0.493 | 0.906 | 0.105 |
+| `s201/iter_0060` | 0.898 | 0.699 | 0.301 | 0.669 | 0.378 | 0.181 |
+| `s201/iter_0080` | 0.884 | 0.652 | 0.348 | 0.804 | 0.368 | 0.220 |
+| `s201/final` | 0.884 | 0.652 | 0.348 | 0.804 | 0.368 | 0.220 |
+| `transformer-s102/iter_0060` | 0.876 | 0.641 | 0.359 | 0.412 | 0.360 | 0.177 |
+
+Budget-averaged agreement by checkpoint:
+
+| MCTS sims | `s103/final` consensus/ref | `s201/iter_0060` consensus/ref | `s201/iter_0080` consensus/ref | `s201/final` consensus/ref | `s102/iter_0060` consensus/ref |
+| ---: | --- | --- | --- | --- | --- |
+| 24 | 0.512 / 0.926 | 0.691 / 0.371 | 0.789 / 0.359 | 0.789 / 0.359 | 0.406 / 0.371 |
+| 32 | 0.500 / 0.953 | 0.676 / 0.371 | 0.805 / 0.355 | 0.805 / 0.355 | 0.414 / 0.379 |
+| 64 | 0.512 / 0.930 | 0.664 / 0.379 | 0.836 / 0.383 | 0.836 / 0.383 | 0.422 / 0.367 |
+| 128 | 0.449 / 0.816 | 0.645 / 0.391 | 0.785 / 0.375 | 0.785 / 0.375 | 0.406 / 0.324 |
+
+Read: the fixed-position gate is doing the intended job: it removes state-set
+drift from pairwise games and shows that the remaining disagreement is mostly
+search-budget sensitivity. It does not prove that `s201` replaces
+`transformer-s103/final`. The consensus metric favors `s201/iter_0080` and
+`s201/final`, but those two rows are identical and therefore double-weight the
+same policy in consensus. More importantly, the `s201` rows match the
+`s103/final` reference action on only about 37% of positions and are more
+budget-sensitive than `s103/final`. The next gate should use a high-budget
+teacher action or forced continuation on the fixed positions, so disagreements
+are scored against a stronger target rather than against a duplicated consensus.
