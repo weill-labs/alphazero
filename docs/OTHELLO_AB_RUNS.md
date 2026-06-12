@@ -987,3 +987,51 @@ Launch identifiers:
 - Candidate checkpoints: `s201/iter_0060`, `s201/iter_0080`, `s201/final`
 - Continuation checkpoint: `othello-transformer-s103/othello/final.msgpack`
 - Continuation budget: 128 MCTS simulations, seeds 1 and 2
+
+Because the full 256-position run is much heavier than the teacher-action gate,
+also launched a pilot to validate the scorer and get a directional read:
+
+```bash
+setsid bash -c 'uv run --extra modal modal run --detach jaxzero/modal_train.py::checkpoint_elo \
+  --game othello \
+  --checkpoints "othello-transformer-s103/othello/final.msgpack,othello-transformer-s201/othello/iter_0060.msgpack,othello-transformer-s201/othello/iter_0080.msgpack,othello-transformer-s201/othello/final.msgpack,othello-transformer-s102/othello/iter_0060.msgpack" \
+  --position-samples 48 \
+  --position-min-ply 8 \
+  --position-max-ply 56 \
+  --position-budgets "64,128" \
+  --position-seeds "1,2" \
+  --position-seed 20260612 \
+  --position-force-reference-index 0 \
+  --position-force-candidate-indices "1,2,3" \
+  --position-force-continuation-index 0 \
+  --position-force-continuation-simulations 32 \
+  --position-force-continuation-seeds "1" \
+  --mcts-simulations 32 \
+  --gpu A100-40GB' < /dev/null > /tmp/othello-forced-continuation-pilot-20260612.modal.log 2>&1 &
+```
+
+Pilot identifiers:
+
+- Modal app: `ap-0bSon9Pu7HJGh5QBThHROp`
+- Local log: `/tmp/othello-forced-continuation-pilot-20260612.modal.log`
+- Runtime: 142.8 seconds
+- Scope: 48 fixed positions, 960 action-search evals, 152 forced continuation
+  evals.
+
+Pilot forced-continuation result, using `s103/final` as the continuation
+checkpoint at 32 MCTS simulations:
+
+| Candidate | Disagreements | Evaluated | Candidate - reference return | Candidate better | Reference better | Equal |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `s201/iter_0060` | 22 | 22 | +0.318 | 0.273 | 0.136 | 0.591 |
+| `s201/iter_0080` | 27 | 27 | -0.074 | 0.185 | 0.222 | 0.593 |
+| `s201/final` | 27 | 27 | -0.074 | 0.185 | 0.222 | 0.593 |
+
+Read: the scorer works and the first pilot does *not* support the raw
+fixed-position consensus winner (`s201/iter_0080` or `s201/final`). Those two
+checkpoints remain exact duplicate action profiles and are slightly worse than
+`s103/final` under `s103` continuation on this small sample. The surprising
+signal is `s201/iter_0060`: despite weaker action agreement with the
+high-budget `s103` teacher, its forced actions produced better continuations in
+this pilot. Treat that as directional only until the 256-position, 128-sim run
+finishes.
