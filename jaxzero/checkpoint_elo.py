@@ -406,6 +406,9 @@ def evaluate_fixed_position_search(
     seeds: Sequence[int],
     position_seed: int = 0,
     gumbel_scale: float = DEFAULT_GUMBEL_SCALE,
+    teacher_index: int = 0,
+    teacher_simulations: int = 0,
+    teacher_seed: int = 0,
 ) -> dict[str, object]:
     """Compare checkpoint search choices on one fixed random-position batch.
 
@@ -434,10 +437,14 @@ def evaluate_fixed_position_search(
     seed_values = _validate_ints(seeds, name="seeds")
     if gumbel_scale < 0.0:
         raise ValueError("gumbel_scale must be non-negative")
+    if teacher_simulations < 0:
+        raise ValueError("teacher_simulations must be non-negative")
 
     paths = [Path(path) for path in checkpoint_paths]
     if not paths:
         raise ValueError("checkpoint_paths must not be empty")
+    if teacher_index < 0 or teacher_index >= len(paths):
+        raise ValueError("teacher_index must select a checkpoint")
     names = _checkpoint_names(paths)
     checkpoints = [
         _load_checkpoint(path, name=name, game=spec.name)
@@ -501,6 +508,31 @@ def evaluate_fixed_position_search(
         actions[0].reshape((-1, num_positions)),
         action_size=legal_action_mask.shape[1],
     )
+    unique_group_indices = _unique_action_profile_indices(actions)
+    deduplicated_consensus_actions, deduplicated_consensus_votes = _majority_actions(
+        actions[unique_group_indices].reshape((-1, num_positions)),
+        action_size=legal_action_mask.shape[1],
+    )
+    teacher_actions = None
+    teacher_weights = None
+    teacher_values = None
+    if teacher_simulations > 0:
+        teacher_checkpoint = checkpoints[teacher_index]
+        teacher_search = _make_mcts_search_details(
+            teacher_checkpoint.graphdef,
+            game=spec.name,
+            num_simulations=teacher_simulations,
+            gumbel_scale=gumbel_scale,
+        )
+        teacher_action, weights, value = teacher_search(
+            teacher_checkpoint.params,
+            sampled_state,
+            jax.random.PRNGKey(teacher_seed),
+        )
+        teacher_actions = np.asarray(jax.device_get(teacher_action), dtype=np.int32)
+        teacher_weights_np = np.asarray(jax.device_get(weights), dtype=np.float32)
+        teacher_weights = teacher_weights_np[np.arange(num_positions), teacher_actions]
+        teacher_values = np.asarray(jax.device_get(value), dtype=np.float32)
 
     checkpoint_summary = {}
     for checkpoint_index, checkpoint in enumerate(checkpoints):
@@ -509,7 +541,9 @@ def evaluate_fixed_position_search(
             selected_weights[checkpoint_index],
             root_values[checkpoint_index],
             consensus_actions=consensus_actions,
+            deduplicated_consensus_actions=deduplicated_consensus_actions,
             reference_actions=reference_actions,
+            teacher_actions=teacher_actions,
             action_size=legal_action_mask.shape[1],
         )
 
@@ -529,6 +563,14 @@ def evaluate_fixed_position_search(
                         ),
                         "reference_match": float(
                             np.mean(run_actions == reference_actions)
+                        ),
+                        "deduplicated_consensus_match": float(
+                            np.mean(run_actions == deduplicated_consensus_actions)
+                        ),
+                        "teacher_match": (
+                            None
+                            if teacher_actions is None
+                            else float(np.mean(run_actions == teacher_actions))
                         ),
                         "mean_selected_weight": float(
                             np.mean(
@@ -552,7 +594,7 @@ def evaluate_fixed_position_search(
                     }
                 )
 
-    return {
+    payload: dict[str, object] = {
         "game": spec.name,
         "evaluator_mode": "fixed-position-mcts",
         "num_positions": int(num_positions),
@@ -586,10 +628,39 @@ def evaluate_fixed_position_search(
                     reference_votes / actions[0].reshape((-1, num_positions)).shape[0]
                 )
             ),
+            "deduplicated_consensus_action_counts": _value_counts(
+                deduplicated_consensus_actions
+            ),
+            "deduplicated_checkpoint_groups": [
+                [checkpoints[index].name for index in group]
+                for group in _unique_action_profile_groups(actions)
+            ],
+            "mean_deduplicated_consensus_vote_fraction": float(
+                np.mean(
+                    deduplicated_consensus_votes
+                    / actions[unique_group_indices]
+                    .reshape((-1, num_positions))
+                    .shape[0]
+                )
+            ),
         },
         "checkpoint_summary": checkpoint_summary,
         "runs": runs,
     }
+    if teacher_actions is not None:
+        payload["teacher"] = {
+            "checkpoint": checkpoints[teacher_index].name,
+            "checkpoint_index": int(teacher_index),
+            "mcts_simulations": int(teacher_simulations),
+            "seed": int(teacher_seed),
+            "action_counts": _value_counts(teacher_actions),
+            "mean_selected_weight": float(np.mean(teacher_weights)),
+            "mean_root_value": float(np.mean(teacher_values)),
+        }
+        payload["position_summary"]["teacher_action_counts"] = _value_counts(
+            teacher_actions
+        )
+    return payload
 
 
 def play_checkpoint_match(
@@ -1272,9 +1343,11 @@ def _summarize_fixed_position_checkpoint(
     root_values: np.ndarray,
     *,
     consensus_actions: np.ndarray,
+    deduplicated_consensus_actions: np.ndarray,
     reference_actions: np.ndarray,
+    teacher_actions: np.ndarray | None,
     action_size: int,
-) -> dict[str, float | int | dict[str, int]]:
+) -> dict[str, float | int | dict[str, int] | None]:
     budget_count, seed_count, num_positions = actions.shape
     flat_actions = actions.reshape((budget_count * seed_count, num_positions))
     majority_actions, majority_votes = _majority_actions(
@@ -1306,7 +1379,15 @@ def _summarize_fixed_position_checkpoint(
         "budget_sensitive_fraction": float(np.mean(budget_sensitive)),
         "seed_sensitive_fraction": float(np.mean(seed_sensitive)),
         "consensus_match": float(np.mean(flat_actions == consensus_actions)),
+        "deduplicated_consensus_match": float(
+            np.mean(flat_actions == deduplicated_consensus_actions)
+        ),
         "reference_match": float(np.mean(flat_actions == reference_actions)),
+        "teacher_match": (
+            None
+            if teacher_actions is None
+            else float(np.mean(flat_actions == teacher_actions))
+        ),
         "mean_selected_weight": float(np.mean(selected_weights)),
         "mean_root_value": float(np.mean(root_values)),
         "majority_action_counts": _value_counts(majority_actions),
@@ -1436,6 +1517,24 @@ def _top_action_weights(
         }
         for index in order
     ]
+
+
+def _unique_action_profile_groups(actions: np.ndarray) -> list[list[int]]:
+    groups: list[list[int]] = []
+    profile_to_group: dict[bytes, int] = {}
+    for checkpoint_index, checkpoint_actions in enumerate(actions):
+        profile = np.ascontiguousarray(checkpoint_actions).tobytes()
+        group_index = profile_to_group.get(profile)
+        if group_index is None:
+            profile_to_group[profile] = len(groups)
+            groups.append([checkpoint_index])
+        else:
+            groups[group_index].append(checkpoint_index)
+    return groups
+
+
+def _unique_action_profile_indices(actions: np.ndarray) -> list[int]:
+    return [group[0] for group in _unique_action_profile_groups(actions)]
 
 
 def _majority_actions(
@@ -2375,6 +2474,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=0,
         help="Seed for the fixed random-position batch.",
     )
+    parser.add_argument(
+        "--position-teacher-index",
+        type=int,
+        default=0,
+        help="Checkpoint index to use as the high-budget teacher target for "
+        "--position-samples.",
+    )
+    parser.add_argument(
+        "--position-teacher-simulations",
+        type=int,
+        default=0,
+        help="When >0, evaluate the teacher checkpoint with this MCTS budget "
+        "on the fixed positions and report teacher-action agreement.",
+    )
+    parser.add_argument(
+        "--position-teacher-seed",
+        type=int,
+        default=0,
+        help="Evaluator seed for --position-teacher-simulations.",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pairing <= 0:
@@ -2409,6 +2528,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--position-min-ply must be non-negative")
     if args.position_max_ply is not None and args.position_max_ply < 0:
         parser.error("--position-max-ply must be non-negative")
+    if args.position_teacher_index < 0:
+        parser.error("--position-teacher-index must be non-negative")
+    if args.position_teacher_simulations < 0:
+        parser.error("--position-teacher-simulations must be non-negative")
     try:
         probe_budgets = _parse_probe_simulations(
             args.probe_budgets,
@@ -2542,6 +2665,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             seeds=position_seeds,
             position_seed=args.position_seed,
             gumbel_scale=args.gumbel_scale,
+            teacher_index=args.position_teacher_index,
+            teacher_simulations=args.position_teacher_simulations,
+            teacher_seed=args.position_teacher_seed,
         )
         print(json.dumps(fixed_positions, indent=2, sort_keys=True))
         return 0

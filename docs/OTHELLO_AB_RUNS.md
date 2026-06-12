@@ -840,3 +840,35 @@ same policy in consensus. More importantly, the `s201` rows match the
 budget-sensitive than `s103/final`. The next gate should use a high-budget
 teacher action or forced continuation on the fixed positions, so disagreements
 are scored against a stronger target rather than against a duplicated consensus.
+
+## 2026-06-12 High-Budget Teacher Action Gate
+
+Bead: `alphago-dzf`
+
+Extended the fixed-position gate with an optional high-budget teacher target:
+
+```bash
+uv run jaxzero-checkpoint-elo \
+  --game othello \
+  --position-samples 256 \
+  --position-min-ply 8 \
+  --position-max-ply 56 \
+  --position-budgets "24,32,64,128" \
+  --position-seeds "1,2,3" \
+  --position-seed 20260612 \
+  --position-teacher-index 0 \
+  --position-teacher-simulations 512 \
+  --position-teacher-seed 0 \
+  <teacher-checkpoint> <candidate-a> <candidate-b> ...
+```
+
+The teacher action is computed once per fixed position from
+`--position-teacher-index` with `--position-teacher-simulations`, then every
+checkpoint/budget/seed row reports `teacher_match`. The same payload also now
+reports `deduplicated_consensus_match` and exact duplicate action-profile
+groups, so identical checkpoints do not double-weight the consensus metric.
+
+Interpretation: this is still not a solver oracle, but it is a stronger gate
+than raw fixed-position consensus. Use the incumbent or an explicitly chosen
+teacher checkpoint first, then ask whether challengers match the high-budget
+teacher actions while staying less budget-sensitive than the incumbent.

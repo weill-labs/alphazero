@@ -534,6 +534,9 @@ else:
         position_budgets: str = "",
         position_seeds: str = "0",
         position_seed: int = 0,
+        position_teacher_index: int = 0,
+        position_teacher_simulations: int = 0,
+        position_teacher_seed: int = 0,
         requested_gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
     ) -> dict[str, object]:
         from jaxzero.checkpoint_elo import (
@@ -675,6 +678,9 @@ else:
                 seeds=_parse_position_seeds(position_seeds),
                 position_seed=position_seed,
                 gumbel_scale=gumbel_scale,
+                teacher_index=position_teacher_index,
+                teacher_simulations=position_teacher_simulations,
+                teacher_seed=position_teacher_seed,
             )
             pairings = (
                 len(resolved_paths)
@@ -971,6 +977,9 @@ else:
         position_budgets: str = "",
         position_seeds: str = "0",
         position_seed: int = 0,
+        position_teacher_index: int = 0,
+        position_teacher_simulations: int = 0,
+        position_teacher_seed: int = 0,
         gpu: str = _DEFAULT_CHECKPOINT_ELO_GPU,
         spawn: bool = False,
     ) -> None:
@@ -1014,6 +1023,9 @@ else:
             position_budgets=position_budgets,
             position_seeds=position_seeds,
             position_seed=position_seed,
+            position_teacher_index=position_teacher_index,
+            position_teacher_simulations=position_teacher_simulations,
+            position_teacher_seed=position_teacher_seed,
             requested_gpu=gpu,
         )
         if spawn:

@@ -141,6 +141,8 @@ def test_fixed_position_search_scores_shared_position_batch(tmp_path) -> None:
         mcts_simulations_list=[1, 2],
         seeds=[3, 4],
         position_seed=5,
+        teacher_simulations=2,
+        teacher_seed=6,
     )
 
     assert result["game"] == "othello"
@@ -152,12 +154,17 @@ def test_fixed_position_search_scores_shared_position_batch(tmp_path) -> None:
     assert set(result["checkpoint_summary"]) == {"early", "late"}
     assert len(result["runs"]) == 8
     assert result["position_summary"]["reached_positions"] == 4
+    assert result["teacher"]["checkpoint"] == "early"
+    assert result["teacher"]["mcts_simulations"] == 2
 
     early_summary = result["checkpoint_summary"]["early"]
     assert 0.0 <= early_summary["action_stability"] <= 1.0
     assert 0.0 <= early_summary["consensus_match"] <= 1.0
+    assert 0.0 <= early_summary["deduplicated_consensus_match"] <= 1.0
     assert 0.0 <= early_summary["reference_match"] <= 1.0
+    assert 0.0 <= early_summary["teacher_match"] <= 1.0
     assert "majority_action_counts" in early_summary
+    assert "deduplicated_checkpoint_groups" in result["position_summary"]
 
 
 def test_checkpoint_ladder_is_deterministic_for_fixed_seed(tmp_path) -> None:
@@ -519,6 +526,10 @@ def test_checkpoint_elo_cli_runs_fixed_position_search(tmp_path, capsys) -> None
             "3,4",
             "--position-seed",
             "5",
+            "--position-teacher-simulations",
+            "2",
+            "--position-teacher-seed",
+            "6",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
@@ -528,6 +539,7 @@ def test_checkpoint_elo_cli_runs_fixed_position_search(tmp_path, capsys) -> None
     assert payload["num_positions"] == 2
     assert payload["mcts_simulations"] == [1, 2]
     assert payload["seeds"] == [3, 4]
+    assert payload["teacher"]["mcts_simulations"] == 2
     assert set(payload["checkpoint_summary"]) == {"early", "late"}
 
 

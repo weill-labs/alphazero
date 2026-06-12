@@ -356,6 +356,11 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
             "num_positions": kwargs["num_positions"],
             "mcts_simulations": kwargs["mcts_simulations_list"],
             "seeds": kwargs["seeds"],
+            "teacher": {
+                "checkpoint_index": kwargs["teacher_index"],
+                "mcts_simulations": kwargs["teacher_simulations"],
+                "seed": kwargs["teacher_seed"],
+            },
             "checkpoint_summary": {},
             "runs": [],
         }
@@ -543,6 +548,9 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
         position_budgets="24,32",
         position_seeds="3,4",
         position_seed=99,
+        position_teacher_index=1,
+        position_teacher_simulations=512,
+        position_teacher_seed=7,
     )
 
     assert captured["positions"]["max_steps"] == 128
@@ -552,7 +560,11 @@ def test_jaxzero_modal_checkpoint_elo_remote_uses_volume_paths(monkeypatch) -> N
     assert captured["positions"]["mcts_simulations_list"] == [24, 32]
     assert captured["positions"]["seeds"] == [3, 4]
     assert captured["positions"]["position_seed"] == 99
+    assert captured["positions"]["teacher_index"] == 1
+    assert captured["positions"]["teacher_simulations"] == 512
+    assert captured["positions"]["teacher_seed"] == 7
     assert position_result["evaluator_mode"] == "fixed-position-mcts"
+    assert position_result["teacher"]["mcts_simulations"] == 512
     assert position_result["modal_metrics"]["modal_checkpoint_elo_pairings"] == 8
     assert position_result["modal_metrics"]["modal_checkpoint_elo_games"] == 0
     assert position_result["modal_metrics"]["modal_checkpoint_elo_position_evals"] == 32
