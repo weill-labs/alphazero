@@ -901,3 +901,41 @@ Launch identifiers:
 - Teacher budget: 512 MCTS simulations
 - Scope: 5 checkpoints, 256 fixed positions, 4 candidate budgets, 3 evaluator
   seeds, plus one 512-sim teacher action per position.
+
+Completed in 248.1 seconds with 15,360 candidate fixed-position evaluations.
+
+Teacher-action agreement by checkpoint:
+
+| Checkpoint | Teacher match | De-duped consensus match | Raw consensus match | Reference match | Action stability | Budget-sensitive | Mean root value |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transformer-s103/final` | 0.649 | 0.550 | 0.493 | 0.906 | 0.906 | 0.277 | 0.105 |
+| `s201/iter_0060` | 0.321 | 0.691 | 0.669 | 0.378 | 0.897 | 0.301 | 0.181 |
+| `s201/iter_0080` | 0.303 | 0.691 | 0.804 | 0.368 | 0.884 | 0.348 | 0.220 |
+| `s201/final` | 0.303 | 0.691 | 0.804 | 0.368 | 0.884 | 0.348 | 0.220 |
+| `transformer-s102/iter_0060` | 0.306 | 0.489 | 0.412 | 0.360 | 0.876 | 0.359 | 0.177 |
+
+Teacher-match by candidate MCTS budget:
+
+| MCTS sims | `s103/final` | `s201/iter_0060` | `s201/iter_0080` | `s201/final` | `s102/iter_0060` |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 24 | 0.609 | 0.305 | 0.277 | 0.277 | 0.309 |
+| 32 | 0.605 | 0.324 | 0.289 | 0.289 | 0.316 |
+| 64 | 0.641 | 0.324 | 0.309 | 0.309 | 0.301 |
+| 128 | 0.742 | 0.332 | 0.336 | 0.336 | 0.297 |
+
+Exact duplicate action-profile groups:
+
+- `transformer-s103/final`
+- `s201/iter_0060`
+- `s201/iter_0080`, `s201/final`
+- `transformer-s102/iter_0060`
+
+Read: this gate argues strongly against replacing `transformer-s103/final` with
+the `s201` checkpoints when the teacher is high-budget search from
+`transformer-s103/final`. The incumbent's 128-sim actions match its 512-sim
+teacher on 74.2% of fixed positions, while the `s201` candidates sit near
+33.6%. This is not an independent oracle: it measures agreement with the
+incumbent's high-budget search, not absolute move quality. The useful next
+question is the subset of positions where `s103` and `s201` disagree; those
+need forced-action continuations or an external/stronger teacher to determine
+whether `s201` is actually finding better moves or only disagreeing.
